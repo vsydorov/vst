@@ -19,8 +19,8 @@ from typing import Dict, List, Tuple, cast, NewType, Any
 
 from vsydorov_tools import small, cv as vt_cv
 
-from tavid.filesystem import get_dataset_path
-from tavid.tools import snippets
+from thes.filesystem import get_dataset_path
+from thes.tools import snippets
 
 
 log = logging.getLogger(__name__)
@@ -917,6 +917,163 @@ class DatasetHMDB51(
         self._print_split_stats()
 
 
+DALY_vid = NewType('DALY_vid', Vid)
+DALY_action_name = NewType('DALY_action_name', str)
+DALY_object_name = NewType('DALY_object_name', str)
+DALY_joint_name = NewType('DALY_joint_name', str)
+DALY_instance_flags = TypedDict('DALY_instance_flags', {
+    'isSmall': bool,
+    'isReflection': bool,
+    'isShotcut': bool,
+    'isZoom': bool,
+    'isAmbiguous': bool,
+    'isOccluded': bool,
+    'isOutsideFOV': bool
+})
+DALY_keyframe = TypedDict('DALY_keyframe', {
+    'boundingBox': np.ndarray,
+    'objects': np.ndarray,
+    'frameNumer': int,
+    'pose': np.ndarray,
+    'time': float
+})
+DALY_instance = TypedDict('DALY_instance', {
+    'beginTime': float,
+    'endTime': float,
+    'flags': DALY_instance_flags,
+    'keyframes': List[DALY_keyframe]
+})
+DALY_video = TypedDict('DALY_video', {
+    'vid': DALY_vid,
+    'suggestedClass': str,
+    'instances': Dict[DALY_action_name, List[DALY_instance]],
+    # Meta
+    'duration': float,
+    'nbframes_ffmpeg': int,
+    'fps': float
+})
+
+
+# for action_name, a in v['annot'].items():
+#     for instance_id, source_instance in enumerate(a):
+#         break
+#     break
+# break
+
 class DatasetDALY(object):
     root_path: Path
-    jointnames = ['lsho', 'lelb', 'lwri', 'rsho', 'relb', 'rwri']
+    action_names: List[DALY_action_name]
+    object_names: List[DALY_object_name]
+    joint_names: List[DALY_joint_name]
+    split: Dict[DALY_vid, Dataset_subset]
+    video_odict: "OrderedDict[DALY_vid, DALY_video]"
+
+    source_videos = Dict[DALY_vid, RVideoMP4_reached]
+
+    def __init__(self):
+        super().__init__()
+        self.root_path = get_dataset_path('action/DALY')
+        self.videos_fold = (self.root_path/'videos')
+
+    def _compute_light_stats(self):
+        pkl_path = self.root_path/'daly1.1.0.pkl'
+        info = small.load_py2_pkl(pkl_path)
+
+        action_names = info['labels']
+        object_names = info['objectList']
+        joint_names = info['joints']
+
+        video_odict = OrderedDict()
+        for video_name, v in info['annot'].items():
+            vid = video_name.split('.')[0]
+            meta = info['metadata'][video_name]
+            video = {
+                'vid': vid,
+                'suggestedClass': v['suggestedClass'],
+                'instances': v['annot'],
+                'duration': meta['duration'],
+                'nbframes_ffmpeg': meta['nbframes_ffmpeg'],
+                'fps': meta['fps']
+            }
+            video_odict[vid] = video
+
+        split = {k: 'train' for k in video_odict.keys()}
+        for k in info['splits'][0]:
+            split[k] = 'test'
+
+        light_stats = {
+            'video_odict': video_odict,
+            'split': split,
+            'action_names': action_names,
+            'object_names': object_names,
+            'joint_names': joint_names
+        }
+        return light_stats
+
+    def populate_from_folder(self, fold):
+        light_stats = small.load_pkl(fold/'light_stats.pkl')
+        source_videos = small.load_pkl(fold/'source_videos.pkl')
+
+        self.source_videos = source_videos
+        self.video_odict = light_stats['video_odict']
+        self.split = light_stats['split']
+        self.action_names = light_stats['action_names']
+        self.object_names = light_stats['object_names']
+        self.joint_names = light_stats['joint_names']
+
+    def precompute_to_folder(self, fold):
+        fold = Path(fold)
+        light_stats = self._compute_light_stats()
+        video_odict = light_stats['video_odict']
+
+        # Get ocv stats
+        videos_w_ocv = {}
+        for vid, video in video_odict.items():
+            videos_w_ocv[vid] = {
+                'vid': vid,
+                'rel_video_path': f'videos/{vid}.mp4'}
+        videos_w_ocv = small.stash2(fold/'videos_ocv_stats.pkl')(
+                _update_with_ocv_stats_v2, self.root_path, videos_w_ocv, 20)
+
+        # Confirm reachable frames
+        for vid, video in videos_w_ocv.items():
+            qstats = video['qstats']
+            assert qstats['reported_framecount'] == \
+                    qstats['frames_reached']
+
+        # Record duration/frames mismatches
+        duration_mismatches = {}
+        frames_mismatches = {}
+        for vid, video in videos_w_ocv.items():
+            ovideo = video_odict[vid]
+            qstats = video['qstats']
+            ocv_reached = qstats['ms_reached']
+            meta_duration = ovideo['duration']*1000
+            frames_reached = qstats['frames_reached']
+            meta_frames = ovideo['nbframes_ffmpeg']
+            if ocv_reached != meta_duration:
+                duration_mismatches[vid] = [ocv_reached, meta_duration]
+            if frames_reached != meta_frames:
+                frames_mismatches[vid] = [frames_reached, meta_frames]
+
+        d_mi = pd.DataFrame(duration_mismatches).T
+        d_mi.columns = ['ocv', 'meta']
+        d_mi['diff'] = d_mi['meta'] - d_mi['ocv']
+
+        f_mi = pd.DataFrame(frames_mismatches).T
+        f_mi.columns = ['ocv', 'meta']
+        f_mi['diff'] = f_mi['meta'] - f_mi['ocv']
+
+        """ We prioritize OCV stats everywhere """
+        source_videos = {}
+        for vid, v in videos_w_ocv.items():
+            video = {
+                'height': v['qstats']['height'],
+                'width': v['qstats']['width'],
+                'length_reached': v['qstats']['ms_reached']/1000,
+                'frames_reached': v['qstats']['frames_reached'],
+                'rvideo_path': str(v['rel_video_path'])}
+            source_videos[vid] = video
+
+        small.save_pkl(fold/'source_videos.pkl', source_videos)
+        small.save_pkl(fold/'light_stats.pkl', light_stats)

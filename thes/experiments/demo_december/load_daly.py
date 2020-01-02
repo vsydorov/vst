@@ -15,12 +15,35 @@ import torch
 import torch.utils.data
 import torch.backends.cudnn as cudnn
 
+from thes.tools import snippets
+from thes.data.external_dataset import DatasetDALY
 
 from vsydorov_tools import small
 
 log = logging.getLogger(__name__)
 
 
-def load(workfolder, cfg_dict, add_args):
+def load_philippe_tubes(workfolder, cfg_dict, add_args):
+    dataset = DatasetDALY()
+    dataset.precompute_to_folder()
+    """
+    dataset:
+        cache_folder: [~, str]
+    """
     import pudb; pudb.set_trace()  # XXX BREAKPOINT
     pass
+
+
+def precompute_cache(workfolder, cfg_dict, add_args):
+    out, = snippets.get_subfolders(workfolder, ['out'])
+    cfg = snippets.YConfig(cfg_dict)
+    cfg.set_deftype("""
+    dataset: [~, ['daly']]
+    """)
+    cf = cfg.parse()
+
+    if cf['dataset'] == 'daly':
+        dataset = DatasetDALY()
+    else:
+        raise RuntimeError('Wrong dataset')
+    dataset.precompute_to_folder(out)
