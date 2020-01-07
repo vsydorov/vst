@@ -931,9 +931,9 @@ DALY_instance_flags = TypedDict('DALY_instance_flags', {
     'isOutsideFOV': bool
 })
 DALY_keyframe = TypedDict('DALY_keyframe', {
-    'boundingBox': np.ndarray,
+    'boundingBox': np.ndarray,  # xmin, ymin, xmax, ymax, ltrd
     'objects': np.ndarray,
-    'frameNumer': int,
+    'frameNumber': int,
     'pose': np.ndarray,
     'time': float
 })
@@ -1011,6 +1011,7 @@ class DatasetDALY(object):
         return light_stats
 
     def populate_from_folder(self, fold):
+        fold = Path(fold)
         light_stats = small.load_pkl(fold/'light_stats.pkl')
         source_videos = small.load_pkl(fold/'source_videos.pkl')
 
