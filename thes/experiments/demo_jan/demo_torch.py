@@ -1,8 +1,10 @@
 import logging
 import time
+import yacs
 from tqdm import tqdm
 from abc import abstractmethod, ABC
 import re
+import yaml
 import collections
 import pprint
 import os
@@ -305,3 +307,118 @@ def eval_detectron2_rcnn_voc07eval(workfolder, cfg_dict, add_args):
         verify_results(d_cfg, res)
     if d_cfg.TEST.AUG.ENABLED:
         res.update(Trainer.test_with_TTA(d_cfg, model))
+
+
+# Base-RCNN-C4.yaml
+YAML_Base_RCNN_C4 = """
+MODEL:
+  META_ARCHITECTURE: "GeneralizedRCNN"
+  RPN:
+    PRE_NMS_TOPK_TEST: 6000
+    POST_NMS_TOPK_TEST: 1000
+  ROI_HEADS:
+    NAME: "Res5ROIHeads"
+DATASETS:
+  TRAIN: ("coco_2017_train",)
+  TEST: ("coco_2017_val",)
+SOLVER:
+  IMS_PER_BATCH: 16
+  BASE_LR: 0.02
+  STEPS: (60000, 80000)
+  MAX_ITER: 90000
+INPUT:
+  MIN_SIZE_TRAIN: (640, 672, 704, 736, 768, 800)
+VERSION: 2
+"""
+# faster_rcnn_R_50_C4.yaml
+YAML_faster_rcnn_R_50_C4 = """
+MODEL:
+  WEIGHTS: "detectron2://ImageNetPretrained/MSRA/R-50.pkl"
+  MASK_ON: False
+  RESNETS:
+    DEPTH: 50
+  ROI_HEADS:
+    NUM_CLASSES: 20
+INPUT:
+  MIN_SIZE_TRAIN: (480, 512, 544, 576, 608, 640, 672, 704, 736, 768, 800)
+  MIN_SIZE_TEST: 800
+DATASETS:
+  TRAIN: ('voc_2007_trainval', 'voc_2012_trainval')
+  TEST: ('voc_2007_test',)
+SOLVER:
+  STEPS: (12000, 16000)
+  MAX_ITER: 18000  # 17.4 epochs
+  WARMUP_ITERS: 100
+"""
+
+
+def _train_func(d_cfg, cf):
+    # Register "absolute" VOC
+    VOC_ROOT = '/home/vsydorov/projects/datasets/detection'
+    from detectron2.data.datasets.pascal_voc import register_pascal_voc
+    SPLITS = [
+        ("voc_2007_trainval_absolute", "VOC2007/VOCdevkit/VOC2007", "trainval"),
+        ("voc_2007_test_absolute", "VOC2007/VOCdevkit/VOC2007", "test"),
+        ("voc_2012_trainval_absolute", "VOC2012/VOCdevkit/VOC2012", "trainval"),
+    ]
+    for name, dirname, split in SPLITS:
+        year = 2007 if "2007" in name else 2012
+        register_pascal_voc(name, os.path.join(VOC_ROOT, dirname), split, year)
+        MetadataCatalog.get(name).evaluator_type = "pascal_voc"
+
+    trainer = Trainer(d_cfg)
+    trainer.resume_or_load(resume=cf['resume'])
+    if d_cfg.TEST.AUG.ENABLED:
+        trainer.register_hooks(
+            [hooks.EvalHook(
+                0, lambda: trainer.test_with_TTA(d_cfg, trainer.model))]
+        )
+    trainer.train()
+
+
+def train_d2_rcnn_voc0712(workfolder, cfg_dict, add_args):
+    out, = snippets.get_subfolders(workfolder, ['out'])
+    cfg = snippets.YConfig(cfg_dict)
+    cfg.set_deftype("""
+    num_gpus: [~, int]
+    resume: [True, bool]
+    """)
+    cf = cfg.parse()
+
+    CONFIDENCE_THRESHOLD = 0.25
+    d_cfg = get_cfg()
+    # Base keys
+    loaded_cfg = yacs.config.CfgNode.load_cfg(YAML_Base_RCNN_C4)
+    d_cfg.merge_from_other_cfg(loaded_cfg)
+    # FRCCN keys
+    loaded_cfg = yacs.config.CfgNode.load_cfg(YAML_faster_rcnn_R_50_C4)
+    d_cfg.merge_from_other_cfg(loaded_cfg)
+    # Manual overwrite
+    d_cfg.MODEL.RETINANET.SCORE_THRESH_TEST = CONFIDENCE_THRESHOLD
+    d_cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = CONFIDENCE_THRESHOLD
+    d_cfg.MODEL.PANOPTIC_FPN.COMBINE.INSTANCES_CONFIDENCE_THRESH = \
+            CONFIDENCE_THRESHOLD
+    d_cfg.OUTPUT_DIR = str(small.mkdir(out/'output_dir'))
+    # d_cfg.MODEL.WEIGHTS = PRETRAINED_WEIGHTS
+    # 2GPUs only
+    d_cfg.SOLVER.BASE_LR = 0.0025 * cf['num_gpus']
+    d_cfg.SOLVER.IMS_PER_BATCH = 2 * cf['num_gpus']
+    # Change datasets
+    d_cfg.DATASETS.TRAIN = (
+            'voc_2007_trainval_absolute',
+            'voc_2012_trainval_absolute')
+    d_cfg.DATASETS.TEST = ('voc_2007_test_absolute',)
+    d_cfg.freeze()
+
+    port = 2 ** 15 + 2 ** 14 + hash(os.getuid()) % 2 ** 14
+    dist_url = "tcp://127.0.0.1:{}".format(port)
+
+    if cf['num_gpus'] > 1:
+        launch(_train_func,
+                cf['num_gpus'],
+                num_machines=1,
+                machine_rank=0,
+                dist_url=dist_url,
+                args=(d_cfg, cf))
+    else:
+        _train_func(d_cfg, cf)
