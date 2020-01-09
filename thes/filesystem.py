@@ -4,7 +4,7 @@ Temporary solution which makes code immovable. Will be fixed later
 """
 from pathlib import Path
 
-__ROOT = Path('/home/vsydorov/projects/deployed/2019_09_CVPR_Video')
+__ROOT = Path('/home/vsydorov/projects/deployed/2019_12_Thesis')
 
 
 def get_dataset_path(data_id):

@@ -292,18 +292,3 @@ def load_wein_tubes(workfolder, cfg_dict, add_args):
                         'iscores': instance_scores}
                 extracted_tubes[(vid, bunch_id, tube_id)] = tube
     small.save_pkl(out/'extracted_tubes.pkl', extracted_tubes)
-
-
-def precompute_cache(workfolder, cfg_dict, add_args):
-    out, = snippets.get_subfolders(workfolder, ['out'])
-    cfg = snippets.YConfig(cfg_dict)
-    cfg.set_deftype("""
-    dataset: [~, ['daly']]
-    """)
-    cf = cfg.parse()
-
-    if cf['dataset'] == 'daly':
-        dataset = DatasetDALY()
-    else:
-        raise RuntimeError('Wrong dataset')
-    dataset.precompute_to_folder(out)

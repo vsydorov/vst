@@ -1,6 +1,7 @@
 """
 Basic classes that allow working with external datasets
 """
+import xml.etree.ElementTree as ET
 import subprocess
 import csv
 import hashlib
@@ -1078,3 +1079,126 @@ class DatasetDALY(object):
 
         small.save_pkl(fold/'source_videos.pkl', source_videos)
         small.save_pkl(fold/'light_stats.pkl', light_stats)
+
+
+# Detection datasets
+VOC_object = TypedDict('VOC_object', {
+    'name': str,
+    'pose': str,
+    'difficult': bool,
+    'truncated': bool,
+    'box': np.ndarray
+})
+VOC_image_annotation = TypedDict('VOC_image_annotation', {
+    'filename': str,
+    'filepath': Path,
+    'size_WHD': Tuple[int, int, int],
+    'objects': List[VOC_object]
+})
+
+
+class DatasetVOC(object):
+    root_path = None  # type: Path
+    object_classes = ['aeroplane', 'bicycle', 'bird', 'boat', 'bottle', 'bus',
+            'car', 'cat', 'chair', 'cow', 'diningtable', 'dog', 'horse',
+            'motorbike', 'person', 'pottedplant', 'sheep', 'sofa', 'train',
+            'tvmonitor']  # type: List[str]
+    annotations_per_split: "Dict[str, OrderedDict[str, VOC_image_annotation]]"
+
+    def _get_image_index_for_subset(self, prefix, subset: str) -> List[str]:
+        # Load "image index" for a subset (which indices belong to it)
+        filename = self.root_path/prefix/'ImageSets/Main'/f'{subset}.txt'
+        with filename.open('r') as f:
+            image_index = [x.strip() for x in f.readlines()]
+        return image_index
+
+    def _get_annotations_from_index(
+            self, prefix, image_index
+            ) -> "OrderedDict[str, VOC_image_annotation]":
+        annotations: "OrderedDict[str, VOC_image_annotation]" = OrderedDict()
+        # Load region annotation
+        for index in tqdm(image_index):
+            xml_filename = self.root_path/prefix/'Annotations'/f'{index}.xml'
+            xml_tree = ET.parse(xml_filename)
+            filename = str(xml_tree.find('filename').text)  # type: ignore
+            filepath = self.root_path/prefix/'JPEGImages'/filename
+            assert xml_tree.find('folder').text == prefix  # type: ignore
+
+            xml_size = xml_tree.find('size')
+            width, height, depth = [
+                    int(xml_size.find(x).text)  # type: ignore
+                    for x in ('width', 'height', 'depth')]  # type: ignore
+            size_WHD = (width, height, depth)
+
+            # Load objects
+            objects: List[VOC_object] = []
+            xml_objs = xml_tree.findall('object')
+            for xml_obj in xml_objs:
+                # // Getting the box
+                bndbox = xml_obj.find('bndbox')
+                # Make pixel indexes 0-based
+                l = float(bndbox.find('xmin').text) - 1  # type: ignore
+                t_ = float(bndbox.find('ymin').text) - 1  # type: ignore
+                r = float(bndbox.find('xmax').text) - 1  # type: ignore
+                d = float(bndbox.find('ymax').text) - 1  # type: ignore
+                box = np.r_[l, t_, r, d]
+
+                # cls = self._class_to_ind[obj.find('name').text.lower().strip()]
+                objects.append(VOC_object(
+                    name=xml_obj.find('name').text,  # type: ignore
+                    pose=xml_obj.find('pose').text,  # type: ignore
+                    difficult=xml_obj.find('difficult').text == '1',  # type: ignore
+                    truncated=xml_obj.find('truncated').text == '1',  # type: ignore
+                    box=box))
+
+            annotations[index] = VOC_image_annotation(
+                    filename=filename,
+                    filepath=filepath,
+                    size_WHD=size_WHD,
+                    objects=objects)
+        return annotations
+
+    def precompute_to_folder(self, fold):
+        annotations_per_split = small.stash2(
+                fold/'get_annotations_per_split.pkl')(
+                        self.get_annotations_per_split)
+        light_stats = {
+                'annotations_per_split': annotations_per_split}
+        small.save_pkl(fold/'light_stats.pkl', light_stats)
+
+    def populate_from_folder(self, fold):
+        fold = Path(fold)
+        light_stats = small.load_pkl(fold/'light_stats.pkl')
+        self.annotations_per_split = light_stats['annotations_per_split']
+
+
+class DatasetVOC2007(DatasetVOC):
+    def __init__(self):
+        self.root_path = get_dataset_path('detection/VOC2007/VOCdevkit')
+
+    def get_annotations_per_split(self):
+        annotations_per_split = {}
+        # Reading XML
+        for split in ['train', 'trainval', 'val', 'test']:
+            log.info('Loading splits {}'.format(split))
+            image_index = self._get_image_index_for_subset('VOC2007', split)
+            annotations: "OrderedDict[str, VOC_image_annotation]" = \
+                    self._get_annotations_from_index('VOC2007', image_index)
+            annotations_per_split[split] = annotations
+        return annotations_per_split
+
+
+class DatasetVOC2012(DatasetVOC):
+    def __init__(self):
+        self.root_path = get_dataset_path('detection/VOC2012')
+
+    def get_annotations_per_split(self):
+        annotations_per_split = {}
+        # Reading XML
+        for split in ['train', 'trainval', 'val']:
+            log.info('Loading splits {}'.format(split))
+            image_index = self._get_image_index_for_subset('VOC2012', split)
+            annotations: "OrderedDict[str, VOC_image_annotation]" = \
+                    self._get_annotations_from_index('VOC2012', image_index)
+            annotations_per_split[split] = annotations
+        return annotations_per_split
