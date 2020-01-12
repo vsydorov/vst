@@ -955,12 +955,6 @@ DALY_video = TypedDict('DALY_video', {
 })
 
 
-# for action_name, a in v['annot'].items():
-#     for instance_id, source_instance in enumerate(a):
-#         break
-#     break
-# break
-
 class DatasetDALY(object):
     root_path: Path
     action_names: List[DALY_action_name]
@@ -999,8 +993,9 @@ class DatasetDALY(object):
             video_odict[vid] = video
 
         split = {k: 'train' for k in video_odict.keys()}
-        for k in info['splits'][0]:
-            split[k] = 'test'
+        for video_name in info['splits'][0]:
+            vid = video_name.split('.')[0]
+            split[vid] = 'test'
 
         light_stats = {
             'video_odict': video_odict,
@@ -1014,7 +1009,8 @@ class DatasetDALY(object):
     def populate_from_folder(self, fold):
         fold = Path(fold)
         light_stats = small.load_pkl(fold/'light_stats.pkl')
-        source_videos = small.load_pkl(fold/'source_videos.pkl')
+        source_videos: Dict[DALY_vid, RVideoMP4_reached] = \
+                small.load_pkl(fold/'source_videos.pkl')
 
         self.source_videos = source_videos
         self.video_odict = light_stats['video_odict']
@@ -1067,7 +1063,7 @@ class DatasetDALY(object):
         f_mi['diff'] = f_mi['meta'] - f_mi['ocv']
 
         """ We prioritize OCV stats everywhere """
-        source_videos = {}
+        relpath_source_videos: Dict[DALY_vid, RVideoMP4_reached] = {}
         for vid, v in videos_w_ocv.items():
             video = {
                 'height': v['qstats']['height'],
@@ -1075,7 +1071,15 @@ class DatasetDALY(object):
                 'length_reached': v['qstats']['ms_reached']/1000,
                 'frames_reached': v['qstats']['frames_reached'],
                 'rvideo_path': str(v['rel_video_path'])}
-            source_videos[vid] = video
+            relpath_source_videos[vid] = video
+
+        # replace rpaths -> paths
+        source_videos = {}
+        for vid, v in relpath_source_videos.items():
+            vnew = v.copy()
+            vnew['video_path'] = self.root_path/v['rvideo_path']
+            del vnew['rvideo_path']
+            source_videos[vid] = vnew
 
         small.save_pkl(fold/'source_videos.pkl', source_videos)
         small.save_pkl(fold/'light_stats.pkl', light_stats)
