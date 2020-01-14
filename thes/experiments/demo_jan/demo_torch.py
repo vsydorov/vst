@@ -723,8 +723,18 @@ class DalyObjTrainer(DefaultTrainer):
     #     return PascalVOCDetectionEvaluator(dataset_name)
 
 
-def _train_func_dalyobj(d_cfg, cf, args):
+def _train_func_dalyobj(d_cfg, cf, args,):
     simple_d2_setup(d_cfg)
+    datalist_per_split = args.datalist_per_split
+    dataset = args.dataset
+
+    for split, datalist in datalist_per_split.items():
+        d2_dataset_name = f'dalyobjects_{split}'
+        DatasetCatalog.register(d2_dataset_name,
+                lambda split=split: datalist_per_split[split])
+        MetadataCatalog.get(d2_dataset_name).set(
+                thing_classes=dataset.object_names)
+
 
     trainer = DalyObjTrainer(d_cfg)
     trainer.resume_or_load(resume=cf['resume'])
@@ -759,13 +769,6 @@ def train_d2_dalyobj(workfolder, cfg_dict, add_args):
     for split in ['train', 'test']:
         datalist = daly_to_datalist(dataset, split)
         datalist_per_split[split] = datalist
-
-    for split, datalist in datalist_per_split.items():
-        d2_dataset_name = f'dalyobjects_{split}'
-        DatasetCatalog.register(d2_dataset_name,
-                lambda split=split: datalist_per_split[split])
-        MetadataCatalog.get(d2_dataset_name).set(
-                thing_classes=dataset.object_names)
 
     PRETRAINED_WEIGHTS_MODELPATH = '/home/vsydorov/projects/deployed/2019_12_Thesis/links/horus/pytorch_model_zoo/pascal_voc_baseline/model_final_b1acc2.pkl'
     CONFIDENCE_THRESHOLD = 0.25
@@ -807,6 +810,8 @@ def train_d2_dalyobj(workfolder, cfg_dict, add_args):
     port = 2 ** 15 + 2 ** 14 + hash(os.getuid()) % 2 ** 14
     dist_url = "tcp://127.0.0.1:{}".format(port)
     args = argparse.Namespace()
+    args.datalist_per_split = datalist_per_split
+    args.dataset = dataset
 
     launch_w_logging(_train_func_dalyobj,
             cf['num_gpus'],
