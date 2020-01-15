@@ -936,7 +936,7 @@ DALY_keyframe = TypedDict('DALY_keyframe', {
     'objects': np.ndarray,
     'frameNumber': int,
     'pose': np.ndarray,
-    'time': float
+    'time': float  # seconds
 })
 DALY_instance = TypedDict('DALY_instance', {
     'beginTime': float,

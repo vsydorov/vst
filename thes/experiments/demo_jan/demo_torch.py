@@ -62,7 +62,8 @@ from vsydorov_tools import cv as vt_cv
 from thes.data import video_utils
 from thes.tools import snippets
 from thes.data.external_dataset import DatasetVOC2007, DatasetDALY
-from thes.det2 import launch_w_logging, simple_d2_setup
+from thes.det2 import (
+        launch_w_logging, launch_without_logging, simple_d2_setup)
 
 
 log = logging.getLogger(__name__)
@@ -460,9 +461,10 @@ def daly_to_datalist(dataset, split):
         for action_name, instances in v['instances'].items():
             for ins_ind, instance in enumerate(instances):
                 for keyframe in instance['keyframes']:
-                    # box = keyframe['boundingBox']
-                    fn = keyframe['frameNumber']
-                    image_id = '{}_A{}_FN{}'.format(vid, action_name, fn)
+                    frame_number = keyframe['frameNumber']
+                    frame_time = keyframe['time']
+                    image_id = '{}_A{}_FN{}_FT{:.3f}'.format(
+                            vid, action_name, frame_number, frame_time)
                     kf_objects = keyframe['objects']
                     annotations = []
                     for kfo in kf_objects:
@@ -482,7 +484,8 @@ def daly_to_datalist(dataset, split):
                         continue
                     record = {
                             'video_path': video_path,
-                            'video_frame_number': fn,
+                            'video_frame_number': frame_number,
+                            'video_frame_time': frame_time,
                             'image_id': image_id,
                             'height': vmp4['height'],
                             'width': vmp4['width'],
@@ -543,7 +546,8 @@ def demo_d2_dalyobj_vis(workfolder, cfg_dict, add_args):
 def get_single_frame_robustly(video_path, frame_number, OVERALL_ATTEMPTS):
     def _get(video_path, frame_number):
         with vt_cv.video_capture_open(video_path) as vcap:
-            frame_u8 = vt_cv.video_sample(vcap, [frame_number])[0]
+            frame_u8 = vt_cv.video_sample(
+                    vcap, [frame_number], debug_filename=video_path)[0]
         return frame_u8
 
     i = 0
@@ -552,10 +556,72 @@ def get_single_frame_robustly(video_path, frame_number, OVERALL_ATTEMPTS):
             frame_u8 = _get(video_path, frame_number)
             return frame_u8
         except (IOError, vt_cv.VideoCaptureError) as e:
-            log.warning('Caught {}, retrying {}/{}'.format(e, i, OVERALL_ATTEMPTS))
-            i += 0
+            mp_name = multiprocessing.current_process().name
+            WARN_MESSAGE = 'Caught "{}", retrying {}/{}. File {} frame {} mp_name {}'.format(
+                    e, i, OVERALL_ATTEMPTS, video_path, frame_number, mp_name)
+            d2_logger = logging.getLogger('detectron2')
+            log.warning(WARN_MESSAGE)
+            d2_logger.warning(WARN_MESSAGE)
+            print(WARN_MESSAGE)
+            time.sleep(1)
+            i += 1
     raise IOError('Never managed to open {}, frame {}'.format(
         video_path, frame_number))
+
+
+def get_frame_without_crashing(
+        video_path, frame_number, frame_time,
+        OCV_ATTEMPTS=3,
+        PYAV_ATTEMPTS=0):
+    """
+    Plz don't crash
+    """
+    MP_NAME = multiprocessing.current_process().name
+    THREAD_NAME = threading.get_ident()
+
+    def _get_via_opencv(video_path, frame_number):
+        with vt_cv.video_capture_open(video_path, tries=2) as vcap:
+            vcap.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
+            ret, frame_BGR = vcap.retrieve()
+            if ret == 0:
+                raise OSError(f"Can't read frame {frame_number} from {video_path}")
+        return frame_BGR
+
+    def _get_via_pyav(video_path, frame_time):
+        raise NotImplementedError()
+        # import torchvision.io
+        # pyav_video = torchvision.io.read_video(
+        #         video_path, pts_unit='sec', start_pts=frame_time)
+        # return frame_BGR
+
+    def _fail_message(via, e, i, attempts):
+        MESSAGE = (
+            'Failed frame read via {} mp_name {} thread {}. '
+            'Caught "{}", retrying {}/{}. '
+            'File {} frame {}').format(
+                    via, MP_NAME, THREAD_NAME,
+                    e, i, attempts,
+                    video_path, frame_number)
+        log.warning('WARN ' + MESSAGE)
+
+    for i in range(OCV_ATTEMPTS):
+        try:
+            frame_u8 = _get_via_opencv(video_path, frame_number)
+            return frame_u8
+        except (IOError, RuntimeError, NotImplementedError) as e:
+            _fail_message('opencv', e, i, OCV_ATTEMPTS)
+            time.sleep(1)
+
+    for i in range(PYAV_ATTEMPTS):
+        try:
+            frame_u8 = _get_via_pyav(video_path, frame_time)
+            return frame_u8
+        except (IOError, RuntimeError, NotImplementedError) as e:
+            _fail_message('pyav', e, i, OCV_ATTEMPTS)
+            time.sleep(1)
+
+    raise IOError('Never managed to open {}, f_num {} f_time {}'.format(
+        video_path, frame_number, frame_time))
 
 
 class DalyVideoDatasetMapper:
@@ -593,15 +659,17 @@ class DalyVideoDatasetMapper:
         Returns:
             dict: a format that builtin models in detectron2 accept
         """
-        dataset_dict = copy.deepcopy(dataset_dict)  # it will be modified by code below
-        video_path = dataset_dict['video_path']
-        frame_number = dataset_dict['video_frame_number']
+        # it will be modified by code below
+        dataset_dict = copy.deepcopy(dataset_dict)
 
         # Robust video sampling
+        video_path = dataset_dict['video_path']
+        frame_number = dataset_dict['video_frame_number']
+        frame_time = dataset_dict['video_frame_time']
         OVERALL_ATTEMPTS = 5
 
-        image = get_single_frame_robustly(
-                video_path, frame_number, OVERALL_ATTEMPTS)
+        image = get_frame_without_crashing(
+                video_path, frame_number, frame_time, OVERALL_ATTEMPTS)
 
         d2_dutils.check_image_size(dataset_dict, image)
 
@@ -698,6 +766,8 @@ def _train_func_dalyobj(d_cfg, cf, args,):
     datalist_per_split = args.datalist_per_split
     dataset = args.dataset
 
+    # raise RuntimeError('debug')
+
     for split, datalist in datalist_per_split.items():
         d2_dataset_name = f'dalyobjects_{split}'
         DatasetCatalog.register(d2_dataset_name,
@@ -721,6 +791,7 @@ def train_d2_dalyobj(workfolder, cfg_dict, add_args):
     cfg.set_deftype("""
     resume: [True, bool]
     num_gpus: [~, int]
+    num_workers: [4, int]
     base_lr: [0.0025, float]
     eval_period: [0, int]
     checkpoint_period: [5000, int]
@@ -728,6 +799,7 @@ def train_d2_dalyobj(workfolder, cfg_dict, add_args):
     dataset:
         name: [~, ['daly']]
         cache_folder: [~, str]
+    seed: [42, int]
     """)
     cf = cfg.parse()
     # DALY Dataset
@@ -762,7 +834,7 @@ def train_d2_dalyobj(workfolder, cfg_dict, add_args):
     # Different number of classes
     d_cfg.MODEL.ROI_HEADS.NUM_CLASSES = 43
     # No workers
-    # d_cfg.DATALOADER.NUM_WORKERS = 0
+    d_cfg.DATALOADER.NUM_WORKERS = cf['num_workers']
     # GPUs
     d_cfg.SOLVER.BASE_LR = cf['base_lr'] * cf['num_gpus']
     d_cfg.SOLVER.IMS_PER_BATCH = 2 * cf['num_gpus']
@@ -774,6 +846,7 @@ def train_d2_dalyobj(workfolder, cfg_dict, add_args):
     d_cfg.WARMUP_ITERS = int(100 * imult)
     d_cfg.TEST.EVAL_PERIOD = cf['eval_period']
     d_cfg.SOLVER.CHECKPOINT_PERIOD = cf['checkpoint_period']
+    d_cfg.SEED = cf['seed']
     d_cfg.freeze()
 
     port = 2 ** 15 + 2 ** 14 + hash(os.getuid()) % 2 ** 14
@@ -788,5 +861,3 @@ def train_d2_dalyobj(workfolder, cfg_dict, add_args):
             machine_rank=0,
             dist_url=dist_url,
             args=(d_cfg, cf, args))
-
-    # _train_func_dalyobj(d_cfg, cf, args)

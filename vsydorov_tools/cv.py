@@ -93,7 +93,8 @@ class VideoCaptureError(RuntimeError):
 
 def video_sorted_enumerate(cap,
         sorted_framenumbers,
-        throw_on_failure=True):
+        throw_on_failure=True,
+        debug_filename=None):
     """
     Fast opencv frame iteration
     - Only operates on sorted frames
@@ -110,11 +111,12 @@ def video_sorted_enumerate(cap,
 
     def stop_at_0():
         if ret == 0:
+            FAIL_MESSAGE = "Failed to read frame {} from '{}'".format(
+                    f_current, debug_filename)
             if throw_on_failure:
-                raise VideoCaptureError(
-                        f'Failed to read frame {f_current}')
+                raise VideoCaptureError(FAIL_MESSAGE)
             else:
-                log.warning(f'Failed to read frame {f_current}')
+                log.warning(FAIL_MESSAGE)
                 return
 
     assert (np.diff(sorted_framenumbers) >= 0).all(), \
@@ -140,10 +142,11 @@ def video_sorted_enumerate(cap,
         assert f_current == int(cap.get(cv2.CAP_PROP_POS_FRAMES))
 
 
-def video_sample(cap, framenumbers) -> List:
+def video_sample(cap, framenumbers, debug_filename=None) -> List:
     sorted_framenumber = np.unique(framenumbers)
     frames_BGR = {}
-    for i, frame_BGR in video_sorted_enumerate(cap, sorted_framenumber):
+    for i, frame_BGR in video_sorted_enumerate(cap, sorted_framenumber,
+            debug_filename=debug_filename):
         frames_BGR[i] = frame_BGR
     sampled_BGR = []
     for i in framenumbers:
@@ -155,7 +158,8 @@ def read_whole_video(path):
     with video_capture_open(path) as vcap:
         framecount = int(vcap.get(cv2.CAP_PROP_FRAME_COUNT))
         frames = np.array(
-                video_sample(vcap, np.arange(framecount)))
+            video_sample(vcap, np.arange(framecount)),
+            debug_filename=path)
     return frames
 
 
