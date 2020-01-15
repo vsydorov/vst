@@ -540,6 +540,24 @@ def demo_d2_dalyobj_vis(workfolder, cfg_dict, add_args):
         cv2.imwrite(str(out/filename), img_vis.get_image())
 
 
+def get_single_frame_robustly(video_path, frame_number, OVERALL_ATTEMPTS):
+    def _get(video_path, frame_number):
+        with vt_cv.video_capture_open(video_path) as vcap:
+            frame_u8 = vt_cv.video_sample(vcap, [frame_number])[0]
+        return frame_u8
+
+    i = 0
+    while i < OVERALL_ATTEMPTS:
+        try:
+            frame_u8 = _get(video_path, frame_number)
+            return frame_u8
+        except (IOError, vt_cv.VideoCaptureError) as e:
+            log.warning('Caught {}, retrying {}/{}'.format(e, i, OVERALL_ATTEMPTS))
+            i += 0
+    raise IOError('Never managed to open {}, frame {}'.format(
+        video_path, frame_number))
+
+
 class DalyVideoDatasetMapper:
     """
     A callable which takes a dataset dict in Detectron2 Dataset format,
@@ -576,17 +594,14 @@ class DalyVideoDatasetMapper:
             dict: a format that builtin models in detectron2 accept
         """
         dataset_dict = copy.deepcopy(dataset_dict)  # it will be modified by code below
-        # # USER: Write your own image loading if it's not from a file
-        # image = d2_dutils.read_image(
-        #         dataset_dict["file_name"], format=self.img_format)
-
         video_path = dataset_dict['video_path']
         frame_number = dataset_dict['video_frame_number']
-        TRIES = 100
-        with vt_cv.video_capture_open(video_path, TRIES) as vcap:
-            frame_u8 = vt_cv.video_sample(vcap, [frame_number])[0]
 
-        image = frame_u8
+        # Robust video sampling
+        OVERALL_ATTEMPTS = 5
+
+        image = get_single_frame_robustly(
+                video_path, frame_number, OVERALL_ATTEMPTS)
 
         d2_dutils.check_image_size(dataset_dict, image)
 
