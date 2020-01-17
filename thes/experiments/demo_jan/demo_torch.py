@@ -447,12 +447,20 @@ def train_d2_rcnn_voc0712(workfolder, cfg_dict, add_args):
             args=(d_cfg, cf, args))
 
 
-def daly_to_datalist(dataset, split):
+def daly_to_datalist(dataset, split_label):
     split_vids = [vid for vid, split in dataset.split.items()
-            if split == split]
+            if split == split_label]
+
+    if split_label == 'train':
+        split_size = 310
+    elif split_label == 'test':
+        split_size = 200
+    else:
+        split_size = None
+    assert len(split_vids) == split_size
 
     d2_datalist = []
-    for vid in tqdm(split_vids):
+    for vid in split_vids:
         v = dataset.video_odict[vid]
         vmp4 = dataset.source_videos[vid]
         video_path = vmp4['video_path']
@@ -766,8 +774,6 @@ def _train_func_dalyobj(d_cfg, cf, args,):
     datalist_per_split = args.datalist_per_split
     dataset = args.dataset
 
-    # raise RuntimeError('debug')
-
     for split, datalist in datalist_per_split.items():
         d2_dataset_name = f'dalyobjects_{split}'
         DatasetCatalog.register(d2_dataset_name,
@@ -872,5 +878,104 @@ def train_d2_dalyobj(workfolder, cfg_dict, add_args):
             args=(d_cfg, cf, args))
 
 
-def test_d2_dalyobj(workfolder, cfg_dict, add_args):
-    pass
+def vis_evaldemo_dalyobj(predictor, datalist, metadata, visfold, size=50):
+    NP_SEED = 0
+    np_rstate = np.random.RandomState(NP_SEED)
+    prm_train_datalist = np_rstate.permutation(datalist)
+    dl_items = prm_train_datalist[:size]
+
+    cpu_device = torch.device("cpu")
+    for i, dl_item in tqdm(enumerate(dl_items)):
+        video_path = dl_item['video_path']
+        frame_number = dl_item['video_frame_number']
+        frame_time = dl_item['video_frame_number']
+        frame_u8 = get_frame_without_crashing(
+            video_path, frame_number, frame_time)
+
+        # Detect
+
+        predictions = predictor(frame_u8)
+        instances = predictions["instances"].to(cpu_device)
+
+        visualizer1 = Visualizer(frame_u8, metadata=metadata, scale=0.5)
+        vis_output_gt = visualizer1.draw_instance_predictions(predictions=instances)
+
+        visualizer2 = Visualizer(frame_u8, metadata=metadata, scale=0.5)
+        vis_output_det = visualizer2.draw_dataset_dict(dl_item)
+
+        img1 = vis_output_gt.get_image()
+        img2 = vis_output_det.get_image()
+        img_side_by_side = np.hstack((img1, img2))
+
+        filename = 'i{:02d}_id{}_side.jpg'.format(i, dl_item['image_id'])
+        cv2.imwrite(str(visfold/filename), img_side_by_side)
+
+
+def evaldemo_d2_dalyobj_old(workfolder, cfg_dict, add_args):
+    """
+    Here we'll follow the old evaluation protocol
+    """
+    out, = snippets.get_subfolders(workfolder, ['out'])
+    cfg = snippets.YConfig(cfg_dict)
+    cfg.set_deftype("""
+    dataset:
+        name: [~, ['daly']]
+        cache_folder: [~, str]
+    model_to_eval: [~, str]
+    seed: [42, int]
+    """)
+    cf = cfg.parse()
+
+    # DALY Dataset
+    dataset = DatasetDALY()
+    dataset.populate_from_folder(cf['dataset.cache_folder'])
+    CONFIDENCE_THRESHOLD = 0.25
+
+    # D2 dataset compatible list of keyframes
+    datalist_per_split = {}
+    for split in ['train', 'test']:
+        datalist = daly_to_datalist(dataset, split)
+        datalist_per_split[split] = datalist
+
+    for split, datalist in datalist_per_split.items():
+        d2_dataset_name = f'dalyobjects_{split}'
+        DatasetCatalog.register(d2_dataset_name,
+                lambda split=split: datalist_per_split[split])
+        MetadataCatalog.get(d2_dataset_name).set(
+                thing_classes=dataset.object_names)
+
+    # d2_config
+    d_cfg = get_cfg()
+    # Base keys
+    loaded_cfg = yacs.config.CfgNode.load_cfg(YAML_Base_RCNN_C4)
+    d_cfg.merge_from_other_cfg(loaded_cfg)
+    # FRCCN keys
+    loaded_cfg = yacs.config.CfgNode.load_cfg(YAML_faster_rcnn_R_50_C4)
+    d_cfg.merge_from_other_cfg(loaded_cfg)
+    # Manual overwrite
+    d_cfg.MODEL.RETINANET.SCORE_THRESH_TEST = CONFIDENCE_THRESHOLD
+    d_cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = CONFIDENCE_THRESHOLD
+    d_cfg.MODEL.PANOPTIC_FPN.COMBINE.INSTANCES_CONFIDENCE_THRESH = \
+            CONFIDENCE_THRESHOLD
+    d_cfg.OUTPUT_DIR = str(small.mkdir(out/'d2_output'))
+    d_cfg.MODEL.WEIGHTS = cf['model_to_eval']
+    d_cfg.DATASETS.TRAIN = ()
+    d_cfg.DATASETS.TEST = ('dalyobjects_test',)
+    # Different number of classes
+    d_cfg.MODEL.ROI_HEADS.NUM_CLASSES = 43
+    # Defaults:
+    d_cfg.SEED = cf['seed']
+    d_cfg.freeze()
+
+    # Visualizer
+    predictor = DefaultPredictor(d_cfg)
+
+    datalist = datalist_per_split['test']
+    metadata = MetadataCatalog.get("dalyobjects_test")
+    visfold = small.mkdir(out/'exp3/test')
+    vis_evaldemo_dalyobj(predictor, datalist, metadata, visfold, 50)
+
+    datalist = datalist_per_split['train']
+    metadata = MetadataCatalog.get("dalyobjects_train")
+    visfold = small.mkdir(out/'exp3/train')
+    vis_evaldemo_dalyobj(predictor, datalist, metadata, visfold, 50)
