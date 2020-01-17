@@ -876,7 +876,12 @@ def train_d2_dalyobj(workfolder, cfg_dict, add_args):
     d_cfg.merge_from_other_cfg(yacs_add_d2)
     d_cfg.freeze()
 
-    port = 2 ** 15 + 2 ** 14 + hash(os.getuid()) % 2 ** 14
+    if '--port_inc' in add_args:
+        ind = add_args.index('--port_inc')
+        port_inc = int(add_args[ind+1])
+    else:
+        port_inc = 0
+    port = 2 ** 15 + 2 ** 14 + hash(os.getuid()) % 2 ** 14 + port_inc
     dist_url = "tcp://127.0.0.1:{}".format(port)
     args = argparse.Namespace()
     args.datalist_per_split = datalist_per_split
