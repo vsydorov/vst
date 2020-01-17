@@ -796,6 +796,8 @@ def train_d2_dalyobj(workfolder, cfg_dict, add_args):
     eval_period: [0, int]
     checkpoint_period: [5000, int]
     solver_gpuscale: [true, bool]
+    base_solver_steps: [[12000, 16000], list]
+    base_solver_max_iter: [18000, int]
     dataset:
         name: [~, ['daly']]
         cache_folder: [~, str]
@@ -839,10 +841,17 @@ def train_d2_dalyobj(workfolder, cfg_dict, add_args):
     d_cfg.SOLVER.BASE_LR = cf['base_lr'] * cf['num_gpus']
     d_cfg.SOLVER.IMS_PER_BATCH = 2 * cf['num_gpus']
     imult = 8 / cf['num_gpus']
+    """
+    BASE:
+    SOLVER.STEPS = [12000, 16000]
+    SOLVER.MAX_ITER = 18000
+    """
+    # Defaults:
+    base_solver_steps = np.array(cf['base_solver_steps'])
     d_cfg.SOLVER.STEPS = \
-        (np.r_[12000, 16000] * imult).astype(int).tolist()
+        (base_solver_steps * imult).astype(int).tolist()
     d_cfg.SOLVER.MAX_ITER = \
-        int(18000 * imult)
+        int(cf['base_solver_max_iter'] * imult)
     d_cfg.WARMUP_ITERS = int(100 * imult)
     d_cfg.TEST.EVAL_PERIOD = cf['eval_period']
     d_cfg.SOLVER.CHECKPOINT_PERIOD = cf['checkpoint_period']
@@ -861,3 +870,7 @@ def train_d2_dalyobj(workfolder, cfg_dict, add_args):
             machine_rank=0,
             dist_url=dist_url,
             args=(d_cfg, cf, args))
+
+
+def test_d2_dalyobj(workfolder, cfg_dict, add_args):
+    pass

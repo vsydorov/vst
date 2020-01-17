@@ -320,7 +320,7 @@ class YConfig(object):
             VALUE = cf[k]
             if isinstance(v, list):
                 assert VALUE in v, f'Value {VALUE} for key {k} not in {v}'
-            elif v in ['int', 'float', 'str', 'bool']:
+            elif v in ['int', 'float', 'str', 'bool', 'list']:
                 good_cls = eval(v)
                 assert isinstance(VALUE, good_cls), \
                     f'Value {VALUE} for key {k} not of type {good_cls}'
