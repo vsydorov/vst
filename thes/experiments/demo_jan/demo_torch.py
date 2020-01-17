@@ -782,7 +782,7 @@ def _train_func_dalyobj(d_cfg, cf, args,):
                 thing_classes=dataset.object_names)
 
     trainer = DalyObjTrainer(d_cfg)
-    trainer.resume_or_load(resume=cf['resume'])
+    trainer.resume_or_load(resume=args.resume)
     if d_cfg.TEST.AUG.ENABLED:
         trainer.register_hooks(
             [hooks.EvalHook(
@@ -791,25 +791,63 @@ def _train_func_dalyobj(d_cfg, cf, args,):
     trainer.train()
 
 
+def base_d2_frcnn_config():
+    d_cfg = get_cfg()
+    # Base keys
+    loaded_cfg = yacs.config.CfgNode.load_cfg(YAML_Base_RCNN_C4)
+    d_cfg.merge_from_other_cfg(loaded_cfg)
+    # FRCCN keys
+    loaded_cfg = yacs.config.CfgNode.load_cfg(YAML_faster_rcnn_R_50_C4)
+    d_cfg.merge_from_other_cfg(loaded_cfg)
+    return d_cfg
+
+
+def d2dict_gpu_scaling(cf, cf_add_d2, num_gpus):
+    imult = 8 / num_gpus
+    prepared = {}
+    prepared['SOLVER.BASE_LR'] = \
+        cf['gpu_scaling.base.SOLVER.BASE_LR'] * num_gpus
+    prepared['SOLVER.IMS_PER_BATCH'] = \
+        cf['gpu_scaling.base.SOLVER.IMS_PER_BATCH'] * num_gpus
+    prepared['SOLVER.MAX_ITER'] = \
+        int(cf['gpu_scaling.base.SOLVER.MAX_ITER'] * imult)
+    prepared['SOLVER.STEPS'] = tuple((np.array(
+            cf['gpu_scaling.base.SOLVER.STEPS']
+            ) * imult).astype(int).tolist())
+    return cf_add_d2.update(prepared)
+
+
 def train_d2_dalyobj(workfolder, cfg_dict, add_args):
     out, = snippets.get_subfolders(workfolder, ['out'])
     cfg = snippets.YConfig(cfg_dict)
+    cfg.set_defaults_handling(['d2.'])
     cfg.set_deftype("""
-    resume: [True, bool]
     num_gpus: [~, int]
-    num_workers: [4, int]
-    base_lr: [0.0025, float]
-    eval_period: [0, int]
-    checkpoint_period: [5000, int]
-    solver_gpuscale: [true, bool]
-    base_solver_steps: [[12000, 16000], list]
-    base_solver_max_iter: [18000, int]
     dataset:
         name: [~, ['daly']]
         cache_folder: [~, str]
     seed: [42, int]
     """)
+    cfg.set_defaults("""
+    gpu_scaling:
+        enabled: True
+        base:
+            # more per gpu
+            SOLVER.BASE_LR: 0.0025
+            SOLVER.IMS_PER_BATCH: 2
+            # less per gpu
+            SOLVER.MAX_ITER: 18000
+            SOLVER.STEPS: [12000, 16000]
+    """)
+    cfg.set_deftype("""
+    d2:
+        SOLVER.CHECKPOINT_PERIOD: [2500, int]
+        TEST.EVAL_PERIOD: [0, int]
+        SEED: [42, int]
+        # ... anything ...
+    """)
     cf = cfg.parse()
+    cf_add_d2 = cfg.without_prefix('d2.')
     # DALY Dataset
     dataset = DatasetDALY()
     dataset.populate_from_folder(cf['dataset.cache_folder'])
@@ -820,48 +858,22 @@ def train_d2_dalyobj(workfolder, cfg_dict, add_args):
         datalist_per_split[split] = datalist
 
     PRETRAINED_WEIGHTS_MODELPATH = '/home/vsydorov/projects/deployed/2019_12_Thesis/links/horus/pytorch_model_zoo/pascal_voc_baseline/model_final_b1acc2.pkl'
-    CONFIDENCE_THRESHOLD = 0.25
     # d2_config
-    d_cfg = get_cfg()
-    # Base keys
-    loaded_cfg = yacs.config.CfgNode.load_cfg(YAML_Base_RCNN_C4)
-    d_cfg.merge_from_other_cfg(loaded_cfg)
-    # FRCCN keys
-    loaded_cfg = yacs.config.CfgNode.load_cfg(YAML_faster_rcnn_R_50_C4)
-    d_cfg.merge_from_other_cfg(loaded_cfg)
+    d_cfg = base_d2_frcnn_config()
     # Manual overwrite
-    d_cfg.MODEL.RETINANET.SCORE_THRESH_TEST = CONFIDENCE_THRESHOLD
-    d_cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = CONFIDENCE_THRESHOLD
-    d_cfg.MODEL.PANOPTIC_FPN.COMBINE.INSTANCES_CONFIDENCE_THRESH = \
-            CONFIDENCE_THRESHOLD
-    d_cfg.OUTPUT_DIR = str(small.mkdir(out/'d2_output'))
     d_cfg.MODEL.WEIGHTS = PRETRAINED_WEIGHTS_MODELPATH
+    d_cfg.OUTPUT_DIR = str(small.mkdir(out/'d2_output'))
     d_cfg.DATASETS.TRAIN = (
             'dalyobjects_train',)
     d_cfg.DATASETS.TEST = ('dalyobjects_test',)
-    # Different number of classes
     d_cfg.MODEL.ROI_HEADS.NUM_CLASSES = 43
-    # No workers
-    d_cfg.DATALOADER.NUM_WORKERS = cf['num_workers']
-    # GPUs
-    d_cfg.SOLVER.BASE_LR = cf['base_lr'] * cf['num_gpus']
-    d_cfg.SOLVER.IMS_PER_BATCH = 2 * cf['num_gpus']
-    imult = 8 / cf['num_gpus']
-    """
-    BASE:
-    SOLVER.STEPS = [12000, 16000]
-    SOLVER.MAX_ITER = 18000
-    """
-    # Defaults:
-    base_solver_steps = np.array(cf['base_solver_steps'])
-    d_cfg.SOLVER.STEPS = \
-        (base_solver_steps * imult).astype(int).tolist()
-    d_cfg.SOLVER.MAX_ITER = \
-        int(cf['base_solver_max_iter'] * imult)
-    d_cfg.WARMUP_ITERS = int(100 * imult)
-    d_cfg.TEST.EVAL_PERIOD = cf['eval_period']
-    d_cfg.SOLVER.CHECKPOINT_PERIOD = cf['checkpoint_period']
-    d_cfg.SEED = cf['seed']
+    num_gpus = cf['num_gpus']
+    if cf['gpu_scaling.enabled']:
+        d2dict_gpu_scaling(cf, cf_add_d2, num_gpus)
+    # Merge additional keys
+    yacs_add_d2 = yacs.config.CfgNode(
+            snippets.unflatten_nested_dict(cf_add_d2), [])
+    d_cfg.merge_from_other_cfg(yacs_add_d2)
     d_cfg.freeze()
 
     port = 2 ** 15 + 2 ** 14 + hash(os.getuid()) % 2 ** 14
@@ -869,9 +881,10 @@ def train_d2_dalyobj(workfolder, cfg_dict, add_args):
     args = argparse.Namespace()
     args.datalist_per_split = datalist_per_split
     args.dataset = dataset
+    args.resume = True
 
     launch_w_logging(_train_func_dalyobj,
-            cf['num_gpus'],
+            num_gpus,
             num_machines=1,
             machine_rank=0,
             dist_url=dist_url,

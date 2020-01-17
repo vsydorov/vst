@@ -187,6 +187,29 @@ def flatten_nested_dict(d, parent_key='', sep='.'):
     return dict(items)
 
 
+def set_dd(d, key, value, sep='.', soft=False):
+    """
+    Dynamic assignment to nested dictionary
+    http://stackoverflow.com/questions/21297475/set-a-value-deep-in-a-dict-dynamically
+    """
+    dd = d
+    keys = key.split(sep)
+    latest = keys.pop()
+    for k in keys:
+        dd = dd.setdefault(k, {})
+    if soft:
+        dd.setdefault(latest, value)
+    else:
+        dd[latest] = value
+
+
+def unflatten_nested_dict(flat_dict, sep='.'):
+    nested = {}
+    for k, v in flat_dict.items():
+        set_dd(nested, k, v, sep)
+    return nested
+
+
 def yml_cast_to_dict(merge_from):
     if isinstance(merge_from, str):
         merge_from = flatten_nested_dict(yaml.safe_load(merge_from))
@@ -228,10 +251,18 @@ class YConfig(object):
     - All configurations stored inside are flat
     """
 
-    def __init__(self, cfg_dict, raise_without_defaults=True):
+    def __init__(self, cfg_dict):
         self.cf = flatten_nested_dict(cfg_dict)
         self.cf_defaults = {}
         self.typechecks = {}
+        self.allowed_wo_defaults = []
+        self.raise_without_defaults = True
+
+    def set_defaults_handling(self,
+            allowed_wo_defaults=[],
+            raise_without_defaults=True):
+        # Key substrings that are allowed to exist without defaults
+        self.allowed_wo_defaults = allowed_wo_defaults
         self.raise_without_defaults = raise_without_defaults
 
     @staticmethod
@@ -282,10 +313,27 @@ class YConfig(object):
         keys_cf_default = np.array(list(self.cf_defaults.keys()))
         DEFAULTS_ASSIGNED = []
 
-        # Are there new keys that were not present in default?
+        # // Are there new keys that were not present in default?
         keys_without_defaults = keys_cf[~np.in1d(keys_cf, keys_cf_default)]
-        if len(keys_without_defaults):
-            for k in keys_without_defaults:
+        # Take care of keys that were allowed
+        allowed_keys_without_defaults = []
+        forbidden_keys_without_defaults = []
+        for k in keys_without_defaults:
+            allowed = False
+            for allowed_prefix in self.allowed_wo_defaults:
+                if k.startswith(allowed_prefix):
+                    allowed = True
+            if allowed:
+                allowed_keys_without_defaults.append(k)
+            else:
+                forbidden_keys_without_defaults.append(k)
+        if len(allowed_keys_without_defaults):
+            log.info('Some keys were allowed to '
+                    'exist without defaults: {}'.format(
+                        allowed_keys_without_defaults))
+        # Complain about forbidden ones
+        if len(forbidden_keys_without_defaults):
+            for k in forbidden_keys_without_defaults:
                 log.info(f'ERROR: Key {k} has no default value')
             if self.raise_without_defaults:
                 raise ValueError('Keys without defaults')
