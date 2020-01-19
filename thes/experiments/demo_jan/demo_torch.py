@@ -1045,53 +1045,46 @@ class Base_isaver(ABC):
             len(inds_to_purge), files_purged))
 
 
-class Dict_func_isaver(Base_isaver):
+class Simple_isaver(Base_isaver):
     """
-    Will process a dict with a func
+    Will process a list with a func
     """
-    def __init__(self, folder, in_dict, func,
+    def __init__(self, folder, in_list, func,
             save_period='::25'):
         assert sys.version_info >= (3, 6), 'Dicts must keep insertion order'
-        super().__init__(folder, len(in_dict))
-        self.in_dict = in_dict
-        self.out_dict = {}
+        super().__init__(folder, len(in_list))
+        self.in_list = in_list
+        self.result = []
         self.func = func
         self._save_period = save_period
 
-    def _restore(self, i, ifiles):
-        restore_from = ifiles['pkl']
-        self.out_dict = small.load_pkl(restore_from)
-        log.info('Restore from {}'.format(restore_from))
-
-    def _save(self, i):
-        ifiles = self._get_filenames(i)
-        savepath = ifiles['pkl']
-        small.save_pkl(savepath, self.out_dict)
-        ifiles['finished'].touch()
-        log.debug(('Saved at {}/{} to {}'.format(i, self._total, savepath)))
-
-    def _process(self, key):
-        func_args = self.in_dict[key]
-        result = self.func(func_args)
-        self.out_dict[key] = result
-
-    def run(self):
+    def _restore(self):
         intermediate_files: Dict[int, Dict[str, Path]] = \
                 self._get_intermediate_files()
         start_i, ifiles = max(intermediate_files.items(),
                 default=(-1, None))
         if ifiles is not None:
-            self._restore(start_i, ifiles)
-        keys_left = list(self.in_dict.keys())[start_i+1:]
+            restore_from = ifiles['pkl']
+            self.result = small.load_pkl(restore_from)
+            log.info('Restore from {}'.format(restore_from))
+        return start_i
 
-        pbar = tqdm(keys_left)
-        for i, key in enumerate(pbar, start=start_i+1):
-            self._process(key)
+    def _save(self, i):
+        ifiles = self._get_filenames(i)
+        savepath = ifiles['pkl']
+        small.save_pkl(savepath, self.result)
+        ifiles['finished'].touch()
+
+    def run(self):
+        start_i = self._restore()
+        run_range = np.arange(start_i+1, self._total)
+        for i in tqdm(run_range):
+            self.result.append(self.func(self.in_list[i]))
             if snippets.check_step_v2(i, self._save_period) or \
-                    (i+1 == len(keys_left)):
+                    (i+1 == self._total):
                 self._save(i)
                 self._purge_intermediate_files()
-        return self.out_dict
+        return self.result
 
 
 def eval_d2_dalyobj_old(workfolder, cfg_dict, add_args):
@@ -1157,8 +1150,7 @@ def eval_d2_dalyobj_old(workfolder, cfg_dict, add_args):
     # Evaluate all images
     cpu_device = torch.device("cpu")
 
-    def eval_func(datalist_i):
-        dl_item = datalist[datalist_i]
+    def eval_func(dl_item):
         video_path = dl_item['video_path']
         frame_number = dl_item['video_frame_number']
         frame_time = dl_item['video_frame_number']
@@ -1168,8 +1160,6 @@ def eval_d2_dalyobj_old(workfolder, cfg_dict, add_args):
         cpu_instances = predictions["instances"].to(cpu_device)
         return cpu_instances
 
-    r = np.arange(len(datalist))
-    in_dict = dict(zip(r, r))
-    df_isaver = Dict_func_isaver(
-            small.mkdir(out/'isaver'), in_dict, eval_func, '::5')
-    df_isaver.run()
+    df_isaver = Simple_isaver(
+            small.mkdir(out/'isaver'), datalist, eval_func, '::50')
+    predicted_datalist = df_isaver.run()
