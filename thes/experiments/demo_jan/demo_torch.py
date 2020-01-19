@@ -1,4 +1,6 @@
+from abc import abstractmethod, ABC
 import cv2
+import sys
 import copy
 import torch
 import logging
@@ -802,6 +804,13 @@ def base_d2_frcnn_config():
     return d_cfg
 
 
+def set_d2_cthresh(d_cfg, CONFIDENCE_THRESHOLD=0.25):
+    d_cfg.MODEL.RETINANET.SCORE_THRESH_TEST = CONFIDENCE_THRESHOLD
+    d_cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = CONFIDENCE_THRESHOLD
+    d_cfg.MODEL.PANOPTIC_FPN.COMBINE.INSTANCES_CONFIDENCE_THRESH = \
+            CONFIDENCE_THRESHOLD
+
+
 def d2dict_gpu_scaling(cf, cf_add_d2, num_gpus):
     imult = 8 / num_gpus
     prepared = {}
@@ -858,9 +867,9 @@ def train_d2_dalyobj(workfolder, cfg_dict, add_args):
         datalist_per_split[split] = datalist
 
     PRETRAINED_WEIGHTS_MODELPATH = '/home/vsydorov/projects/deployed/2019_12_Thesis/links/horus/pytorch_model_zoo/pascal_voc_baseline/model_final_b1acc2.pkl'
-    # d2_config
+
+    # // d2_config
     d_cfg = base_d2_frcnn_config()
-    # Manual overwrite
     d_cfg.MODEL.WEIGHTS = PRETRAINED_WEIGHTS_MODELPATH
     d_cfg.OUTPUT_DIR = str(small.mkdir(out/'d2_output'))
     d_cfg.DATASETS.TRAIN = (
@@ -931,7 +940,7 @@ def vis_evaldemo_dalyobj(predictor, datalist, metadata, visfold, size=50):
 
 def evaldemo_d2_dalyobj_old(workfolder, cfg_dict, add_args):
     """
-    Here we'll follow the old evaluation protocol
+    Just a demo
     """
     out, = snippets.get_subfolders(workfolder, ['out'])
     cfg = snippets.YConfig(cfg_dict)
@@ -947,7 +956,6 @@ def evaldemo_d2_dalyobj_old(workfolder, cfg_dict, add_args):
     # DALY Dataset
     dataset = DatasetDALY()
     dataset.populate_from_folder(cf['dataset.cache_folder'])
-    CONFIDENCE_THRESHOLD = 0.25
 
     # D2 dataset compatible list of keyframes
     datalist_per_split = {}
@@ -963,18 +971,8 @@ def evaldemo_d2_dalyobj_old(workfolder, cfg_dict, add_args):
                 thing_classes=dataset.object_names)
 
     # d2_config
-    d_cfg = get_cfg()
-    # Base keys
-    loaded_cfg = yacs.config.CfgNode.load_cfg(YAML_Base_RCNN_C4)
-    d_cfg.merge_from_other_cfg(loaded_cfg)
-    # FRCCN keys
-    loaded_cfg = yacs.config.CfgNode.load_cfg(YAML_faster_rcnn_R_50_C4)
-    d_cfg.merge_from_other_cfg(loaded_cfg)
-    # Manual overwrite
-    d_cfg.MODEL.RETINANET.SCORE_THRESH_TEST = CONFIDENCE_THRESHOLD
-    d_cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = CONFIDENCE_THRESHOLD
-    d_cfg.MODEL.PANOPTIC_FPN.COMBINE.INSTANCES_CONFIDENCE_THRESH = \
-            CONFIDENCE_THRESHOLD
+    d_cfg = base_d2_frcnn_config()
+    set_d2_cthresh(d_cfg, 0.25)
     d_cfg.OUTPUT_DIR = str(small.mkdir(out/'d2_output'))
     d_cfg.MODEL.WEIGHTS = cf['model_to_eval']
     d_cfg.DATASETS.TRAIN = ()
@@ -997,3 +995,181 @@ def evaldemo_d2_dalyobj_old(workfolder, cfg_dict, add_args):
     metadata = MetadataCatalog.get("dalyobjects_train")
     visfold = small.mkdir(out/'exp3/train')
     vis_evaldemo_dalyobj(predictor, datalist, metadata, visfold, 50)
+
+
+class Base_isaver(ABC):
+    def __init__(self, folder, total):
+        self._re_finished = (
+            r'item_(?P<i>\d+)_of_(?P<N>\d+).finished')
+        self._fmt_finished = 'item_{:04d}_of_{:04d}.finished'
+        self._history_size = 3
+
+        self._folder = folder
+        self._total = total
+
+    def _get_filenames(self, i) -> Dict[str, Path]:
+        base_filenames = {
+            'finished': self._fmt_finished.format(i, self._total)}
+        base_filenames['pkl'] = Path(base_filenames['finished']).with_suffix('.pkl')
+        filenames = {k: self._folder/v for k, v in base_filenames.items()}
+        return filenames
+
+    def _get_intermediate_files(self) -> Dict[int, Dict[str, Path]]:
+        """Check re_finished, query existing filenames"""
+        intermediate_files = {}
+        for ffilename in self._folder.iterdir():
+            matched = re.match(self._re_finished, ffilename.name)
+            if matched:
+                i = int(matched.groupdict()['i'])
+                # Check if filenames exist
+                filenames = self._get_filenames(i)
+                all_exist = all([v.exists() for v in filenames.values()])
+                assert ffilename == filenames['finished']
+                if all_exist:
+                    intermediate_files[i] = filenames
+        return intermediate_files
+
+    def _purge_intermediate_files(self):
+        """Remove old saved states"""
+        intermediate_files: Dict[int, Dict[str, Path]] = \
+                self._get_intermediate_files()
+        inds_to_purge = np.sort(np.fromiter(
+            intermediate_files.keys(), np.int))[:-self._history_size]
+        files_purged = 0
+        for ind in inds_to_purge:
+            filenames = intermediate_files[ind]
+            for filename in filenames.values():
+                filename.unlink()
+                files_purged += 1
+        log.debug('Purged {} states, {} files'.format(
+            len(inds_to_purge), files_purged))
+
+
+class Dict_func_isaver(Base_isaver):
+    """
+    Will process a dict with a func
+    """
+    def __init__(self, folder, in_dict, func,
+            save_period='::25'):
+        assert sys.version_info >= (3, 6), 'Dicts must keep insertion order'
+        super().__init__(folder, len(in_dict))
+        self.in_dict = in_dict
+        self.out_dict = {}
+        self.func = func
+        self._save_period = save_period
+
+    def _restore(self, i, ifiles):
+        restore_from = ifiles['pkl']
+        self.out_dict = small.load_pkl(restore_from)
+        log.info('Restore from {}'.format(restore_from))
+
+    def _save(self, i):
+        ifiles = self._get_filenames(i)
+        savepath = ifiles['pkl']
+        small.save_pkl(savepath, self.out_dict)
+        ifiles['finished'].touch()
+        log.debug(('Saved at {}/{} to {}'.format(i, self._total, savepath)))
+
+    def _process(self, key):
+        func_args = self.in_dict[key]
+        result = self.func(func_args)
+        self.out_dict[key] = result
+
+    def run(self):
+        intermediate_files: Dict[int, Dict[str, Path]] = \
+                self._get_intermediate_files()
+        start_i, ifiles = max(intermediate_files.items(),
+                default=(-1, None))
+        if ifiles is not None:
+            self._restore(start_i, ifiles)
+        keys_left = list(self.in_dict.keys())[start_i+1:]
+
+        pbar = tqdm(keys_left)
+        for i, key in enumerate(pbar, start=start_i+1):
+            self._process(key)
+            if snippets.check_step_v2(i, self._save_period) or \
+                    (i+1 == len(keys_left)):
+                self._save(i)
+                self._purge_intermediate_files()
+        return self.out_dict
+
+
+def eval_d2_dalyobj_old(workfolder, cfg_dict, add_args):
+    """
+    Here we'll follow the old evaluation protocol
+    """
+    out, = snippets.get_subfolders(workfolder, ['out'])
+    cfg = snippets.YConfig(cfg_dict)
+    cfg.set_deftype("""
+    dataset:
+        name: [~, ['daly']]
+        cache_folder: [~, str]
+    model_to_eval: [~, str]
+    subset: ['train', str]
+    seed: [42, int]
+    """)
+    cf = cfg.parse()
+
+    # DALY Dataset
+    dataset = DatasetDALY()
+    dataset.populate_from_folder(cf['dataset.cache_folder'])
+
+    # D2 dataset compatible list of keyframes
+    datalist_per_split = {}
+    for split in ['train', 'test']:
+        datalist = daly_to_datalist(dataset, split)
+        datalist_per_split[split] = datalist
+
+    for split, datalist in datalist_per_split.items():
+        d2_dataset_name = f'dalyobjects_{split}'
+        DatasetCatalog.register(d2_dataset_name,
+                lambda split=split: datalist_per_split[split])
+        MetadataCatalog.get(d2_dataset_name).set(
+                thing_classes=dataset.object_names)
+
+    # d2_config
+    d_cfg = base_d2_frcnn_config()
+    set_d2_cthresh(d_cfg, 0.25)
+    d_cfg.OUTPUT_DIR = str(small.mkdir(out/'d2_output'))
+    d_cfg.MODEL.WEIGHTS = cf['model_to_eval']
+    d_cfg.DATASETS.TRAIN = ()
+    d_cfg.DATASETS.TEST = ('dalyobjects_test',)
+    # Different number of classes
+    d_cfg.MODEL.ROI_HEADS.NUM_CLASSES = 43
+    # Defaults:
+    d_cfg.SEED = cf['seed']
+    d_cfg.freeze()
+
+    # Visualizer
+    predictor = DefaultPredictor(d_cfg)
+
+    # Define subset
+    subset = cf['subset']
+    if subset == 'train':
+        datalist = datalist_per_split['train']
+        metadata = MetadataCatalog.get("dalyobjects_train")
+    elif subset == 'test':
+        datalist = datalist_per_split['test']
+        metadata = MetadataCatalog.get("dalyobjects_test")
+    else:
+        raise RuntimeError('wrong subset')
+
+    # Evaluate all images
+    cpu_device = torch.device("cpu")
+
+    def eval_func(datalist_i):
+        dl_item = datalist[datalist_i]
+        video_path = dl_item['video_path']
+        frame_number = dl_item['video_frame_number']
+        frame_time = dl_item['video_frame_number']
+        frame_u8 = get_frame_without_crashing(
+            video_path, frame_number, frame_time)
+        predictions = predictor(frame_u8)
+        cpu_instances = predictions["instances"].to(cpu_device)
+        return cpu_instances
+
+    r = np.arange(len(datalist))
+    in_dict = dict(zip(r, r))
+    df_isaver = Dict_func_isaver(
+            small.mkdir(out/'isaver'), in_dict, eval_func, '::5')
+    df_isaver.run()
