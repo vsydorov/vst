@@ -1,4 +1,3 @@
-from abc import abstractmethod, ABC
 import cv2
 import sys
 import copy
@@ -62,6 +61,7 @@ from vsydorov_tools import small
 from vsydorov_tools import cv as vt_cv
 
 from thes.data import video_utils
+from thes.eval_tools import legacy_evaluation
 from thes.tools import snippets
 from thes.data.external_dataset import DatasetVOC2007, DatasetDALY
 from thes.det2 import (
@@ -1000,285 +1000,6 @@ def evaldemo_d2_dalyobj_old(workfolder, cfg_dict, add_args):
     vis_evaldemo_dalyobj(predictor, datalist, metadata, visfold, 50)
 
 
-class Base_isaver(ABC):
-    def __init__(self, folder, total):
-        self._re_finished = (
-            r'item_(?P<i>\d+)_of_(?P<N>\d+).finished')
-        self._fmt_finished = 'item_{:04d}_of_{:04d}.finished'
-        self._history_size = 3
-
-        self._folder = folder
-        self._total = total
-
-    def _get_filenames(self, i) -> Dict[str, Path]:
-        base_filenames = {
-            'finished': self._fmt_finished.format(i, self._total)}
-        base_filenames['pkl'] = Path(base_filenames['finished']).with_suffix('.pkl')
-        filenames = {k: self._folder/v for k, v in base_filenames.items()}
-        return filenames
-
-    def _get_intermediate_files(self) -> Dict[int, Dict[str, Path]]:
-        """Check re_finished, query existing filenames"""
-        intermediate_files = {}
-        for ffilename in self._folder.iterdir():
-            matched = re.match(self._re_finished, ffilename.name)
-            if matched:
-                i = int(matched.groupdict()['i'])
-                # Check if filenames exist
-                filenames = self._get_filenames(i)
-                all_exist = all([v.exists() for v in filenames.values()])
-                assert ffilename == filenames['finished']
-                if all_exist:
-                    intermediate_files[i] = filenames
-        return intermediate_files
-
-    def _purge_intermediate_files(self):
-        """Remove old saved states"""
-        intermediate_files: Dict[int, Dict[str, Path]] = \
-                self._get_intermediate_files()
-        inds_to_purge = np.sort(np.fromiter(
-            intermediate_files.keys(), np.int))[:-self._history_size]
-        files_purged = 0
-        for ind in inds_to_purge:
-            filenames = intermediate_files[ind]
-            for filename in filenames.values():
-                filename.unlink()
-                files_purged += 1
-        log.debug('Purged {} states, {} files'.format(
-            len(inds_to_purge), files_purged))
-
-
-class Simple_isaver(Base_isaver):
-    """
-    Will process a list with a func
-    """
-    def __init__(self, folder, in_list, func,
-            save_period='::25'):
-        assert sys.version_info >= (3, 6), 'Dicts must keep insertion order'
-        super().__init__(folder, len(in_list))
-        self.in_list = in_list
-        self.result = []
-        self.func = func
-        self._save_period = save_period
-
-    def _restore(self):
-        intermediate_files: Dict[int, Dict[str, Path]] = \
-                self._get_intermediate_files()
-        start_i, ifiles = max(intermediate_files.items(),
-                default=(-1, None))
-        if ifiles is not None:
-            restore_from = ifiles['pkl']
-            self.result = small.load_pkl(restore_from)
-            log.info('Restore from {}'.format(restore_from))
-        return start_i
-
-    def _save(self, i):
-        ifiles = self._get_filenames(i)
-        savepath = ifiles['pkl']
-        small.save_pkl(savepath, self.result)
-        ifiles['finished'].touch()
-
-    def run(self):
-        start_i = self._restore()
-        run_range = np.arange(start_i+1, self._total)
-        for i in tqdm(run_range):
-            self.result.append(self.func(self.in_list[i]))
-            if snippets.check_step_v2(i, self._save_period) or \
-                    (i+1 == self._total):
-                self._save(i)
-                self._purge_intermediate_files()
-        return self.result
-
-
-def voc_ap(rec, prec, use_07_metric=False):
-    """ ap = voc_ap(rec, prec, [use_07_metric])
-    Compute VOC AP given precision and recall.
-    If use_07_metric is true, uses the
-    VOC 07 11 point method (default:False).
-    """
-    if use_07_metric:
-        # 11 point metric
-        ap = 0.
-        for t_ in np.arange(0., 1.1, 0.1):
-            if np.sum(rec >= t_) == 0:
-                p = 0
-            else:
-                p = np.max(prec[rec >= t_])
-            ap = ap + p / 11.
-    else:
-        # correct AP calculation
-        # first append sentinel values at the end
-        mrec = np.concatenate(([0.], rec, [1.]))
-        mpre = np.concatenate(([0.], prec, [0.]))
-
-        # compute the precision envelope
-        for i in range(mpre.size - 1, 0, -1):
-            mpre[i - 1] = np.maximum(mpre[i - 1], mpre[i])
-
-        # to calculate area under PR curve, look for points
-        # where X axis (recall) changes value
-        i = np.where(mrec[1:] != mrec[:-1])[0]
-
-        # and sum (\Delta recall) * prec
-        ap = np.sum((mrec[i + 1] - mrec[i]) * mpre[i + 1])
-    return ap
-
-
-from collections import namedtuple
-
-
-BoxLTRD = namedtuple('BoxLTRD', 'l t r d')
-Flat_annotation = namedtuple('Flat_annotation', 'id diff l t r d')
-Flat_detection = namedtuple('Flat_detection', 'id id_box score l t r d')
-
-
-def box_area(box: BoxLTRD) -> float:
-    return float((box.d-box.t+1)*(box.r-box.l+1))
-
-
-def box_intersection(
-        bb1: BoxLTRD,
-        bb2: BoxLTRD
-            ) -> BoxLTRD:
-    """ Intersection of two bbs
-    Returned bb has same type as first argument"""
-
-    return BoxLTRD(
-            l=max(bb1.l, bb2.l),
-            t=max(bb1.t, bb2.t),
-            r=min(bb1.r, bb2.r),
-            d=min(bb1.d, bb2.d))
-
-
-def t_box_iou(
-        bb1: BoxLTRD,
-        bb2: BoxLTRD
-            ) -> float:
-
-    inter = box_intersection(bb1, bb2)
-    if (inter.t >= inter.d) or (inter.l >= inter.r):
-        return 0.0  # no intersection
-    else:
-        intersection_area = box_area(inter)
-        union_area = box_area(bb1) + box_area(bb2) - intersection_area
-        return intersection_area/union_area
-
-
-VOClike_object = TypedDict('VOClike_object', {
-    'name': str,
-    'difficult': bool,
-    'box': BoxLTRD
-})
-
-VOClike_image_annotation = TypedDict('VOClike_image_annotation', {
-    'filepath': Path,
-    'frameNumber': int,  # if '-1' we treat filename is image, otherwise as video
-    'size_WHD': Tuple[int, int, int],
-    'objects': List[VOClike_object]
-})
-
-
-def oldcode_evaluate_voc_detections(
-        annotation_list: List[VOClike_image_annotation],
-        all_boxes: "List[OrderedDict[str, np.array]]",
-        object_classes: List[str],
-        iou_thresh,
-        use_07_metric,
-        use_diff
-            ) -> Dict[str, float]:
-    """
-    Params:
-        use_07_metric: If True, will evaluate AP over 11 points, like in VOC2007 evaluation code
-        use_diff: If True, will eval difficult proposals in the same way as real ones
-    """
-
-    assert len(annotation_list) == len(all_boxes)
-
-    ap_per_cls: Dict[str, float] = {}
-    for obj_cls in object_classes:
-        # Extract GT annotation_list (id diff l t r d)
-        flat_annotations: List[Flat_annotation] = []
-        for ind, image_anno in enumerate(annotation_list):
-            for obj in image_anno['objects']:
-                if obj['name'] == obj_cls:
-                    flat_annotations.append(Flat_annotation(
-                        ind, obj['difficult'], *obj['box']))
-        # Extract detections (id id_box score l t r d)
-        flat_detections: List[Flat_detection] = []
-        for id, dets_per_cls in enumerate(all_boxes):
-            for id_box, det in enumerate(dets_per_cls[obj_cls]):
-                flat_detections.append(
-                        Flat_detection(id, id_box, det[4], *det[:4]))
-
-        # Prepare
-        detection_matched = np.zeros(len(flat_detections), dtype=bool)
-        gt_already_matched = np.zeros(len(flat_annotations), dtype=bool)
-        gt_assignment = {}  # type: Dict[int, List[int]]
-        for i, fa in enumerate(flat_annotations):
-            gt_assignment.setdefault(fa.id, []).append(i)
-        # Provenance
-        detection_matched_to_which_gt = np.ones(
-                len(flat_detections), dtype=int)*-1
-
-        # VOC2007 preparation
-        nd = len(flat_detections)
-        tp = np.zeros(nd)
-        fp = np.zeros(nd)
-        if use_diff:
-            npos = len(flat_annotations)
-        else:
-            npos = len([x for x in flat_annotations if not x.diff])
-
-        # Go through ordered detections
-        detection_scores = np.array([x.score for x in flat_detections])
-        detection_scores = detection_scores.round(3)
-        sorted_inds = np.argsort(-detection_scores)
-        for d, detection_ind in enumerate(sorted_inds):
-            detection: Flat_detection = flat_detections[detection_ind]
-
-            # Check available GTs
-            gt_ids_that_share_image = \
-                    gt_assignment.get(detection.id, [])  # type: List[int]
-            if not len(gt_ids_that_share_image):
-                fp[d] = 1
-                continue
-
-            # Compute IOUs
-            det_box = BoxLTRD(*(np.array(detection[3:]).round(1)+1))
-            gt_boxes: List[BoxLTRD] = [BoxLTRD(*(np.array(
-                flat_annotations[gt_ind][2:]).round(1)+1))
-                for gt_ind in gt_ids_that_share_image]
-            iou_coverages = [t_box_iou(det_box, gtb) for gtb in gt_boxes]
-
-            max_coverage_id = np.argmax(iou_coverages)
-            max_coverage = iou_coverages[max_coverage_id]
-            gt_id = gt_ids_that_share_image[max_coverage_id]
-
-            # Mirroring voc_eval
-            if max_coverage > iou_thresh:
-                if (not use_diff) and flat_annotations[gt_id].diff:
-                    continue
-                if not gt_already_matched[gt_id]:
-                    tp[d] = 1
-                    detection_matched[detection_ind] = True
-                    gt_already_matched[gt_id] = True
-                    detection_matched_to_which_gt[detection_ind] = gt_id
-                else:
-                    fp[d] = 1
-            else:
-                fp[d] = 1
-
-        fp = np.cumsum(fp)
-        tp = np.cumsum(tp)
-        rec = tp / float(npos)
-        prec = tp / np.maximum(tp + fp, np.finfo(np.float64).eps)
-        ap = voc_ap(rec, prec, use_07_metric)
-        ap_per_cls[obj_cls] = ap
-        # sklearn version does not work, since it assumes 'recall=1'
-        # ap = sklearn.metrics.average_precision_score(detection_matched, detection_scores)
-    return ap_per_cls
-
-
 def eval_d2_dalyobj_old(workfolder, cfg_dict, add_args):
     """
     Here we'll follow the old evaluation protocol
@@ -1289,6 +1010,7 @@ def eval_d2_dalyobj_old(workfolder, cfg_dict, add_args):
     dataset:
         name: [~, ['daly']]
         cache_folder: [~, str]
+    conf_thresh: [0.0, float]
     model_to_eval: [~, str]
     subset: ['train', str]
     seed: [42, int]
@@ -1314,7 +1036,7 @@ def eval_d2_dalyobj_old(workfolder, cfg_dict, add_args):
 
     # d2_config
     d_cfg = base_d2_frcnn_config()
-    set_d2_cthresh(d_cfg, 0.25)
+    set_d2_cthresh(d_cfg, cf['conf_thresh'])
     d_cfg.OUTPUT_DIR = str(small.mkdir(out/'d2_output'))
     d_cfg.MODEL.WEIGHTS = cf['model_to_eval']
     d_cfg.DATASETS.TRAIN = ()
@@ -1324,6 +1046,8 @@ def eval_d2_dalyobj_old(workfolder, cfg_dict, add_args):
     # Defaults:
     d_cfg.SEED = cf['seed']
     d_cfg.freeze()
+
+    simple_d2_setup(d_cfg)
 
     # Visualizer
     predictor = DefaultPredictor(d_cfg)
@@ -1352,59 +1076,134 @@ def eval_d2_dalyobj_old(workfolder, cfg_dict, add_args):
         cpu_instances = predictions["instances"].to(cpu_device)
         return cpu_instances
 
-    df_isaver = Simple_isaver(
+    df_isaver = snippets.Simple_isaver(
             small.mkdir(out/'isaver'), datalist, eval_func, '::50')
     predicted_datalist = df_isaver.run()
+    legacy_evaluation(dataset, datalist, predicted_datalist)
 
-    # // Transform to oldshool data format
-    # //// GroundTruth
-    voclike_annotation_list = []
-    for dl_item in datalist:
-        objects = []
-        for dl_anno in dl_item['annotations']:
-            name = dataset.object_names[dl_anno['category_id']]
-            box = BoxLTRD(*dl_anno['bbox'])
-            difficult = dl_anno['is_occluded']
-            o = VOClike_object(name=name, difficult=difficult, box=box)
-            objects.append(o)
-        filepath = dl_item['video_path']
-        frameNumber = dl_item['video_frame_number']
-        size_WHD = (dl_item['width'], dl_item['height'], 3)
-        voclike_annotation = VOClike_image_annotation(
-                filepath=filepath, frameNumber=frameNumber,
-                size_WHD=size_WHD, objects=objects)
-        voclike_annotation_list.append(voclike_annotation)
-    # //// Detections
-    all_boxes = []
-    for dl_item, pred_item in zip(datalist, predicted_datalist):
-        pred_boxes = pred_item.pred_boxes.tensor.numpy()
-        scores = pred_item.scores.numpy()
-        pred_classes = pred_item.pred_classes.numpy()
-        # dets = {k: [] for k in dataset.object_names}
-        dets = {}
-        for b, s, c_ind in zip(pred_boxes, scores, pred_classes):
-            cls = dataset.object_names[c_ind]
-            dets.setdefault(cls, []).append(np.r_[b, s])
-        dets = {k: np.vstack(v) for k, v in dets.items()}
-        dets = {k: dets.get(k, np.array([])) for k in dataset.object_names}
-        all_boxes.append(dets)
 
-    use_07_metric = False
-    use_diff = False
-    iou_thresholds = [0.3, 0.5]
-    iou_thresh = 0.5
-    object_classes = dataset.object_names
-    ap_per_cls: Dict[str, float] = oldcode_evaluate_voc_detections(
-            voclike_annotation_list,
-            all_boxes,
-            object_classes,
-            iou_thresh, use_07_metric, use_diff)
+# class BatchPredictor_to_CPU(DefaultPredictor):
+#     def __call__(self, in_images, eval_batch_size=4):
+#         cpu_device = torch.device("cpu")
+#         with torch.no_grad():
+#             if self.input_format == "RGB":
+#                 # whether the model expects BGR inputs or RGB
+#                 images = in_images[:, :, :, ::-1]
+#             else:
+#                 images = in_images
+#             height, width = images.shape[1:3]
+#             images = [self.transform_gen.get_transform(oi).apply_image(oi)
+#                     for oi in images]
+#             images = [torch.as_tensor(image.astype("float32").transpose(2, 0, 1).copy())
+#                 for image in images]
+#             inputs = [{"image": image, "height": height, "width": width}
+#                 for image in images]
+#
+#             # forward_by_eval_batch_size_efficient
+#             indices = np.arange(len(inputs))
+#             split_indices = snippets.leqn_split(indices, eval_batch_size)
+#             cpu_outputs = []
+#             for split_ii in split_indices:
+#                 split_inputs = [inputs[i] for i in split_ii]
+#                 split_predictions = self.model(split_inputs)
+#                 split_icpu = [p["instances"].to(cpu_device)
+#                         for p in split_predictions]
+#                 cpu_outputs.extend(split_icpu)
+#             return cpu_outputs
 
-    # Results printed nicely via pd.Series
-    x = pd.Series(ap_per_cls)*100
-    x.loc['AVERAGE'] = x.mean()
-    table = snippets.string_table(
-            np.array(x.reset_index()),
-            header=['Object', 'AP'],
-            col_formats=['{}', '{:.2f}'], pad=2)
-    log.info(f'AP@{iou_thresh:.3f}:\n{table}')
+
+def eval_d2_dalyobj_old_maybefaster(workfolder, cfg_dict, add_args):
+    """
+    Here we'll follow the old evaluation protocol
+    """
+    out, = snippets.get_subfolders(workfolder, ['out'])
+    cfg = snippets.YConfig(cfg_dict)
+    cfg.set_deftype("""
+    dataset:
+        name: [~, ['daly']]
+        cache_folder: [~, str]
+    conf_thresh: [0.25, float]
+    model_to_eval: [~, str]
+    subset: ['train', str]
+    seed: [42, int]
+    """)
+    cf = cfg.parse()
+
+    # DALY Dataset
+    dataset = DatasetDALY()
+    dataset.populate_from_folder(cf['dataset.cache_folder'])
+
+    # D2 dataset compatible list of keyframes
+    datalist_per_split = {}
+    for split in ['train', 'test']:
+        datalist = daly_to_datalist(dataset, split)
+        datalist_per_split[split] = datalist
+
+    for split, datalist in datalist_per_split.items():
+        d2_dataset_name = f'dalyobjects_{split}'
+        DatasetCatalog.register(d2_dataset_name,
+                lambda split=split: datalist_per_split[split])
+        MetadataCatalog.get(d2_dataset_name).set(
+                thing_classes=dataset.object_names)
+
+    # d2_config
+    d_cfg = base_d2_frcnn_config()
+    set_d2_cthresh(d_cfg, cf['conf_thresh'])
+    d_cfg.OUTPUT_DIR = str(small.mkdir(out/'d2_output'))
+    d_cfg.MODEL.WEIGHTS = cf['model_to_eval']
+    d_cfg.DATASETS.TRAIN = ()
+    d_cfg.DATASETS.TEST = ('dalyobjects_test',)
+    # Different number of classes
+    d_cfg.MODEL.ROI_HEADS.NUM_CLASSES = 43
+    # Defaults:
+    d_cfg.SEED = cf['seed']
+    d_cfg.freeze()
+
+    simple_d2_setup(d_cfg)
+
+    # Visualizer
+    predictor = DefaultPredictor(d_cfg)
+
+    # Define subset
+    subset = cf['subset']
+    if subset == 'train':
+        datalist = datalist_per_split['train']
+        metadata = MetadataCatalog.get("dalyobjects_train")
+    elif subset == 'test':
+        datalist = datalist_per_split['test']
+        metadata = MetadataCatalog.get("dalyobjects_test")
+    else:
+        raise RuntimeError('wrong subset')
+
+    # Evaluate all images
+    cpu_device = torch.device("cpu")
+    # group by videoname
+    assert sys.version_info >= (3, 6), 'Dicts must keep insertion order'
+    videogroups = {}
+    for k, v in pd.DataFrame(datalist).groupby('video_path').groups.items():
+        grouped = [datalist[i] for i in v]
+        videogroups[k] = grouped
+
+    def eval_func_grouped(kv):
+        k, grouped = kv
+        video_path = k
+        frame_numbers = [dl_item['video_frame_number'] for dl_item in grouped]
+        with vt_cv.video_capture_open(video_path, tries=2) as vcap:
+            frames_u8 = vt_cv.video_sample(
+                    vcap, frame_numbers,
+                    debug_filename=video_path)
+
+        grouped_instances = []
+        for frame_u8 in frames_u8:
+            predictions = predictor(frame_u8)
+            cpu_instances = predictions["instances"].to(cpu_device)
+            grouped_instances.append(cpu_instances)
+
+        return grouped_instances
+
+    df_isaver = snippets.Simple_isaver(
+            small.mkdir(out/'isaver_grouped'),
+            list(videogroups.items()), eval_func_grouped, '::5')
+    predicted_grouped_datalist = df_isaver.run()
+
+    # legacy_evaluation(dataset, datalist, predicted_datalist)
