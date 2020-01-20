@@ -2,12 +2,17 @@
 Tools for detectron2
 """
 import os
-import sys
+import yacs
 import functools
 import multiprocessing
 import threading
 import logging
 import logging.handlers
+import cv2
+import time
+import numpy as np
+
+from vsydorov_tools import cv as vt_cv
 
 import torch
 import torch.multiprocessing as torch_mp
@@ -20,8 +25,154 @@ from detectron2.utils.logger import (
         setup_logger, _ColorfulFormatter, colored, _cached_log_stream)
 from detectron2.utils.collect_env import collect_env_info
 from detectron2.utils.env import seed_all_rng
+from detectron2.config import get_cfg
 
 log = logging.getLogger(__name__)
+
+
+# Base-RCNN-C4.yaml
+YAML_Base_RCNN_C4 = """
+MODEL:
+  META_ARCHITECTURE: "GeneralizedRCNN"
+  RPN:
+    PRE_NMS_TOPK_TEST: 6000
+    POST_NMS_TOPK_TEST: 1000
+  ROI_HEADS:
+    NAME: "Res5ROIHeads"
+DATASETS:
+  TRAIN: ("coco_2017_train",)
+  TEST: ("coco_2017_val",)
+SOLVER:
+  IMS_PER_BATCH: 16
+  BASE_LR: 0.02
+  STEPS: (60000, 80000)
+  MAX_ITER: 90000
+INPUT:
+  MIN_SIZE_TRAIN: (640, 672, 704, 736, 768, 800)
+VERSION: 2
+"""
+
+# faster_rcnn_R_50_C4.yaml
+YAML_faster_rcnn_R_50_C4 = """
+MODEL:
+  WEIGHTS: "detectron2://ImageNetPretrained/MSRA/R-50.pkl"
+  MASK_ON: False
+  RESNETS:
+    DEPTH: 50
+  ROI_HEADS:
+    NUM_CLASSES: 20
+INPUT:
+  MIN_SIZE_TRAIN: (480, 512, 544, 576, 608, 640, 672, 704, 736, 768, 800)
+  MIN_SIZE_TEST: 800
+DATASETS:
+  TRAIN: ('voc_2007_trainval', 'voc_2012_trainval')
+  TEST: ('voc_2007_test',)
+SOLVER:
+  STEPS: (12000, 16000)
+  MAX_ITER: 18000  # 17.4 epochs
+  WARMUP_ITERS: 100
+"""
+
+
+def base_d2_frcnn_config():
+    d_cfg = get_cfg()
+    # Base keys
+    loaded_cfg = yacs.config.CfgNode.load_cfg(YAML_Base_RCNN_C4)
+    d_cfg.merge_from_other_cfg(loaded_cfg)
+    # FRCCN keys
+    loaded_cfg = yacs.config.CfgNode.load_cfg(YAML_faster_rcnn_R_50_C4)
+    d_cfg.merge_from_other_cfg(loaded_cfg)
+    return d_cfg
+
+
+def set_d2_cthresh(d_cfg, CONFIDENCE_THRESHOLD=0.25):
+    d_cfg.MODEL.RETINANET.SCORE_THRESH_TEST = CONFIDENCE_THRESHOLD
+    d_cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = CONFIDENCE_THRESHOLD
+    d_cfg.MODEL.PANOPTIC_FPN.COMBINE.INSTANCES_CONFIDENCE_THRESH = \
+            CONFIDENCE_THRESHOLD
+
+
+def get_frame_without_crashing(
+        video_path, frame_number, frame_time,
+        OCV_ATTEMPTS=3,
+        PYAV_ATTEMPTS=0):
+    """
+    Plz don't crash
+    """
+    MP_NAME = multiprocessing.current_process().name
+    THREAD_NAME = threading.get_ident()
+
+    def _get_via_opencv(video_path, frame_number):
+        with vt_cv.video_capture_open(video_path, tries=2) as vcap:
+            vcap.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
+            ret, frame_BGR = vcap.retrieve()
+            if ret == 0:
+                raise OSError(f"Can't read frame {frame_number} from {video_path}")
+        return frame_BGR
+
+    def _get_via_pyav(video_path, frame_time):
+        raise NotImplementedError()
+        # import torchvision.io
+        # pyav_video = torchvision.io.read_video(
+        #         video_path, pts_unit='sec', start_pts=frame_time)
+        # return frame_BGR
+
+    def _fail_message(via, e, i, attempts):
+        MESSAGE = (
+            'Failed frame read via {} mp_name {} thread {}. '
+            'Caught "{}", retrying {}/{}. '
+            'File {} frame {}').format(
+                    via, MP_NAME, THREAD_NAME,
+                    e, i, attempts,
+                    video_path, frame_number)
+        log.warning('WARN ' + MESSAGE)
+
+    for i in range(OCV_ATTEMPTS):
+        try:
+            frame_u8 = _get_via_opencv(video_path, frame_number)
+            return frame_u8
+        except (IOError, RuntimeError, NotImplementedError) as e:
+            _fail_message('opencv', e, i, OCV_ATTEMPTS)
+            time.sleep(1)
+
+    for i in range(PYAV_ATTEMPTS):
+        try:
+            frame_u8 = _get_via_pyav(video_path, frame_time)
+            return frame_u8
+        except (IOError, RuntimeError, NotImplementedError) as e:
+            _fail_message('pyav', e, i, OCV_ATTEMPTS)
+            time.sleep(1)
+
+    raise IOError('Never managed to open {}, f_num {} f_time {}'.format(
+        video_path, frame_number, frame_time))
+
+
+D2DICT_GPU_SCALING_DEFAULTS = """
+gpu_scaling:
+    enabled: True
+    base:
+        # more per gpu
+        SOLVER.BASE_LR: 0.0025
+        SOLVER.IMS_PER_BATCH: 2
+        # less per gpu
+        SOLVER.MAX_ITER: 18000
+        SOLVER.STEPS: [12000, 16000]
+"""
+
+
+def d2dict_gpu_scaling(cf, cf_add_d2, num_gpus):
+    imult = 8 / num_gpus
+    prepared = {}
+    prepared['SOLVER.BASE_LR'] = \
+        cf['gpu_scaling.base.SOLVER.BASE_LR'] * num_gpus
+    prepared['SOLVER.IMS_PER_BATCH'] = \
+        cf['gpu_scaling.base.SOLVER.IMS_PER_BATCH'] * num_gpus
+    prepared['SOLVER.MAX_ITER'] = \
+        int(cf['gpu_scaling.base.SOLVER.MAX_ITER'] * imult)
+    prepared['SOLVER.STEPS'] = tuple((np.array(
+            cf['gpu_scaling.base.SOLVER.STEPS']
+            ) * imult).astype(int).tolist())
+    return cf_add_d2.update(prepared)
 
 
 def launch_w_logging(
