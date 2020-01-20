@@ -951,7 +951,10 @@ def evaldemo_d2_dalyobj_old(workfolder, cfg_dict, add_args):
     dataset:
         name: [~, ['daly']]
         cache_folder: [~, str]
+    conf_thresh: [0.0, float]
     model_to_eval: [~, str]
+    subset: [train, [train, test]]
+    N: [50, int]
     seed: [42, int]
     """)
     cf = cfg.parse()
@@ -975,7 +978,7 @@ def evaldemo_d2_dalyobj_old(workfolder, cfg_dict, add_args):
 
     # d2_config
     d_cfg = base_d2_frcnn_config()
-    set_d2_cthresh(d_cfg, 0.25)
+    set_d2_cthresh(d_cfg, cf['conf_thresh'])
     d_cfg.OUTPUT_DIR = str(small.mkdir(out/'d2_output'))
     d_cfg.MODEL.WEIGHTS = cf['model_to_eval']
     d_cfg.DATASETS.TRAIN = ()
@@ -989,15 +992,18 @@ def evaldemo_d2_dalyobj_old(workfolder, cfg_dict, add_args):
     # Visualizer
     predictor = DefaultPredictor(d_cfg)
 
-    datalist = datalist_per_split['test']
-    metadata = MetadataCatalog.get("dalyobjects_test")
-    visfold = small.mkdir(out/'exp3/test')
-    vis_evaldemo_dalyobj(predictor, datalist, metadata, visfold, 50)
-
-    datalist = datalist_per_split['train']
-    metadata = MetadataCatalog.get("dalyobjects_train")
-    visfold = small.mkdir(out/'exp3/train')
-    vis_evaldemo_dalyobj(predictor, datalist, metadata, visfold, 50)
+    subset = cf['subset']
+    if subset == 'train':
+        datalist = datalist_per_split['train']
+        metadata = MetadataCatalog.get("dalyobjects_train")
+        visfold = small.mkdir(out/'exp3/train')
+    elif subset == 'test':
+        datalist = datalist_per_split['test']
+        metadata = MetadataCatalog.get("dalyobjects_test")
+        visfold = small.mkdir(out/'exp3/test')
+    else:
+        raise RuntimeError()
+    vis_evaldemo_dalyobj(predictor, datalist, metadata, visfold, cf['N'])
 
 
 def eval_d2_dalyobj_old(workfolder, cfg_dict, add_args):
@@ -1010,6 +1016,10 @@ def eval_d2_dalyobj_old(workfolder, cfg_dict, add_args):
     dataset:
         name: [~, ['daly']]
         cache_folder: [~, str]
+    nms:
+        enable: [True, bool]
+        batched: [False, bool]
+        thresh: [0.3, float]
     conf_thresh: [0.0, float]
     model_to_eval: [~, str]
     subset: ['train', str]
@@ -1079,6 +1089,21 @@ def eval_d2_dalyobj_old(workfolder, cfg_dict, add_args):
     df_isaver = snippets.Simple_isaver(
             small.mkdir(out/'isaver'), datalist, eval_func, '::50')
     predicted_datalist = df_isaver.run()
+    from detectron2.layers.nms import nms, batched_nms
+
+    if cf['nms.enable']:
+        nms_thresh = cf['nms.thresh']
+        nmsed_predicted_datalist = []
+        for pred_item in predicted_datalist:
+            if cf['nms.batched']:
+                keep = batched_nms(pred_item.pred_boxes.tensor,
+                        pred_item.scores, pred_item.pred_classes, nms_thresh)
+            else:
+                keep = nms(pred_item.pred_boxes.tensor,
+                        pred_item.scores, nms_thresh)
+            nmsed_item = pred_item[keep]
+            nmsed_predicted_datalist.append(nmsed_item)
+        predicted_datalist = nmsed_predicted_datalist
     legacy_evaluation(dataset, datalist, predicted_datalist)
 
 
@@ -1122,6 +1147,9 @@ def eval_d2_dalyobj_old_maybefaster(workfolder, cfg_dict, add_args):
     dataset:
         name: [~, ['daly']]
         cache_folder: [~, str]
+    nms:
+        enable: [True, bool]
+        thresh: [0.3, float]
     conf_thresh: [0.25, float]
     model_to_eval: [~, str]
     subset: ['train', str]
