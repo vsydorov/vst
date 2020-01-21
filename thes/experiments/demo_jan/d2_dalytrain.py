@@ -5,6 +5,7 @@ import copy
 import logging
 import numpy as np
 import pandas as pd
+from pathlib import Path
 
 from vsydorov_tools import small
 from vsydorov_tools import cv as vt_cv
@@ -19,6 +20,8 @@ from detectron2.data import (
         build_detection_test_loader)
 from detectron2.data import detection_utils as d2_dutils
 from detectron2.data import transforms as d2_transforms
+from detectron2.engine.defaults import DefaultPredictor
+from detectron2.layers.nms import nms, batched_nms
 
 from thes.data.external_dataset import DatasetDALY
 from thes.tools import snippets
@@ -29,6 +32,7 @@ from thes.det2 import (
         D2DICT_GPU_SCALING_DEFAULTS,
         get_frame_without_crashing)
 from thes.daly_d2 import simplest_daly_to_datalist
+from thes.eval_tools import legacy_evaluation
 
 
 log = logging.getLogger(__name__)
@@ -333,3 +337,167 @@ def train_d2_dalyobj_o100(workfolder, cfg_dict, add_args):
     _d2_train_boring_launch(
             o100_objects, datalist_per_split,
             num_gpus, d_cfg, cf, add_args)
+
+
+def _eval_d2_dalyobj_old_boring(cf, d_cfg, datalist_per_split, dataset, out):
+
+    simple_d2_setup(d_cfg)
+
+    # Visualizer
+    predictor = DefaultPredictor(d_cfg)
+
+    # Define subset
+    subset = cf['subset']
+    if subset == 'train':
+        datalist = datalist_per_split['train']
+        metadata = MetadataCatalog.get("dalyobjects_train")
+    elif subset == 'test':
+        datalist = datalist_per_split['test']
+        metadata = MetadataCatalog.get("dalyobjects_test")
+    else:
+        raise RuntimeError('wrong subset')
+
+    # Evaluate all images
+    cpu_device = torch.device("cpu")
+
+    def eval_func(dl_item):
+        video_path = dl_item['video_path']
+        frame_number = dl_item['video_frame_number']
+        frame_time = dl_item['video_frame_number']
+        frame_u8 = get_frame_without_crashing(
+            video_path, frame_number, frame_time)
+        predictions = predictor(frame_u8)
+        cpu_instances = predictions["instances"].to(cpu_device)
+        return cpu_instances
+
+    df_isaver = snippets.Simple_isaver(
+            small.mkdir(out/'isaver'), datalist, eval_func, '::50')
+    predicted_datalist = df_isaver.run()
+
+    if cf['nms.enable']:
+        nms_thresh = cf['nms.thresh']
+        nmsed_predicted_datalist = []
+        for pred_item in predicted_datalist:
+            if cf['nms.batched']:
+                keep = batched_nms(pred_item.pred_boxes.tensor,
+                        pred_item.scores, pred_item.pred_classes, nms_thresh)
+            else:
+                keep = nms(pred_item.pred_boxes.tensor,
+                        pred_item.scores, nms_thresh)
+            nmsed_item = pred_item[keep]
+            nmsed_predicted_datalist.append(nmsed_item)
+        predicted_datalist = nmsed_predicted_datalist
+    legacy_evaluation(dataset, datalist, predicted_datalist)
+
+
+def eval_d2_dalyobj_old(workfolder, cfg_dict, add_args):
+    """
+    Here we'll follow the old evaluation protocol
+    """
+    out, = snippets.get_subfolders(workfolder, ['out'])
+    cfg = snippets.YConfig(cfg_dict)
+    cfg.set_deftype("""
+    dataset:
+        name: [~, ['daly']]
+        cache_folder: [~, str]
+    nms:
+        enable: [True, bool]
+        batched: [False, bool]
+        thresh: [0.3, float]
+    conf_thresh: [0.0, float]
+    model_to_eval: [~, str]
+    subset: ['train', str]
+    seed: [42, int]
+    """)
+    cf = cfg.parse()
+
+    # DALY Dataset
+    dataset = DatasetDALY()
+    dataset.populate_from_folder(cf['dataset.cache_folder'])
+
+    # D2 dataset compatible list of keyframes
+    datalist_per_split = {}
+    for split in ['train', 'test']:
+        datalist = simplest_daly_to_datalist(dataset, split)
+        datalist_per_split[split] = datalist
+
+    for split, datalist in datalist_per_split.items():
+        d2_dataset_name = f'dalyobjects_{split}'
+        DatasetCatalog.register(d2_dataset_name,
+                lambda split=split: datalist_per_split[split])
+        MetadataCatalog.get(d2_dataset_name).set(
+                thing_classes=dataset.object_names)
+
+    # d2_config
+    d_cfg = base_d2_frcnn_config()
+    set_d2_cthresh(d_cfg, cf['conf_thresh'])
+    d_cfg.OUTPUT_DIR = str(small.mkdir(out/'d2_output'))
+    d_cfg.MODEL.WEIGHTS = cf['model_to_eval']
+    d_cfg.DATASETS.TRAIN = ()
+    d_cfg.DATASETS.TEST = ('dalyobjects_test',)
+    # Different number of classes
+    d_cfg.MODEL.ROI_HEADS.NUM_CLASSES = 43
+    # Defaults:
+    d_cfg.SEED = cf['seed']
+    d_cfg.freeze()
+
+    _eval_d2_dalyobj_old_boring(cf, d_cfg, datalist_per_split, dataset, out)
+
+
+def eval_d2_dalyobj_old_hacky_parent(workfolder, cfg_dict, add_args):
+    """
+    Hacky code to evaluate parent
+    """
+    out, = snippets.get_subfolders(workfolder, ['out'])
+    cfg = snippets.YConfig(cfg_dict)
+    cfg.set_deftype("""
+    model_to_eval_parent: [~, str]
+    dataset:
+        name: [~, ['daly']]
+        cache_folder: [~, str]
+    nms:
+        enable: [True, bool]
+        batched: [False, bool]
+        thresh: [0.3, float]
+    conf_thresh: [0.0, float]
+    subset: ['train', str]
+    seed: [42, int]
+    """)
+    cf = cfg.parse()
+
+    # DALY Dataset
+    dataset = DatasetDALY()
+    dataset.populate_from_folder(cf['dataset.cache_folder'])
+
+    # D2 dataset compatible list of keyframes
+    datalist_per_split = {}
+    for split in ['train', 'test']:
+        datalist = simplest_daly_to_datalist(dataset, split)
+        datalist_per_split[split] = datalist
+
+    for split, datalist in datalist_per_split.items():
+        d2_dataset_name = f'dalyobjects_{split}'
+        DatasetCatalog.register(d2_dataset_name,
+                lambda split=split: datalist_per_split[split])
+        MetadataCatalog.get(d2_dataset_name).set(
+                thing_classes=dataset.object_names)
+
+    import dervo
+    EPATH = dervo.experiment.EXPERIMENT_PATH
+    model_name = EPATH.resolve().name
+    model_to_eval = str(Path(cf['model_to_eval_parent'])/model_name)
+
+    # d2_config
+    d_cfg = base_d2_frcnn_config()
+    set_d2_cthresh(d_cfg, cf['conf_thresh'])
+    d_cfg.OUTPUT_DIR = str(small.mkdir(out/'d2_output'))
+    d_cfg.DATASETS.TRAIN = ()
+    d_cfg.DATASETS.TEST = ('dalyobjects_test',)
+    # Different number of classes
+    d_cfg.MODEL.ROI_HEADS.NUM_CLASSES = 43
+    # Defaults:
+    d_cfg.SEED = cf['seed']
+    d_cfg.MODEL.WEIGHTS = model_to_eval
+    d_cfg.freeze()
+
+    _eval_d2_dalyobj_old_boring(cf, d_cfg, datalist_per_split, dataset, out)
