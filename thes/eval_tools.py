@@ -198,7 +198,7 @@ def oldcode_evaluate_voc_detections(
     return ap_per_cls
 
 
-def legacy_evaluation(dataset, datalist, predicted_datalist):
+def legacy_evaluation(object_names, datalist, predicted_datalist):
     """
     This is the evaluation code I used 2 years ago
     """
@@ -208,7 +208,7 @@ def legacy_evaluation(dataset, datalist, predicted_datalist):
     for dl_item in datalist:
         objects = []
         for dl_anno in dl_item['annotations']:
-            name = dataset.object_names[dl_anno['category_id']]
+            name = object_names[dl_anno['category_id']]
             box = BoxLTRD(*dl_anno['bbox'])
             difficult = dl_anno['is_occluded']
             o = VOClike_object(name=name, difficult=difficult, box=box)
@@ -226,20 +226,19 @@ def legacy_evaluation(dataset, datalist, predicted_datalist):
         pred_boxes = pred_item.pred_boxes.tensor.numpy()
         scores = pred_item.scores.numpy()
         pred_classes = pred_item.pred_classes.numpy()
-        # dets = {k: [] for k in dataset.object_names}
         dets = {}
         for b, s, c_ind in zip(pred_boxes, scores, pred_classes):
-            cls = dataset.object_names[c_ind]
+            cls = object_names[c_ind]
             dets.setdefault(cls, []).append(np.r_[b, s])
         dets = {k: np.vstack(v) for k, v in dets.items()}
-        dets = {k: dets.get(k, np.array([])) for k in dataset.object_names}
+        dets = {k: dets.get(k, np.array([])) for k in object_names}
         all_boxes.append(dets)
 
     use_07_metric = False
     use_diff = False
     # iou_thresholds = [0.3, 0.5]
     iou_thresh = 0.5
-    object_classes = dataset.object_names
+    object_classes = object_names
     ap_per_cls: Dict[str, float] = oldcode_evaluate_voc_detections(
             voclike_annotation_list,
             all_boxes,
