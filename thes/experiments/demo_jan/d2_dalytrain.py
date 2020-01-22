@@ -226,33 +226,6 @@ def _d2_train_boring_launch(
             args=(d_cfg, cf, args))
 
 
-def train_d2_dalyobj(workfolder, cfg_dict, add_args):
-    out, = snippets.get_subfolders(workfolder, ['out'])
-    cfg = snippets.YConfig(cfg_dict)
-    _set_cfg_defaults_d2dalyobj(cfg)
-    cf = cfg.parse()
-    cf_add_d2 = cfg.without_prefix('d2.')
-
-    dataset = DatasetDALY()
-    dataset.populate_from_folder(cf['dataset.cache_folder'])
-    object_names = dataset.object_names
-
-    datalist_per_split = {}
-    for split in ['train', 'test']:
-        datalist = simplest_daly_to_datalist(dataset, split)
-        datalist_per_split[split] = datalist
-
-    d_cfg = _set_d2config(cf, cf_add_d2)
-    d_cfg.OUTPUT_DIR = str(small.mkdir(out/'d2_output'))
-    d_cfg.MODEL.ROI_HEADS.NUM_CLASSES = 43
-    d_cfg.freeze()
-
-    num_gpus = cf['num_gpus']
-    _d2_train_boring_launch(
-            object_names, datalist_per_split,
-            num_gpus, d_cfg, cf, add_args)
-
-
 def get_daly_odf(dataset):
     gt_objects = []
     for vid, v in dataset.video_odict.items():
@@ -343,193 +316,6 @@ def make_datalist_objaction_similar_merged(
     return filtered_datalist
 
 
-def train_d2_dalyobj_o100(workfolder, cfg_dict, add_args):
-    out, = snippets.get_subfolders(workfolder, ['out'])
-    cfg = snippets.YConfig(cfg_dict)
-    _set_cfg_defaults_d2dalyobj(cfg)
-    cf = cfg.parse()
-    cf_add_d2 = cfg.without_prefix('d2.')
-
-    dataset = DatasetDALY()
-    dataset.populate_from_folder(cf['dataset.cache_folder'])
-    o100_objects, category_map = get_category_map_o100(dataset)
-    assert len(o100_objects) == 16
-
-    datalist_per_split = {}
-    for split in ['train', 'test']:
-        datalist = simplest_daly_to_datalist(dataset, split)
-        datalist_o100 = make_datalist_o100(datalist, category_map)
-        datalist_per_split[split] = datalist_o100
-
-    d_cfg = _set_d2config(cf, cf_add_d2)
-    d_cfg.OUTPUT_DIR = str(small.mkdir(out/'d2_output'))
-    d_cfg.MODEL.ROI_HEADS.NUM_CLASSES = 16
-    d_cfg.freeze()
-
-    num_gpus = cf['num_gpus']
-    _d2_train_boring_launch(
-            o100_objects, datalist_per_split,
-            num_gpus, d_cfg, cf, add_args)
-
-
-def train_d2_dalyobj_hacky(workfolder, cfg_dict, add_args):
-    out, = snippets.get_subfolders(workfolder, ['out'])
-    cfg = snippets.YConfig(cfg_dict)
-    _set_cfg_defaults_d2dalyobj(cfg)
-    cfg.set_deftype("""
-    hacks:
-        dataset: ['normal', ['normal', 'o100', 'action_object']]
-        action_object:
-            merge: ['sane', ['sane',]]
-    """)
-    cf = cfg.parse()
-    cf_add_d2 = cfg.without_prefix('d2.')
-
-    dataset = DatasetDALY()
-    dataset.populate_from_folder(cf['dataset.cache_folder'])
-    o100_objects, category_map = get_category_map_o100(dataset)
-    assert len(o100_objects) == 16
-
-    datalist_per_split = {}
-    for split in ['train', 'test']:
-        datalist = simplest_daly_to_datalist(dataset, split)
-        datalist_per_split[split] = datalist
-
-    if cf['hacks.dataset'] == 'normal':
-        num_classes = 43
-        object_names = dataset.object_names
-    elif cf['hacks.dataset'] == 'o100':
-        o100_objects, category_map = get_category_map_o100(dataset)
-        num_classes = len(o100_objects)
-        assert len(o100_objects) == 16
-        object_names = o100_objects
-        datalist_per_split = {
-            k: make_datalist_o100(datalist, category_map)
-            for k, datalist in datalist_per_split.items()}
-    elif cf['hacks.dataset'] == 'action_object':
-        action_object_to_object = get_similar_action_objects_DALY()
-        object_names = sorted([x
-            for x in set(list(action_object_to_object.values())) if x])
-        num_classes = len(object_names)
-        datalist_per_split = {
-            k: make_datalist_objaction_similar_merged(
-                datalist, dataset.object_names, object_names,
-                action_object_to_object)
-            for k, datalist in datalist_per_split.items()}
-    else:
-        raise NotImplementedError()
-
-    d_cfg = _set_d2config(cf, cf_add_d2)
-    d_cfg.OUTPUT_DIR = str(small.mkdir(out/'d2_output'))
-    d_cfg.MODEL.ROI_HEADS.NUM_CLASSES = num_classes
-    d_cfg.freeze()
-
-    num_gpus = cf['num_gpus']
-    _d2_train_boring_launch(
-            object_names, datalist_per_split,
-            num_gpus, d_cfg, cf, add_args)
-
-
-def eval_d2_dalyobj_old(workfolder, cfg_dict, add_args):
-    """
-    Here we'll follow the old evaluation protocol
-    """
-    out, = snippets.get_subfolders(workfolder, ['out'])
-    cfg = snippets.YConfig(cfg_dict)
-    cfg.set_deftype("""
-    dataset:
-        name: [~, ['daly']]
-        cache_folder: [~, str]
-        subset: ['train', str]
-    nms:
-        enable: [True, bool]
-        batched: [False, bool]
-        thresh: [0.3, float]
-    conf_thresh: [0.0, float]
-    model_to_eval: [~, str]
-    seed: [42, int]
-    """)
-    cf = cfg.parse()
-
-    # DALY Dataset
-    dataset = DatasetDALY()
-    dataset.populate_from_folder(cf['dataset.cache_folder'])
-
-    # D2 dataset compatible list of keyframes
-    datalist_per_split = {}
-    for split in ['train', 'test']:
-        datalist = simplest_daly_to_datalist(dataset, split)
-        datalist_per_split[split] = datalist
-
-    for split, datalist in datalist_per_split.items():
-        d2_dataset_name = f'dalyobjects_{split}'
-        DatasetCatalog.register(d2_dataset_name,
-                lambda split=split: datalist_per_split[split])
-        MetadataCatalog.get(d2_dataset_name).set(
-                thing_classes=dataset.object_names)
-
-    # d2_config
-    d_cfg = base_d2_frcnn_config()
-    set_d2_cthresh(d_cfg, cf['conf_thresh'])
-    d_cfg.OUTPUT_DIR = str(small.mkdir(out/'d2_output'))
-    d_cfg.MODEL.WEIGHTS = cf['model_to_eval']
-    d_cfg.DATASETS.TRAIN = ()
-    d_cfg.DATASETS.TEST = ('dalyobjects_test',)
-    # Different number of classes
-    d_cfg.MODEL.ROI_HEADS.NUM_CLASSES = 43
-    # Defaults:
-    d_cfg.SEED = cf['seed']
-    d_cfg.freeze()
-
-    simple_d2_setup(d_cfg)
-
-    # Visualizer
-    predictor = DefaultPredictor(d_cfg)
-
-    # Define subset
-    subset = cf['dataset.subset']
-    if subset == 'train':
-        datalist = datalist_per_split['train']
-        metadata = MetadataCatalog.get("dalyobjects_train")
-    elif subset == 'test':
-        datalist = datalist_per_split['test']
-        metadata = MetadataCatalog.get("dalyobjects_test")
-    else:
-        raise RuntimeError('wrong subset')
-
-    # Evaluate all images
-    cpu_device = torch.device("cpu")
-
-    def eval_func(dl_item):
-        video_path = dl_item['video_path']
-        frame_number = dl_item['video_frame_number']
-        frame_time = dl_item['video_frame_number']
-        frame_u8 = get_frame_without_crashing(
-            video_path, frame_number, frame_time)
-        predictions = predictor(frame_u8)
-        cpu_instances = predictions["instances"].to(cpu_device)
-        return cpu_instances
-
-    df_isaver = snippets.Simple_isaver(
-            small.mkdir(out/'isaver'), datalist, eval_func, '::50')
-    predicted_datalist = df_isaver.run()
-
-    if cf['nms.enable']:
-        nms_thresh = cf['nms.thresh']
-        nmsed_predicted_datalist = []
-        for pred_item in predicted_datalist:
-            if cf['nms.batched']:
-                keep = batched_nms(pred_item.pred_boxes.tensor,
-                        pred_item.scores, pred_item.pred_classes, nms_thresh)
-            else:
-                keep = nms(pred_item.pred_boxes.tensor,
-                        pred_item.scores, nms_thresh)
-            nmsed_item = pred_item[keep]
-            nmsed_predicted_datalist.append(nmsed_item)
-        predicted_datalist = nmsed_predicted_datalist
-    legacy_evaluation(dataset.object_names, datalist, predicted_datalist)
-
-
 def get_similar_action_objects_DALY() -> Dict[Tuple[DALY_action_name, DALY_object_name], str]:
     """ Group similar looking objects, ignore other ones """
     action_object_to_object = \
@@ -599,6 +385,80 @@ def get_biggest_objects_DALY() -> Tuple[DALY_action_name, DALY_object_name]:
     return cast(Tuple[DALY_action_name, DALY_object_name], primal_configurations)
 
 
+def _datalist_hacky_converter(cf, dataset):
+    if cf['hacks.dataset'] == 'normal':
+        num_classes = 43
+        object_names = dataset.object_names
+
+        def datalist_converter(datalist):
+            return datalist
+
+    elif cf['hacks.dataset'] == 'o100':
+        o100_objects, category_map = get_category_map_o100(dataset)
+        num_classes = len(o100_objects)
+        assert len(o100_objects) == 16
+        object_names = o100_objects
+
+        def datalist_converter(datalist):
+            datalist = make_datalist_o100(datalist, category_map)
+            return datalist
+
+    elif cf['hacks.dataset'] == 'action_object':
+        action_object_to_object = get_similar_action_objects_DALY()
+        object_names = sorted([x
+            for x in set(list(action_object_to_object.values())) if x])
+        num_classes = len(object_names)
+
+        def datalist_converter(datalist):
+            datalist = make_datalist_objaction_similar_merged(
+                    datalist, dataset.object_names, object_names,
+                    action_object_to_object)
+            return datalist
+
+    else:
+        raise NotImplementedError()
+    return num_classes, object_names, datalist_converter
+
+
+def train_d2_dalyobj_hacky(workfolder, cfg_dict, add_args):
+    out, = snippets.get_subfolders(workfolder, ['out'])
+    cfg = snippets.YConfig(cfg_dict)
+    _set_cfg_defaults_d2dalyobj(cfg)
+    cfg.set_deftype("""
+    hacks:
+        dataset: ['normal', ['normal', 'o100', 'action_object']]
+        action_object:
+            merge: ['sane', ['sane',]]
+    """)
+    cf = cfg.parse()
+    cf_add_d2 = cfg.without_prefix('d2.')
+
+    dataset = DatasetDALY()
+    dataset.populate_from_folder(cf['dataset.cache_folder'])
+    o100_objects, category_map = get_category_map_o100(dataset)
+    assert len(o100_objects) == 16
+
+    datalist_per_split = {}
+    for split in ['train', 'test']:
+        datalist = simplest_daly_to_datalist(dataset, split)
+        datalist_per_split[split] = datalist
+
+    num_classes, object_names, datalist_converter = \
+            _datalist_hacky_converter(cf, dataset)
+    datalist_per_split = {k: datalist_converter(datalist)
+            for k, datalist in datalist_per_split.items()}
+
+    d_cfg = _set_d2config(cf, cf_add_d2)
+    d_cfg.OUTPUT_DIR = str(small.mkdir(out/'d2_output'))
+    d_cfg.MODEL.ROI_HEADS.NUM_CLASSES = num_classes
+    d_cfg.freeze()
+
+    num_gpus = cf['num_gpus']
+    _d2_train_boring_launch(
+            object_names, datalist_per_split,
+            num_gpus, d_cfg, cf, add_args)
+
+
 def eval_d2_dalyobj_hacky(workfolder, cfg_dict, add_args):
     """
     Evaluation code with hacks
@@ -635,12 +495,18 @@ def eval_d2_dalyobj_hacky(workfolder, cfg_dict, add_args):
         datalist = simplest_daly_to_datalist(dataset, split)
         datalist_per_split[split] = datalist
 
-    for split, datalist in datalist_per_split.items():
-        d2_dataset_name = f'dalyobjects_{split}'
-        DatasetCatalog.register(d2_dataset_name,
-                lambda split=split: datalist_per_split[split])
-        MetadataCatalog.get(d2_dataset_name).set(
-                thing_classes=dataset.object_names)
+    # Define subset
+    subset = cf['dataset.subset']
+    if subset == 'train':
+        datalist = datalist_per_split['train']
+    elif subset == 'test':
+        datalist = datalist_per_split['test']
+    else:
+        raise RuntimeError('wrong subset')
+
+    num_classes, object_names, datalist_converter = \
+            _datalist_hacky_converter(cf, dataset)
+    datalist = datalist_converter(datalist)
 
     if cf['hacks.model_to_eval'] == 'what':
         model_to_eval = cf['model_to_eval']
@@ -651,30 +517,6 @@ def eval_d2_dalyobj_hacky(workfolder, cfg_dict, add_args):
         model_to_eval = str(Path(cf['what_to_eval'])/model_name)
     else:
         raise NotImplementedError('Wrong hacks.model_to_eval')
-
-    # Define subset
-    subset = cf['dataset.subset']
-    if subset == 'train':
-        datalist = datalist_per_split['train']
-    elif subset == 'test':
-        datalist = datalist_per_split['test']
-    else:
-        raise RuntimeError('wrong subset')
-
-    if cf['hacks.dataset'] == 'normal':
-        num_classes = 43
-        object_names = dataset.object_names
-    elif cf['hacks.dataset'] == 'o100':
-        o100_objects, category_map = get_category_map_o100(dataset)
-        num_classes = len(o100_objects)
-        assert len(o100_objects) == 16
-        datalist = make_datalist_o100(datalist, category_map)
-        object_names = o100_objects
-    elif cf['hacks.dataset'] == 'action_object':
-        odf = get_daly_odf(dataset)
-        pass
-    else:
-        raise NotImplementedError()
 
     # d2_config
     d_cfg = base_d2_frcnn_config()
