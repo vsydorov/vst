@@ -53,6 +53,7 @@ def simplest_daly_to_datalist(dataset, split_label):
                             'video_path': video_path,
                             'video_frame_number': frame_number,
                             'video_frame_time': frame_time,
+                            'action_name': action_name,
                             'image_id': image_id,
                             'height': vmp4['height'],
                             'width': vmp4['width'],

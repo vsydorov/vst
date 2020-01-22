@@ -6,6 +6,7 @@ import logging
 import numpy as np
 import pandas as pd
 from pathlib import Path
+from typing import Dict, Tuple, cast
 
 from vsydorov_tools import small
 from vsydorov_tools import cv as vt_cv
@@ -23,7 +24,8 @@ from detectron2.data import transforms as d2_transforms
 from detectron2.engine.defaults import DefaultPredictor
 from detectron2.layers.nms import nms, batched_nms
 
-from thes.data.external_dataset import DatasetDALY
+from thes.data.external_dataset import (
+        DatasetDALY, DALY_action_name, DALY_object_name)
 from thes.tools import snippets
 from thes.det2 import (
         YAML_Base_RCNN_C4, YAML_faster_rcnn_R_50_C4,
@@ -251,8 +253,7 @@ def train_d2_dalyobj(workfolder, cfg_dict, add_args):
             num_gpus, d_cfg, cf, add_args)
 
 
-def get_category_map(dataset):
-    # o100 computations
+def get_daly_odf(dataset):
     gt_objects = []
     for vid, v in dataset.video_odict.items():
         vmp4 = dataset.source_videos[vid]
@@ -281,6 +282,12 @@ def get_category_map(dataset):
                                 'is_hallucinate': isHallucinate}
                         gt_objects.append(obj)
     odf = pd.DataFrame(gt_objects)
+    return odf
+
+
+def get_category_map_o100(dataset):
+    # o100 computations
+    odf = get_daly_odf(dataset)
     ocounts = odf.object_name.value_counts()
     o100_objects = sorted(ocounts[ocounts>100].index)
     category_map = []
@@ -310,6 +317,32 @@ def make_datalist_o100(d2_datalist, category_map):
     return filtered_datalist
 
 
+def make_datalist_objaction_similar_merged(
+        d2_datalist,
+        old_object_names, new_object_names,
+        action_object_to_object):
+
+    filtered_datalist = []
+    for record in d2_datalist:
+        filtered_annotations = []
+        action_name = record['action_name']
+        for obj in record['annotations']:
+            old_object_name = old_object_names[obj['category_id']]
+            new_object_name = action_object_to_object[
+                    (action_name, old_object_name)]
+            if new_object_name is None:
+                continue
+            new_category_id = new_object_names.index(new_object_name)
+            new_obj = copy.copy(obj)
+            new_obj['category_id'] = new_category_id
+            filtered_annotations.append(new_obj)
+        if len(filtered_annotations) != 0:
+            new_record = copy.copy(record)
+            new_record['annotations'] = filtered_annotations
+            filtered_datalist.append(new_record)
+    return filtered_datalist
+
+
 def train_d2_dalyobj_o100(workfolder, cfg_dict, add_args):
     out, = snippets.get_subfolders(workfolder, ['out'])
     cfg = snippets.YConfig(cfg_dict)
@@ -319,7 +352,7 @@ def train_d2_dalyobj_o100(workfolder, cfg_dict, add_args):
 
     dataset = DatasetDALY()
     dataset.populate_from_folder(cf['dataset.cache_folder'])
-    o100_objects, category_map = get_category_map(dataset)
+    o100_objects, category_map = get_category_map_o100(dataset)
     assert len(o100_objects) == 16
 
     datalist_per_split = {}
@@ -336,6 +369,64 @@ def train_d2_dalyobj_o100(workfolder, cfg_dict, add_args):
     num_gpus = cf['num_gpus']
     _d2_train_boring_launch(
             o100_objects, datalist_per_split,
+            num_gpus, d_cfg, cf, add_args)
+
+
+def train_d2_dalyobj_hacky(workfolder, cfg_dict, add_args):
+    out, = snippets.get_subfolders(workfolder, ['out'])
+    cfg = snippets.YConfig(cfg_dict)
+    _set_cfg_defaults_d2dalyobj(cfg)
+    cfg.set_deftype("""
+    hacks:
+        dataset: ['normal', ['normal', 'o100', 'action_object']]
+        action_object:
+            merge: ['sane', ['sane',]]
+    """)
+    cf = cfg.parse()
+    cf_add_d2 = cfg.without_prefix('d2.')
+
+    dataset = DatasetDALY()
+    dataset.populate_from_folder(cf['dataset.cache_folder'])
+    o100_objects, category_map = get_category_map_o100(dataset)
+    assert len(o100_objects) == 16
+
+    datalist_per_split = {}
+    for split in ['train', 'test']:
+        datalist = simplest_daly_to_datalist(dataset, split)
+        datalist_per_split[split] = datalist
+
+    if cf['hacks.dataset'] == 'normal':
+        num_classes = 43
+        object_names = dataset.object_names
+    elif cf['hacks.dataset'] == 'o100':
+        o100_objects, category_map = get_category_map_o100(dataset)
+        num_classes = len(o100_objects)
+        assert len(o100_objects) == 16
+        object_names = o100_objects
+        datalist_per_split = {
+            k: make_datalist_o100(datalist, category_map)
+            for k, datalist in datalist_per_split.items()}
+    elif cf['hacks.dataset'] == 'action_object':
+        action_object_to_object = get_similar_action_objects_DALY()
+        object_names = sorted([x
+            for x in set(list(action_object_to_object.values())) if x])
+        num_classes = len(object_names)
+        datalist_per_split = {
+            k: make_datalist_objaction_similar_merged(
+                datalist, dataset.object_names, object_names,
+                action_object_to_object)
+            for k, datalist in datalist_per_split.items()}
+    else:
+        raise NotImplementedError()
+
+    d_cfg = _set_d2config(cf, cf_add_d2)
+    d_cfg.OUTPUT_DIR = str(small.mkdir(out/'d2_output'))
+    d_cfg.MODEL.ROI_HEADS.NUM_CLASSES = num_classes
+    d_cfg.freeze()
+
+    num_gpus = cf['num_gpus']
+    _d2_train_boring_launch(
+            object_names, datalist_per_split,
             num_gpus, d_cfg, cf, add_args)
 
 
@@ -439,6 +530,75 @@ def eval_d2_dalyobj_old(workfolder, cfg_dict, add_args):
     legacy_evaluation(dataset.object_names, datalist, predicted_datalist)
 
 
+def get_similar_action_objects_DALY() -> Dict[Tuple[DALY_action_name, DALY_object_name], str]:
+    """ Group similar looking objects, ignore other ones """
+    action_object_to_object = \
+        {('ApplyingMakeUpOnLips', 'balm'): 'ApplyingMakeUpOnLips_stick_like',
+         ('ApplyingMakeUpOnLips', 'brush'): 'ApplyingMakeUpOnLips_stick_like',
+         ('ApplyingMakeUpOnLips', 'finger'): 'ApplyingMakeUpOnLips_stick_like',
+         ('ApplyingMakeUpOnLips', 'pencil'): 'ApplyingMakeUpOnLips_stick_like',
+         ('ApplyingMakeUpOnLips', 'q-tip'): 'ApplyingMakeUpOnLips_stick_like',
+         ('ApplyingMakeUpOnLips', 'stick'): 'ApplyingMakeUpOnLips_stick_like',
+         ('BrushingTeeth', 'electricToothbrush'): 'BrushingTeeth_toothbrush_like',
+         ('BrushingTeeth', 'toothbrush'): 'BrushingTeeth_toothbrush_like',
+         ('CleaningFloor', 'broom'): 'CleaningFloor_mop_like',
+         ('CleaningFloor', 'brush'): None,
+         ('CleaningFloor', 'cloth'): None,
+         ('CleaningFloor', 'mop'): 'CleaningFloor_mop_like',
+         ('CleaningFloor', 'moppingMachine'): None,
+         ('CleaningFloor', 'steamCleaner'): None,
+         ('CleaningWindows', 'cloth'): 'CleaningWindows_squeegee_like',
+         ('CleaningWindows', 'newspaper'): None,
+         ('CleaningWindows', 'scrubber'): 'CleaningWindows_squeegee_like',
+         ('CleaningWindows', 'soap'): None,
+         ('CleaningWindows', 'sponge'): 'CleaningWindows_squeegee_like',
+         ('CleaningWindows', 'squeegee'): 'CleaningWindows_squeegee_like',
+         ('Drinking', 'bottle'): None,
+         ('Drinking', 'bowl'): None,
+         ('Drinking', 'cup'): 'Drinking_glass_like',
+         ('Drinking', 'glass'): 'Drinking_glass_like',
+         ('Drinking', 'glass+straw'): 'Drinking_glass_like',
+         ('Drinking', 'gourd'): None,
+         ('Drinking', 'hand'): None,
+         ('Drinking', 'hat'): None,
+         ('Drinking', 'other'): None,
+         ('Drinking', 'plasticBag'): None,
+         ('Drinking', 'spoon'): None,
+         ('Drinking', 'vase'): None,
+         ('FoldingTextile', 'bedsheet'): 'FoldingTextile_bedsheet_like',
+         ('FoldingTextile', 'cloth'): 'FoldingTextile_bedsheet_like',
+         ('FoldingTextile', 'shirt'): 'FoldingTextile_bedsheet_like',
+         ('FoldingTextile', 't-shirt'): 'FoldingTextile_bedsheet_like',
+         ('FoldingTextile', 'towel'): 'FoldingTextile_bedsheet_like',
+         ('FoldingTextile', 'trousers'): 'FoldingTextile_bedsheet_like',
+         ('Ironing', 'iron'): 'Ironing_iron_like',
+         ('Phoning', 'mobilePhone'): 'Phoning_phone_like',
+         ('Phoning', 'phone'): 'Phoning_phone_like',
+         ('Phoning', 'satellitePhone'): 'Phoning_phone_like',
+         ('Phoning', 'smartphone'): 'Phoning_phone_like',
+         ('PlayingHarmonica', 'harmonica'): 'PlayingHarmonica_harmonica_like',
+         ('TakingPhotosOrVideos', 'camera'): 'TakingPhotosOrVideos_camera_like',
+         ('TakingPhotosOrVideos', 'smartphone'): 'TakingPhotosOrVideos_camera_like',
+         ('TakingPhotosOrVideos', 'videocamera'): 'TakingPhotosOrVideos_camera_like'}
+    return cast(Dict[Tuple[DALY_action_name, DALY_object_name], str], action_object_to_object)
+
+
+def get_biggest_objects_DALY() -> Tuple[DALY_action_name, DALY_object_name]:
+    """ Biggest object category per action class """
+    primal_configurations = [
+            ('ApplyingMakeUpOnLips', 'stick'),
+            ('BrushingTeeth', 'toothbrush'),
+            ('CleaningFloor', 'mop'),
+            ('CleaningWindows', 'squeegee'),
+            ('Drinking', 'glass'),
+            ('FoldingTextile', 'bedsheet'),
+            ('Ironing', 'iron'),
+            ('Phoning', 'phone'),
+            ('PlayingHarmonica', 'harmonica'),
+            ('TakingPhotosOrVideos', 'camera')]
+    return cast(Tuple[DALY_action_name, DALY_object_name], primal_configurations)
+
+
 def eval_d2_dalyobj_hacky(workfolder, cfg_dict, add_args):
     """
     Evaluation code with hacks
@@ -449,7 +609,9 @@ def eval_d2_dalyobj_hacky(workfolder, cfg_dict, add_args):
     what_to_eval: [~, str]
     hacks:
         model_to_eval: ['what', ['what', 'what+foldname']]
-        dataset: ['normal', ['normal', 'o100']]
+        dataset: ['normal', ['normal', 'o100', 'action_object']]
+        action_object:
+            merge: ['sane', ['sane',]]
     dataset:
         name: [~, ['daly']]
         cache_folder: [~, str]
@@ -503,11 +665,14 @@ def eval_d2_dalyobj_hacky(workfolder, cfg_dict, add_args):
         num_classes = 43
         object_names = dataset.object_names
     elif cf['hacks.dataset'] == 'o100':
-        o100_objects, category_map = get_category_map(dataset)
+        o100_objects, category_map = get_category_map_o100(dataset)
         num_classes = len(o100_objects)
         assert len(o100_objects) == 16
         datalist = make_datalist_o100(datalist, category_map)
         object_names = o100_objects
+    elif cf['hacks.dataset'] == 'action_object':
+        odf = get_daly_odf(dataset)
+        pass
     else:
         raise NotImplementedError()
 
