@@ -17,7 +17,8 @@ import torch.utils.data
 import torch.backends.cudnn as cudnn
 
 from thes.tools import snippets
-from thes.data.external_dataset import DatasetDALY
+from thes.data.external_dataset import (
+        DatasetDALY, DALY_vid)
 
 from vsydorov_tools import small
 
@@ -40,6 +41,9 @@ DALY_wein_tube = TypedDict('DALY_wein_tube', {
     'hscores': np.ndarray,  # human
     'iscores': np.ndarray  # instance
     })
+
+
+DALY_tube_index = Tuple[DALY_vid, int, int]
 
 
 def temporal_coverage_stats(ex_df, gt_df):
@@ -276,7 +280,7 @@ def load_wein_tubes(workfolder, cfg_dict, add_args):
     # For reason I forgot we only care about [0] element
     wein_package = small.load_py2_pkl(cf['wein_tubes'])[0]
     # We got a dictionary of filenames (w .mp4 suffix)
-    extracted_tubes = {}
+    extracted_tubes: Dict[DALY_tube_index, DALY_wein_tube] = {}
     for vid_mp4, wein_bunches in wein_package.items():
         vid = re.search(r'(.*)\.mp4', vid_mp4).group(1)
         for bunch_id, wein_tubes in enumerate(wein_bunches):

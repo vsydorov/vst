@@ -3,10 +3,9 @@ import numpy as np
 from detectron2.structures import BoxMode
 
 
-def simplest_daly_to_datalist(dataset, split_label):
+def get_daly_split_vids(dataset, split_label):
     split_vids = [vid for vid, split in dataset.split.items()
             if split == split_label]
-
     if split_label == 'train':
         split_size = 310
     elif split_label == 'test':
@@ -14,6 +13,11 @@ def simplest_daly_to_datalist(dataset, split_label):
     else:
         split_size = None
     assert len(split_vids) == split_size
+    return split_vids
+
+
+def simplest_daly_to_datalist(dataset, split_label):
+    split_vids = get_daly_split_vids(dataset, split_label)
 
     d2_datalist = []
     for vid in split_vids:
