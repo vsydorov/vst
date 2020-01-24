@@ -19,6 +19,7 @@ import torch.backends.cudnn as cudnn
 from thes.tools import snippets
 from thes.data.external_dataset import (
         DatasetDALY, DALY_vid)
+from thes.daly_d2 import (get_daly_gt_tubes, ex_tubes_to_df, gt_tubes_to_df)
 
 from vsydorov_tools import small
 
@@ -206,57 +207,13 @@ def stats_of_wein_tubes(workfolder, cfg_dict, add_args):
     dataset.populate_from_folder(cf['dataset.cache_folder'])
 
     extracted_tubes = small.load_pkl(cf['imported_wein_tubes'])
-
-    # Daly GT tubes
-    gt_tubes = {}
-    for vid, v in dataset.video_odict.items():
-        for action_name, instances in v['instances'].items():
-            for ins_ind, instance in enumerate(instances):
-                # Read keyframes
-                frame_inds = []
-                times = []
-                boxes = []
-                for keyframe in instance['keyframes']:
-                    frame_inds.append(keyframe['frameNumber'])
-                    times.append(keyframe['time'])
-                    boxes.append(keyframe['boundingBox'])
-                tube = {
-                    'start_time': instance['beginTime'],
-                    'end_time': instance['endTime'],
-                    'frame_inds': frame_inds,
-                    'times': times,
-                    'boxes': boxes}
-                gt_tubes[(vid, action_name, ins_ind)] = tube
+    gt_tubes = get_daly_gt_tubes(dataset)
 
     # We reference video only in terms of ocv frames from now on
     # We ASSUME extracted philippe frames here are the OCV frames
     # Probably this is not the case
-    ex_df = []
-    for k, v in extracted_tubes.items():
-        min_frame = v['frame_inds'].min()
-        max_frame = v['frame_inds'].max()
-        ex_df.append([*k, min_frame, max_frame])
-    ex_df = pd.DataFrame(ex_df)
-    ex_df.columns = ['vid', 'bunch_id', 'tube_id', 'min_frame', 'max_frame']
-
-    gt_df = []
-    for k, v in gt_tubes.items():
-        vmp4 = dataset.source_videos[k[0]]
-        ocv_video_fps = vmp4['frames_reached']/vmp4['length_reached']
-        # vmeta = dataset.video_odict[k[0]]
-        # meta_video_fps = vmeta['fps']
-        # if ocv_video_fps != meta_video_fps:
-        #     log.info('FPS mismatch at {}: OCV: {} META: {}'.format(
-        #         k, ocv_video_fps, meta_video_fps))
-        min_kframe = min(v['frame_inds'])
-        max_kframe = max(v['frame_inds'])
-        start_frame = int(v['start_time']*ocv_video_fps)
-        end_frame = int(v['end_time']*ocv_video_fps)
-        gt_df.append([*k, min_kframe, max_kframe, start_frame, end_frame])
-    gt_df = pd.DataFrame(gt_df)
-    gt_df.columns = ['vid', 'action', 'ins_id',
-            'min_kframe', 'max_kframe',
-            'start_frame', 'end_frame']
+    ex_df = ex_tubes_to_df(extracted_tubes)
+    gt_df = gt_tubes_to_df(dataset, gt_tubes)
 
     # coverage_df, temp_stats = temporal_coverage_stats(ex_df, gt_df)
     coverage_df, spat_stats = spatial_coverage_stats(

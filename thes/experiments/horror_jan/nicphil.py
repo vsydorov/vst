@@ -1,4 +1,5 @@
 import argparse
+import itertools
 import cv2
 import os
 import yacs
@@ -8,7 +9,7 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 from pathlib import Path
-from typing import Dict, Tuple, List, cast, NewType
+from typing import Dict, Tuple, List, cast, NewType, Iterable
 
 from vsydorov_tools import small
 from vsydorov_tools import cv as vt_cv
@@ -36,7 +37,8 @@ from thes.det2 import (
         D2DICT_GPU_SCALING_DEFAULTS,
         get_frame_without_crashing)
 from thes.daly_d2 import (
-        simplest_daly_to_datalist, get_daly_split_vids)
+        simplest_daly_to_datalist, get_daly_split_vids,
+        get_daly_gt_tubes, gt_tubes_to_df)
 from thes.eval_tools import legacy_evaluation
 from thes.experiments.demo_december.load_daly import (
         DALY_wein_tube, DALY_tube_index)
@@ -124,7 +126,6 @@ def model_test_get_image_blob(im, PIXEL_MEANS, TEST_SCALES, TEST_MAX_SIZE):
     return blob, np.array(im_scale_factors)
 
 
-@profile
 def get_scores_per_frame_RGB(
         net, tube, frames_u8,
         PIXEL_MEANS, TEST_SCALES, TEST_MAX_SIZE):
@@ -161,65 +162,223 @@ def get_scores_per_frame_RGB(
     return tube_scores
 
 
-@profile
-def eval_daly_tubes_RGB(workfolder, cfg_dict, add_args):
+def cv_put_box_with_text(
+        image: np.ndarray,
+        box_ltrd: Iterable[float],
+        # Rectangle params
+        rec_color=(255, 255, 255),  # White
+        rec_thickness=4,
+        # Text params
+        text=None,
+        text_size=0.6,
+        text_color=None,
+        text_thickness=2,
+        text_position='left_down'
+            ) -> np.ndarray:
     """
-    Run Philippes/Nicolas caffe model to extract 'rcnn scores'
+    Overwrites in place
     """
-    out, = snippets.get_subfolders(workfolder, ['out'])
-    cfg = snippets.YConfig(cfg_dict)
-    cfg.set_deftype("""
-    dataset:
-        name: [~, ['daly']]
-        cache_folder: [~, str]
-        subset: ['train', str]
-    inputs:
-        imported_wein_tubes: [~, ~]
-    """)
-    cfg.set_defaults("""
-    outputs:
-        scores_for_tubes_per_video: 'scores_for_tubes_per_video.pkl'
-        multiscored_tubes_per_video: 'multiscored_tubes_per_video.pkl'
-    rcnn:
-        PIXEL_MEANS: [102.9801, 115.9465, 122.7717]
-        TEST_SCALES: [600,]
-        TEST_MAX_SIZE: 1000
 
-    eval:
-        nms:
-            enabled: False
-            thresh: 0.5
-        iou_thresholds: [0.3, 0.5, 0.75]
-        spatiotemporal: False
-        use_07_metric: False
-        use_diff: False
-    """)
-    cf = cfg.parse()
-    PIXEL_MEANS = cf['rcnn.PIXEL_MEANS']
-    TEST_SCALES = cf['rcnn.TEST_SCALES']
-    TEST_MAX_SIZE = cf['rcnn.TEST_MAX_SIZE']
+    l, t, r, d = map(int, box_ltrd)
+    result = cv2.rectangle(
+            image,
+            (l, t), (r, d),
+            color=rec_color,
+            thickness=rec_thickness)
 
-    # // Loading inputs //
-    # DALY Dataset
-    dataset = DatasetDALY()
-    dataset.populate_from_folder(cf['dataset.cache_folder'])
+    fontFace = cv2.FONT_HERSHEY_SIMPLEX
+    if text:
+        if text_color is None:
+            text_color = rec_color
+        # Text Positioning
 
-    all_actions: List[DALY_action_name] = dataset.action_names
-    tubes_per_video: Dict[DALY_tube_index, DALY_wein_tube] = \
-        small.load_pkl(cf['inputs.imported_wein_tubes'])
+        retval, baseline = cv2.getTextSize(
+                text, fontFace, text_size, text_thickness)
+        if text_position == 'left_down':
+            text_pos = (l, d-5)
+        elif text_position == 'left_up':
+            text_pos = (l, t-5)
+        elif text_position == 'right_down':
+            text_pos = (r-retval[0], d-5)
+        elif text_position == 'right_up':
+            text_pos = (r-retval[0], t-5)
+        else:
+            raise ValueError('Wrong text position')
+        cv2.putText(
+                image,
+                text,
+                text_pos,
+                fontFace=fontFace,
+                fontScale=text_size,
+                color=text_color,
+                thickness=text_thickness)
+    return result
 
-    # // Input manipulations //
-    split_label = cf['dataset.subset']
+
+def filter_tube_keyframes_only_gt(dataset, tubes_per_video):
+    gt_tubes = get_daly_gt_tubes(dataset)
+    gt_df = gt_tubes_to_df(dataset, gt_tubes)
+    # Query good inds per vid
+    good_inds_per_vid = {}
+    for vid, gindices in gt_df.groupby('vid').groups.items():
+        qdf = gt_df.loc[gindices]
+        sorted_inds = sorted(
+                itertools.chain.from_iterable(qdf.frame_inds.tolist()))
+        good_inds_per_vid[vid] = sorted_inds
+    # Filter tubes to only gt keyframes
+    filtered_tubes = {}
+    for k, v in tqdm(tubes_per_video.items(), 'filter_tubes'):
+        (vid, bunch_id, tube_id) = k
+        good_inds = good_inds_per_vid[vid]
+        intersecting_inds, comm1, comm2 = \
+            np.intersect1d(v['frame_inds'], good_inds, return_indices=True)
+        if len(intersecting_inds):
+            v_intersect = {}
+            for k0, v0 in v.items():
+                v_intersect[k0] = v0[comm1]
+            filtered_tubes[k] = v_intersect
+    return filtered_tubes
+
+
+def get_subset_tubes(dataset, split_label, tubes_per_video):
     split_vids = get_daly_split_vids(dataset, split_label)
     subset_tubes_per_video: Dict[DALY_tube_index, DALY_wein_tube] = {}
     for k, v in tubes_per_video.items():
         (vid, bunch_id, tube_id) = k
         if vid in split_vids:
             subset_tubes_per_video[k] = v
+    return subset_tubes_per_video
+
+
+def sample_some_tubes(tubes_per_video, N=10, NP_SEED=0):
+    np_rstate = np.random.RandomState(NP_SEED)
+    prm_key_indices = np_rstate.permutation(
+            np.arange(len(tubes_per_video)))
+    key_list = list(tubes_per_video.keys())
+    some_keys = [key_list[i] for i in prm_key_indices[:N]]
+    some_tubes = {k: tubes_per_video[k] for k in some_keys}
+    return some_tubes
+
+
+def perform_tube_demovis(dataset, some_tubes, out,
+        PIXEL_MEANS, TEST_SCALES, TEST_MAX_SIZE):
+    net = nicolas_net()
+    nicolas_labels = ['background', ] + dataset.action_names
+    for k, tube in tqdm(some_tubes.items(), 'nicphil on tubes'):
+        (vid, bunch_id, tube_id) = k
+        vmp4 = dataset.source_videos[vid]
+        # video = dataset.video_odict[vid]
+        video_path = vmp4['video_path']
+        frame_inds = tube['frame_inds']
+
+        # scorefold/f'scores_{video_name}_{tube_id:04d}.pkl')(
+        with vt_cv.video_capture_open(video_path) as vcap:
+            frames_u8 = vt_cv.video_sample(
+                    vcap, frame_inds, debug_filename=video_path)
+        scores_per_frame = get_scores_per_frame_RGB(
+                net, tube, frames_u8,
+                PIXEL_MEANS, TEST_SCALES, TEST_MAX_SIZE)
+        txt_output = []
+        video_fold = small.mkdir(out/'{}_{}_{}'.format(
+            vid, bunch_id, tube_id))
+        for i, (frame, score) in enumerate(zip(frames_u8, scores_per_frame)):
+            image = frame.copy()
+            box = tube['boxes'][i]
+            real_framenum = tube['frame_inds'][i]
+            best_score_id = np.argmax(score)
+            best_score = score[best_score_id]
+            best_nicolas_label = nicolas_labels[best_score_id]
+            cv_put_box_with_text(
+                    image, box,
+                    text='{} {} {} {:.2f}'.format(
+                        i, real_framenum,
+                        best_nicolas_label, best_score))
+            line = ' '.join([f'{y}: {x:.3f}'
+                for x, y in zip(score, nicolas_labels)])
+            txt_output.append(line)
+            cv2.imwrite(
+                    str(video_fold/'frame{:03d}_{:03d}.jpg'.format(
+                        i, real_framenum)),
+                    image)
+        with (video_fold/'scores.txt').open('w') as f:
+            f.write('\n'.join(txt_output))
+
+
+def _set_tubecfg(cfg):
+    cfg.set_deftype("""
+    dataset:
+        name: [~, ['daly']]
+        cache_folder: [~, str]
+        subset: ['train', str]
+    tubes:
+        imported_wein_tubes: [~, ~]
+        filter_gt: [False, bool]
+    """)
+    cfg.set_defaults("""
+    rcnn:
+        PIXEL_MEANS: [102.9801, 115.9465, 122.7717]
+        TEST_SCALES: [600,]
+        TEST_MAX_SIZE: 1000
+    """)
+    cf = cfg.parse()
+    return cf
+
+
+def _set_tubes(cf, dataset):
+    tubes_per_video: Dict[DALY_tube_index, DALY_wein_tube] = \
+        small.load_pkl(cf['tubes.imported_wein_tubes'])
+    if cf['tubes.filter_gt']:
+        tubes_per_video = filter_tube_keyframes_only_gt(
+                dataset, tubes_per_video)
+    split_label = cf['dataset.subset']
+    tubes_per_video = \
+            get_subset_tubes(dataset, split_label, tubes_per_video)
+    return tubes_per_video
+
+
+def eval_daly_tubes_RGB_demovis(workfolder, cfg_dict, add_args):
+    """
+    Run Philippes/Nicolas caffe model to extract 'rcnn scores'
+    DEMO version that displays pretty stuff
+    """
+    out, = snippets.get_subfolders(workfolder, ['out'])
+    cfg = snippets.YConfig(cfg_dict)
+    cf = _set_tubecfg(cfg)
+    PIXEL_MEANS = cf['rcnn.PIXEL_MEANS']
+    TEST_SCALES = cf['rcnn.TEST_SCALES']
+    TEST_MAX_SIZE = cf['rcnn.TEST_MAX_SIZE']
+
+    dataset = DatasetDALY()
+    dataset.populate_from_folder(cf['dataset.cache_folder'])
+
+    tubes_per_video = _set_tubes(cf, dataset)
+
+    some_tubes = sample_some_tubes(
+            tubes_per_video, N=10, NP_SEED=0)
+
+    perform_tube_demovis(dataset, some_tubes, out,
+            PIXEL_MEANS, TEST_SCALES, TEST_MAX_SIZE)
+
+
+def eval_daly_tubes_RGB(workfolder, cfg_dict, add_args):
+    """
+    Run Philippes/Nicolas caffe model to extract 'rcnn scores'
+    """
+    out, = snippets.get_subfolders(workfolder, ['out'])
+    cfg = snippets.YConfig(cfg_dict)
+    cf = _set_tubecfg(cfg)
+    PIXEL_MEANS = cf['rcnn.PIXEL_MEANS']
+    TEST_SCALES = cf['rcnn.TEST_SCALES']
+    TEST_MAX_SIZE = cf['rcnn.TEST_MAX_SIZE']
+
+    dataset = DatasetDALY()
+    dataset.populate_from_folder(cf['dataset.cache_folder'])
+
+    tubes_per_video = _set_tubes(cf, dataset)
 
     # // Computation of the parcels inside chosen chunk
     net = nicolas_net()
-    for k, tube in tqdm(subset_tubes_per_video.items(), 'nicphil on tubes'):
+    for k, tube in tqdm(tubes_per_video.items(), 'nicphil on tubes'):
         (vid, bunch_id, tube_id) = k
         vmp4 = dataset.source_videos[vid]
         video_path = vmp4['video_path']
