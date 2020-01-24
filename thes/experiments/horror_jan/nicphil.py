@@ -320,8 +320,7 @@ def _set_tubecfg(cfg):
         TEST_SCALES: [600,]
         TEST_MAX_SIZE: 1000
     """)
-    cf = cfg.parse()
-    return cf
+    return cfg
 
 
 def _set_tubes(cf, dataset):
@@ -343,7 +342,8 @@ def eval_daly_tubes_RGB_demovis(workfolder, cfg_dict, add_args):
     """
     out, = snippets.get_subfolders(workfolder, ['out'])
     cfg = snippets.YConfig(cfg_dict)
-    cf = _set_tubecfg(cfg)
+    _set_tubecfg(cfg)
+    cf = cfg.parse()
     PIXEL_MEANS = cf['rcnn.PIXEL_MEANS']
     TEST_SCALES = cf['rcnn.TEST_SCALES']
     TEST_MAX_SIZE = cf['rcnn.TEST_MAX_SIZE']
@@ -366,7 +366,13 @@ def eval_daly_tubes_RGB(workfolder, cfg_dict, add_args):
     """
     out, = snippets.get_subfolders(workfolder, ['out'])
     cfg = snippets.YConfig(cfg_dict)
-    cf = _set_tubecfg(cfg)
+    _set_tubecfg(cfg)
+    cfg.set_deftype("""
+    compute:
+        chunk: [0, "VALUE >= 0"]
+        total: [1, int]
+    """)
+    cf = cfg.parse()
     PIXEL_MEANS = cf['rcnn.PIXEL_MEANS']
     TEST_SCALES = cf['rcnn.TEST_SCALES']
     TEST_MAX_SIZE = cf['rcnn.TEST_MAX_SIZE']
@@ -377,13 +383,25 @@ def eval_daly_tubes_RGB(workfolder, cfg_dict, add_args):
     tubes_per_video = _set_tubes(cf, dataset)
 
     # // Computation of the parcels inside chosen chunk
+    chunk = (cf['compute.chunk'], cf['compute.total'])
+    cc, ct = chunk
+
+    key_indices = np.arange(len(tubes_per_video))
+    key_list = list(tubes_per_video.keys())
+    chunk_indices = np.array_split(key_indices, ct)[cc]
+    chunk_keys = [key_list[i] for i in chunk_indices]
+    # chunk_tubes = {k: tubes_per_video[k] for k in chunk_keys}
+    log.info('Chunk {}: {} -> {}'.format(
+        chunk, len(key_indices), len(chunk_indices)))
+
     net = nicolas_net()
-    for k, tube in tqdm(tubes_per_video.items(), 'nicphil on tubes'):
+
+    def tube_eval_func(k):
+        tube = tubes_per_video[k]
         (vid, bunch_id, tube_id) = k
         vmp4 = dataset.source_videos[vid]
         video_path = vmp4['video_path']
         frame_inds = tube['frame_inds']
-
         # scorefold/f'scores_{video_name}_{tube_id:04d}.pkl')(
         with vt_cv.video_capture_open(video_path) as vcap:
             frames_u8 = vt_cv.video_sample(
@@ -391,3 +409,11 @@ def eval_daly_tubes_RGB(workfolder, cfg_dict, add_args):
         scores_per_frame = get_scores_per_frame_RGB(
                 net, tube, frames_u8,
                 PIXEL_MEANS, TEST_SCALES, TEST_MAX_SIZE)
+        return scores_per_frame
+
+    df_isaver = snippets.Simple_isaver(
+            small.mkdir(out/'tube_eval_isaver'),
+            chunk_keys, tube_eval_func, '::10', 120)
+    predicted_tubescores = df_isaver.run()
+    tubescores_dict = dict(zip(chunk_keys, predicted_tubescores))
+    small.save_pkl(out/'tubescores_dict.pkl', tubescores_dict)

@@ -443,18 +443,30 @@ class Base_isaver(ABC):
             len(inds_to_purge), files_purged))
 
 
+def _tqdm_str(pbar, ninc=0):
+    if pbar is None:
+        tqdm_str = ''
+    else:
+        tqdm_str = 'TQDM[' + pbar.format_meter(
+                pbar.n + ninc, pbar.total,
+                pbar._time()-pbar.start_t) + ']'
+    return tqdm_str
+
+
 class Simple_isaver(Base_isaver):
     """
     Will process a list with a func
     """
     def __init__(self, folder, in_list, func,
-            save_period='::25'):
+            save_period='::25',
+            log_interval_seconds=-1):
         # assert sys.version_info >= (3, 6), 'Dicts must keep insertion order'
         super().__init__(folder, len(in_list))
         self.in_list = in_list
         self.result = []
         self.func = func
         self._save_period = save_period
+        self._log_interval_seconds = log_interval_seconds
 
     def _restore(self):
         intermediate_files: Dict[int, Dict[str, Path]] = \
@@ -476,10 +488,16 @@ class Simple_isaver(Base_isaver):
     def run(self):
         start_i = self._restore()
         run_range = np.arange(start_i+1, self._total)
-        for i in tqdm(run_range):
+        self._last_time = time.perf_counter()
+        pbar = tqdm(run_range)
+        for i in pbar:
             self.result.append(self.func(self.in_list[i]))
             if check_step_v2(i, self._save_period) or \
                     (i+1 == self._total):
                 self._save(i)
                 self._purge_intermediate_files()
+            if self._log_interval_seconds != -1:
+                if (time.perf_counter() - self._last_time) > \
+                        self._log_interval_seconds:
+                    log.info(_tqdm_str(pbar))
         return self.result
