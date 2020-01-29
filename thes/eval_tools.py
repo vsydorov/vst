@@ -4,7 +4,6 @@ import numpy as np
 from mypy_extensions import TypedDict
 from typing import Dict, List, Tuple
 from collections import namedtuple
-from collections import OrderedDict
 from pathlib import Path
 
 from thes.tools import snippets
@@ -99,7 +98,7 @@ def t_box_iou(
 
 def oldcode_evaluate_voc_detections(
         annotation_list: List[VOClike_image_annotation],
-        all_boxes: "List[OrderedDict[str, np.array]]",
+        all_boxes: List[Dict[str, np.array]],
         object_classes: List[str],
         iou_thresh,
         use_07_metric,
@@ -198,19 +197,14 @@ def oldcode_evaluate_voc_detections(
     return ap_per_cls
 
 
-def legacy_evaluation(object_names, datalist, predicted_datalist):
-    """
-    This is the evaluation code I used 2 years ago
-    """
-    # // Transform to legacy data format
-    # //// GroundTruth
+def datalist_to_voclike(object_names, datalist):
     voclike_annotation_list = []
     for dl_item in datalist:
         objects = []
         for dl_anno in dl_item['annotations']:
             name = object_names[dl_anno['category_id']]
             box = BoxLTRD(*dl_anno['bbox'])
-            difficult = dl_anno['is_occluded']
+            difficult = dl_anno.get('is_occluded', False)
             o = VOClike_object(name=name, difficult=difficult, box=box)
             objects.append(o)
         filepath = dl_item['video_path']
@@ -220,8 +214,19 @@ def legacy_evaluation(object_names, datalist, predicted_datalist):
                 filepath=filepath, frameNumber=frameNumber,
                 size_WHD=size_WHD, objects=objects)
         voclike_annotation_list.append(voclike_annotation)
+    return voclike_annotation_list
+
+
+def legacy_evaluation(object_names, datalist, predicted_datalist):
+    """
+    This is the evaluation code I used 2 years ago
+    """
+    # // Transform to legacy data format
+    # //// GroundTruth
+    voclike_annotation_list: List[VOClike_image_annotation] = \
+            datalist_to_voclike(object_names, datalist)
     # //// Detections
-    all_boxes = []
+    all_boxes: List[Dict[str, np.array]] = []
     for dl_item, pred_item in zip(datalist, predicted_datalist):
         pred_boxes = pred_item.pred_boxes.tensor.numpy()
         scores = pred_item.scores.numpy()
@@ -236,7 +241,6 @@ def legacy_evaluation(object_names, datalist, predicted_datalist):
 
     use_07_metric = False
     use_diff = False
-    # iou_thresholds = [0.3, 0.5]
     iou_thresh = 0.5
     object_classes = object_names
     ap_per_cls: Dict[str, float] = oldcode_evaluate_voc_detections(

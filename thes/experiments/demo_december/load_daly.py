@@ -19,7 +19,8 @@ import torch.backends.cudnn as cudnn
 from thes.tools import snippets
 from thes.data.external_dataset import (
         DatasetDALY, DALY_vid)
-from thes.daly_d2 import (get_daly_gt_tubes, ex_tubes_to_df, gt_tubes_to_df)
+from thes.daly_d2 import (
+        get_daly_gt_tubes, ex_tubes_to_df, gt_tubes_to_df)
 
 from vsydorov_tools import small
 

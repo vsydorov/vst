@@ -932,7 +932,7 @@ DALY_instance_flags = TypedDict('DALY_instance_flags', {
     'isOutsideFOV': bool
 })
 DALY_keyframe = TypedDict('DALY_keyframe', {
-    'boundingBox': np.ndarray,  # xmin, ymin, xmax, ymax, ltrd
+    'boundingBox': np.ndarray,  # (1, 4), xmin, ymin, xmax, ymax, ltrd
     'objects': np.ndarray,
     'frameNumber': int,
     'pose': np.ndarray,

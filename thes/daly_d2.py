@@ -30,7 +30,7 @@ def get_daly_gt_tubes(dataset):
                 for keyframe in instance['keyframes']:
                     frame_inds.append(keyframe['frameNumber'])
                     times.append(keyframe['time'])
-                    boxes.append(keyframe['boundingBox'])
+                    boxes.append(keyframe['boundingBox'].squeeze())
                 tube = {
                     'start_time': instance['beginTime'],
                     'end_time': instance['endTime'],
@@ -119,8 +119,8 @@ def simplest_daly_to_datalist(dataset, split_label):
                             'video_frame_time': frame_time,
                             'action_name': action_name,
                             'image_id': image_id,
-                            'height': vmp4['height'],
-                            'width': vmp4['width'],
+                            'height': height,
+                            'width': width,
                             'annotations': annotations}
                     d2_datalist.append(record)
     return d2_datalist
