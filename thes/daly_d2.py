@@ -114,6 +114,7 @@ def simplest_daly_to_datalist(dataset, split_label):
                     if len(annotations) == 0:
                         continue
                     record = {
+                            'vid': vid,
                             'video_path': video_path,
                             'video_frame_number': frame_number,
                             'video_frame_time': frame_time,

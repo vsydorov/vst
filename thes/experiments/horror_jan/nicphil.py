@@ -46,6 +46,9 @@ from thes.eval_tools import (legacy_evaluation, datalist_to_voclike,
         oldcode_evaluate_voc_detections)
 from thes.experiments.demo_december.load_daly import (
         DALY_wein_tube, DALY_tube_index)
+from thes.experiments.demo_jan.d2_dalytrain import (
+        make_datalist_objaction_similar_merged,
+        get_similar_action_objects_DALY)
 from thes.eval_tools import voc_ap
 
 
@@ -563,6 +566,11 @@ def convert_daly_to_action_based_datalist(dataset, split_label):
     return d2_datalist
 
 
+def numpy_box_area(box):
+    assert box.shape == (4,)
+    return np.prod(box[2:] - box[:2])
+
+
 def numpy_iou(box1, box2):
     assert box1.shape == (4,)
     assert box2.shape == (4,)
@@ -573,12 +581,46 @@ def numpy_iou(box1, box2):
     if np.any(inter[:2] > inter[2:]):
         iou = 0.0
     else:
-        inter_area = np.prod(inter[2:] - inter[:2])
+        inter_area = numpy_box_area(inter)
         union_area = (
             np.prod(box1[2:] - box1[:2]) +
             np.prod(box2[2:] - box2[:2]) - inter_area)
         iou = inter_area/union_area
     return iou
+
+
+def numpy_inner_overlap_11(box1, box2):
+    assert box1.shape == (4,)
+    assert box2.shape == (4,)
+    inter = np.r_[
+        np.maximum(box1[:2], box2[:2]),
+        np.minimum(box1[2:], box2[2:])]
+    if np.any(inter[:2] > inter[2:]):
+        inter = 0.0
+    else:
+        inter_area = numpy_box_area(inter)
+        inter = inter_area/numpy_box_area(box1)
+    return inter
+
+
+def numpy_inner_overlap_N1(boxes1, box2):
+    assert len(boxes1.shape) == 2
+    assert boxes1.shape[-1] == 4
+    assert box2.shape == (4,)
+
+    inter = np.c_[
+        np.maximum(boxes1[..., :2], box2[:2]),
+        np.minimum(boxes1[..., 2:], box2[2:])]
+
+    # Intersection area
+    inter_subs = inter[..., 2:] - inter[..., :2]
+    inter_area = np.prod(inter_subs, axis=1)
+    inter_area[(inter_subs < 0).any(axis=1)] = 0.0
+
+    # Divide
+    boxes1_areas = np.prod(boxes1[..., 2:] - boxes1[..., :2], axis=1)
+    ioverlaps = inter_area / boxes1_areas
+    return ioverlaps
 
 
 def daly_coverage_tube_phil(
@@ -591,7 +633,7 @@ def daly_coverage_tube_phil(
     coverages_tube: List[Coverage_tube] = []
     for vid, gt_tubes in gt_dict.items():
         proposal_tubes: List[DALY_sparse_frametube_scored] = \
-                proposal_dict[vid]
+                proposal_dict.get(vid, [])
         if len(proposal_tubes) == 0:
             continue
         # Extract min/max frames
@@ -607,7 +649,8 @@ def daly_coverage_tube_phil(
             # Prepare iou values
             possible_spatial_ious = np.zeros(len(proposal_tubes))
             possible_temp_ious = np.zeros(len(proposal_tubes))
-            # Loop over proposal tubes that have at least some temporal intersection
+            # Loop over proposal tubes that have at least some temporal
+            # intersection
             for proposal_tube_id in np.where(temp_inters > 0)[0]:
                 proposal_tube: DALY_sparse_frametube_scored = \
                         proposal_tubes[proposal_tube_id]
@@ -936,32 +979,7 @@ def df_to_table(df: pd.DataFrame, indexname=None) -> str:
     return table
 
 
-def actual_eval_of_nicphil_etubes(workfolder, cfg_dict, add_args):
-    """
-    Evaluate "tubes" as if they were VOC objects
-    """
-    out, = snippets.get_subfolders(workfolder, ['out'])
-    cfg = snippets.YConfig(cfg_dict)
-    cfg.set_deftype("""
-    tubescores_dict: [~, ~]
-    dataset:
-        name: [~, ['daly']]
-        cache_folder: [~, str]
-        subset: ['train', str]
-    tubes:
-        imported_wein_tubes: [~, ~]
-        filter_gt: [False, bool]
-    """)
-    cf = cfg.parse()
-
-    dataset = DatasetDALY()
-    dataset.populate_from_folder(cf['dataset.cache_folder'])
-
-    # // Obtain GT tubes
-    split_label = cf['dataset.subset']
-    split_vids = get_daly_split_vids(dataset, split_label)
-    gt_tubes = get_daly_gt_tubes(dataset)
-
+def _get_gt_sparsetubes(dataset, split_vids, gt_tubes):
     daly_tubes_temp_per_action: \
             Dict[DALY_action_name,
                 Dict[DALY_vid,
@@ -988,6 +1006,36 @@ def actual_eval_of_nicphil_etubes(workfolder, cfg_dict, add_args):
         (daly_tubes_temp_per_action
                 .setdefault(action_name, {})
                 .setdefault(vid, [])).append(sparse_tube)
+    return daly_tubes_temp_per_action
+
+
+def actual_eval_of_nicphil_etubes(workfolder, cfg_dict, add_args):
+    """
+    Evaluate "tubes" as if they were VOC objects
+    """
+    out, = snippets.get_subfolders(workfolder, ['out'])
+    cfg = snippets.YConfig(cfg_dict)
+    cfg.set_deftype("""
+    tubescores_dict: [~, ~]
+    dataset:
+        name: [~, ['daly']]
+        cache_folder: [~, str]
+        subset: ['train', str]
+    tubes:
+        imported_wein_tubes: [~, ~]
+        filter_gt: [False, bool]
+    """)
+    cf = cfg.parse()
+
+    dataset = DatasetDALY()
+    dataset.populate_from_folder(cf['dataset.cache_folder'])
+
+    # // Obtain GT tubes
+    split_label = cf['dataset.subset']
+    split_vids = get_daly_split_vids(dataset, split_label)
+    gt_tubes = get_daly_gt_tubes(dataset)
+    daly_tubes_temp_per_action = \
+            _get_gt_sparsetubes(dataset, split_vids, gt_tubes)
 
     # // Obtain detected tubes
     tubes_per_video: \
@@ -1047,22 +1095,156 @@ def actual_eval_of_nicphil_etubes(workfolder, cfg_dict, add_args):
             daly_tubes_temp_per_action, options_tube_ap)
     df_recap = pd.concat((series_rec_s, series_rec_st, series_ap), axis=1)
     log.info('For thresh {:.2f}\n{}'.format(iou_thresh, df_to_table(df_recap)))
-#
-#
-# def actual_eval_of_action_object_predictions(workfolder, cfg_dict, add_args):
-#     """
-#     Evaluate "tubes" as if they were VOC objects
-#     """
-#     out, = snippets.get_subfolders(workfolder, ['out'])
-#     cfg = snippets.YConfig(cfg_dict)
-#     cfg.set_deftype("""
-#     tubescores_dict: [~, ~]
-#     dataset:
-#         name: [~, ['daly']]
-#         cache_folder: [~, str]
-#         subset: ['train', str]
-#     tubes:
-#         imported_wein_tubes: [~, ~]
-#         filter_gt: [False, bool]
-#     """)
-#     cf = cfg.parse()
+
+
+def actual_eval_of_action_object_predictions(workfolder, cfg_dict, add_args):
+    """
+    Evaluate "tubes" as if they were VOC objects
+    """
+    out, = snippets.get_subfolders(workfolder, ['out'])
+    cfg = snippets.YConfig(cfg_dict)
+    cfg.set_deftype("""
+    dataset:
+        name: [~, ['daly']]
+        cache_folder: [~, str]
+        subset: ['train', str]
+    tubes:
+        imported_wein_tubes: [~, ~]
+        filter_gt: [False, bool]
+    actobjects_evaluated: [~, ~]
+    """)
+    cf = cfg.parse()
+
+    dataset = DatasetDALY()
+    dataset.populate_from_folder(cf['dataset.cache_folder'])
+
+    # // Obtain GT tubes
+    split_label = cf['dataset.subset']
+    split_vids = get_daly_split_vids(dataset, split_label)
+    gt_tubes = get_daly_gt_tubes(dataset)
+    daly_tubes_temp_per_action = \
+            _get_gt_sparsetubes(dataset, split_vids, gt_tubes)
+
+    # // Obtain detected tubes
+    tubes_per_video: \
+            Dict[DALY_tube_index, DALY_wein_tube] = _set_tubes(cf, dataset)
+    # Refer to the originals for start_frame/end_frame
+    original_tubes_per_video: Dict[DALY_tube_index, DALY_wein_tube] = \
+        small.load_pkl(cf['tubes.imported_wein_tubes'])
+    split_label = cf['dataset.subset']
+    original_tubes_per_video = \
+        get_subset_tubes(dataset, split_label, original_tubes_per_video)
+
+    # Assign scores to these tubes, based on intersections
+    # with objaction detections
+    datalist = simplest_daly_to_datalist(dataset, split_label)
+    action_object_to_object = get_similar_action_objects_DALY()
+    object_names = sorted([x
+        for x in set(list(action_object_to_object.values())) if x])
+    num_classes = len(object_names)
+    def datalist_converter(datalist):  # NOQA
+        datalist = make_datalist_objaction_similar_merged(
+                datalist, dataset.object_names, object_names,
+                action_object_to_object)
+        return datalist
+    datalist = datalist_converter(datalist)
+    actobjects_evaluated = small.load_pkl(cf['actobjects_evaluated'])
+
+    overlap_type = 'inner_overlap'
+    overlap_cutoff = 0.2
+    score_cutoff = 0.2
+
+    # // Create a helper structure
+    preds_per_framevid: Dict[DALY_vid, Dict[int, Dict]] = {}
+    for dl_item, pred_item in zip(datalist, actobjects_evaluated):
+        pred_boxes = pred_item.pred_boxes.tensor.numpy()
+        scores = pred_item.scores.numpy()
+        pred_classes = pred_item.pred_classes.numpy()
+        detections = {
+                'pred_boxes': pred_boxes,
+                'scores': scores,
+                'pred_classes': pred_classes}
+        (preds_per_framevid
+            .setdefault(dl_item['vid'], {})
+            [dl_item['video_frame_number']]) = detections
+
+    # To every tube, find matching keyframes
+    n_classes = len(dataset.action_names)
+    cls_scores_per_tube: Dict[DALY_tube_index, np.ndarray] = {}
+    for k, wein_tube in tqdm(tubes_per_video.items(), 'match_keyframes'):
+        (vid, bunch_id, tube_id) = k
+        cls_scores = np.zeros(n_classes)
+        for frame_ind, tube_box in zip(
+                wein_tube['frame_inds'],
+                wein_tube['boxes']):
+            matching_keyframe = preds_per_framevid.get(vid, {}).get(frame_ind)
+            if matching_keyframe is None:
+                continue
+            # Check overlap
+            if overlap_type == 'iou':
+                overlaps = []
+                for pred_box in matching_keyframe['pred_boxes']:
+                    overlaps.append(numpy_iou(pred_box, tube_box))
+                overlaps = np.array(overlaps)
+            elif overlap_type == 'inner_overlap':
+                overlaps = numpy_inner_overlap_N1(
+                        matching_keyframe['pred_boxes'], tube_box)
+            else:
+                raise RuntimeError()
+            good_overlaps = overlaps > overlap_cutoff
+            # Check score
+            good_score = matching_keyframe['scores'] > score_cutoff
+            # Merge
+            good = good_overlaps & good_score
+
+            for score, cls in zip(
+                    matching_keyframe['scores'][good],
+                    matching_keyframe['pred_classes'][good]):
+                cls_scores[cls] += score
+        cls_scores_per_tube[k] = cls_scores
+
+    # Create scored_tubes
+    scored_tubes_per_video_per_action: \
+            Dict[DALY_action_name,
+                    Dict[DALY_vid, List[DALY_sparse_frametube_scored]]] = {}
+    for ckey, tube in tubes_per_video.items():
+        (vid, bunch_id, tube_id) = ckey
+        agg_tubescores = cls_scores_per_tube[ckey]
+
+        original_tube = original_tubes_per_video[ckey]
+        frame_inds = tube['frame_inds']
+        boxes = tube['boxes']
+        start_frame = original_tube['frame_inds'].min()
+        end_frame = original_tube['frame_inds'].max()
+        # Sum the perframe scores
+        for action_name, score in zip(
+                dataset.action_names, agg_tubescores):
+            sparse_scored_tube = {
+                    'frame_inds': frame_inds,
+                    'boxes': boxes,
+                    'start_frame': start_frame,
+                    'end_frame': end_frame,
+                    'score': score}
+            if score < 0.05:
+                continue
+            (scored_tubes_per_video_per_action
+                    .setdefault(action_name, {})
+                    .setdefault(vid, []).append(sparse_scored_tube))
+
+    all_actions = dataset.action_names
+    coverage = compute_daly_coverage(all_actions,
+            scored_tubes_per_video_per_action, daly_tubes_temp_per_action)
+    iou_thresh = 0.3
+    series_rec_s, series_rec_st = _daly_recall_as_series(coverage, iou_thresh)
+
+    options_tube_ap: Options_tube_ap = {
+            'iou_thresh': iou_thresh,
+            'spatiotemporal': False,
+            'use_07_metric': False,
+            'use_diff': False,
+    }
+    series_ap, ap_per_cls = _daly_ap_as_series(
+            all_actions, scored_tubes_per_video_per_action,
+            daly_tubes_temp_per_action, options_tube_ap)
+    df_recap = pd.concat((series_rec_s, series_rec_st, series_ap), axis=1)
+    log.info('For thresh {:.2f}\n{}'.format(iou_thresh, df_to_table(df_recap)))
