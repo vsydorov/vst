@@ -11,7 +11,7 @@ from tqdm import tqdm
 from pathlib import Path
 from collections import namedtuple
 from typing import (Dict, Tuple, List, cast, NewType,
-        Iterable, NamedTuple, Any, TypeVar)
+        Iterable, NamedTuple, Any, TypeVar, Callable)
 from mypy_extensions import TypedDict
 
 from vsydorov_tools import small
@@ -93,13 +93,13 @@ Options_tube_ap = TypedDict('Options_tube_ap', {
 
 
 Flat_tube_temp_annotation = NamedTuple('Flat_tube_temp_annotation', [
-    ('video_name', str),
+    ('vid', str),
     ('id_tube', int),
     ('diff', bool),
     ('tube_temp', DALY_sparse_frametube),
 ])
 Flat_tube_detection = NamedTuple('Flat_tube_detection', [
-    ('video_name', str),
+    ('vid', str),
     ('id_tube', int),
     ('score', float),
     ('tube', DALY_sparse_frametube)
@@ -792,16 +792,15 @@ def _daly_ap_as_series(
 
 
 def temporal_IOU(
-        range_to_cover, covering_range):
+        b1, e1, b2, e2):
 
-    begin = max(range_to_cover[0], covering_range[0])
-    end = min(range_to_cover[1], covering_range[1])
+    begin = max(b1, b2)
+    end = min(e1, e2)
     inter = end-begin+1
     if inter <= 0:
         return 0.0
     else:
-        union = (range_to_cover[1] - range_to_cover[0] + 1) + \
-                (covering_range[1] - covering_range[0] + 1) - inter
+        union = (e1 - b1 + 1) + (e2 - b2 + 1) - inter
         return inter/union
 
 
@@ -837,40 +836,37 @@ def daly_average_precision_stats(
     """
     We always compute stats
     """
-
     # Flatten tube representations
     flat_annotations: List[Flat_tube_temp_annotation] = []
     flat_detections: List[Flat_tube_detection] = []
     # Extract GT annotation_list
-    for video_name, gt_tubes in sorted(gt_dict.items()):
+    for vid, gt_tubes in sorted(gt_dict.items()):
         for id_tube, gt_tube_temp in enumerate(gt_tubes):
             flat_annotations.append(Flat_tube_temp_annotation(
-                video_name, id_tube, False, gt_tube_temp))
+                vid, id_tube, False, gt_tube_temp))
     # Extract Proposal list
-    for video_name, proposal_tubes in sorted(proposal_dict.items()):
+    for vid, proposal_tubes in sorted(proposal_dict.items()):
         for id_tube, prop_tube in enumerate(proposal_tubes):
             prop_score = prop_tube['score']
             flat_detections.append(Flat_tube_detection(
-                video_name, id_tube, prop_score, prop_tube))
+                vid, id_tube, prop_score, prop_tube))
 
     # Precompute 'temporal iou' and indices of tubesp
-    # with small.QTimer('Precomputing Temp. IOU took %(time)s sec'):
-    possible_matches: List[Dict[int, float]] = []
-    for detection_id, _detection in enumerate(flat_detections):
+    possible_matches_per_detection: List[Dict[int, float]] = []
+    for _detection in flat_detections:
         ind_to_iou: Dict[int, float] = {}
-        video_name_ = str(_detection.video_name)
         begin_det = _detection.tube['start_frame']
         end_det = _detection.tube['end_frame']
         for annotation_id, annotation in enumerate(flat_annotations):
-            if annotation.video_name == video_name_:
+            if annotation.vid == _detection.vid:
                 tube_ann = annotation.tube_temp
                 begin_ann = tube_ann['start_frame']
                 end_ann = tube_ann['end_frame']
                 temp_iou = temporal_IOU(
-                        (begin_ann, end_ann), (begin_det, end_det))
-                if temp_iou > 0:
+                        begin_ann, end_ann, begin_det, end_det)
+                if temp_iou > 0.0:
                     ind_to_iou[annotation_id] = temp_iou
-        possible_matches.append(ind_to_iou)
+        possible_matches_per_detection.append(ind_to_iou)
 
     # Preparation
     detection_matched = np.zeros(len(flat_detections), dtype=bool)
@@ -894,7 +890,7 @@ def daly_average_precision_stats(
     sorted_inds = np.argsort(-detection_scores)
     for d, detection_ind in enumerate(sorted_inds):
         # Check available GTs
-        gt_ids_that_overlap = possible_matches[detection_ind]
+        gt_ids_that_overlap = possible_matches_per_detection[detection_ind]
         if len(gt_ids_that_overlap) == 0:
             fp[d] = 1
             continue
@@ -947,7 +943,7 @@ def daly_average_precision_stats(
             flat_detections=flat_detections,
             detection_matched=detection_matched,
             gt_already_matched=gt_already_matched,
-            possible_matches=possible_matches,
+            possible_matches=possible_matches_per_detection,
             iou_coverages_per_detection_ind=iou_coverages_per_detection_ind,
             detection_matched_to_which_gt=detection_matched_to_which_gt,
             sorted_inds=sorted_inds, fp=fp, tp=tp, npos=npos, rec=rec,
@@ -1007,6 +1003,75 @@ def _get_gt_sparsetubes(dataset, split_vids, gt_tubes):
                 .setdefault(action_name, {})
                 .setdefault(vid, [])).append(sparse_tube)
     return daly_tubes_temp_per_action
+
+
+def overlap_DALY_sparse_frametube(
+        x: DALY_sparse_frametube_scored,
+        y: DALY_sparse_frametube_scored) -> float:
+    """
+    - We utilize simple spatio-temporal overlap here:
+        - S = Mean spatial IOU for overlapping frames
+        - T = Temporal IOU of (start, end)
+    - We return S*T
+    """
+    # Find overlapping keyframes
+    union_keys = np.intersect1d(list(x), list(y))
+    if len(union_keys) == 0:
+        return 0.0
+    # Spatial
+    spat = spatial_tube_iou(x, y)
+    # Temporal
+    temp = temporal_IOU(
+            x['start_frame'], x['end_frame'],
+            y['start_frame'], y['end_frame'])
+    return spat * temp
+
+
+T = TypeVar('T')
+
+
+def custom_nms(
+        element_list: List[T],
+        overlap_func: Callable[[T, T], float],
+        score_func: Callable[[T], float],
+        thresh
+            ) -> List[T]:
+    """ Provided with function to compare overlap between two elements performs NMS on tubes """
+
+    scores = [score_func(e) for e in element_list]
+    sorted_ids = np.argsort(scores)[::-1]  # In decreasing order
+    sorted_candidates = [element_list[i] for i in sorted_ids]
+    results = []
+    while len(sorted_candidates):
+        taken = sorted_candidates.pop(0)
+        results.append(taken)
+        overlaps = [overlap_func(taken, c) for c in sorted_candidates]
+        sorted_candidates = [c for c, o in zip(sorted_candidates, overlaps) if o < thresh]
+
+    return results
+
+
+def nms_on_scored_tubes(
+        scored_tubes_per_video: Dict[str, List[DALY_sparse_frametube_scored]],
+        thresh: float
+            ) -> Dict[str, List[DALY_sparse_frametube_scored]]:
+
+    def score_func(x: DALY_sparse_frametube_scored):
+        return x['score']
+
+    def overlap_func(
+            x: DALY_sparse_frametube_scored,
+            y: DALY_sparse_frametube_scored) -> float:
+        return overlap_DALY_sparse_frametube(x, y)
+
+    nmsed_scored_tubes_per_video: \
+            Dict[str, List[DALY_sparse_frametube_scored]] = {}
+
+    for video_name, tubes in tqdm(scored_tubes_per_video.items(), desc='nms'):
+        nmsed_tubes: List[DALY_sparse_frametube_scored] = custom_nms(
+                tubes, overlap_func, score_func, thresh)
+        nmsed_scored_tubes_per_video[video_name] = nmsed_tubes
+    return nmsed_scored_tubes_per_video
 
 
 def actual_eval_of_nicphil_etubes(workfolder, cfg_dict, add_args):
@@ -1073,10 +1138,24 @@ def actual_eval_of_nicphil_etubes(workfolder, cfg_dict, add_args):
                     .setdefault(action_name, {})
                     .setdefault(vid, []).append(sparse_scored_tube))
 
+    # Apply per-class NMS
+    nmsed_scored_tubes_per_video_per_action = {}
+    tube_nms_thresh = 0.5
+    for action_name, scored_tubes_per_video in \
+            scored_tubes_per_video_per_action.items():
+        nmsed_scored_tubes_per_video = small.stash2(
+                out/f'scored_tubes_nms_at_{action_name}.pkl')(
+                nms_on_scored_tubes,
+                scored_tubes_per_video, tube_nms_thresh)
+        nmsed_scored_tubes_per_video_per_action[action_name] = \
+                nmsed_scored_tubes_per_video
+
+    scored_tubes_per_video_per_action = nmsed_scored_tubes_per_video_per_action
+
     all_actions = dataset.action_names
     coverage = compute_daly_coverage(all_actions,
             scored_tubes_per_video_per_action, daly_tubes_temp_per_action)
-    iou_thresh = 0.3
+    iou_thresh = 0.5
     series_rec_s, series_rec_st = _daly_recall_as_series(coverage, iou_thresh)
     # options_tube_ap: Options_tube_ap = {
     #         'iou_thresh': iou_thresh,
@@ -1231,10 +1310,24 @@ def actual_eval_of_action_object_predictions(workfolder, cfg_dict, add_args):
                     .setdefault(action_name, {})
                     .setdefault(vid, []).append(sparse_scored_tube))
 
+    # Apply per-class NMS
+    nmsed_scored_tubes_per_video_per_action = {}
+    tube_nms_thresh = 0.5
+    for action_name, scored_tubes_per_video in \
+            scored_tubes_per_video_per_action.items():
+        nmsed_scored_tubes_per_video = small.stash2(
+                out/f'scored_tubes_nms_at_{action_name}.pkl')(
+                nms_on_scored_tubes,
+                scored_tubes_per_video, tube_nms_thresh)
+        nmsed_scored_tubes_per_video_per_action[action_name] = \
+                nmsed_scored_tubes_per_video
+
+    scored_tubes_per_video_per_action = nmsed_scored_tubes_per_video_per_action
+
     all_actions = dataset.action_names
     coverage = compute_daly_coverage(all_actions,
             scored_tubes_per_video_per_action, daly_tubes_temp_per_action)
-    iou_thresh = 0.3
+    iou_thresh = 0.5
     series_rec_s, series_rec_st = _daly_recall_as_series(coverage, iou_thresh)
 
     options_tube_ap: Options_tube_ap = {
