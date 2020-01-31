@@ -454,6 +454,7 @@ def eval_daly_tubes_RGB(workfolder, cfg_dict, add_args):
     compute:
         chunk: [0, "VALUE >= 0"]
         total: [1, int]
+    save_period: ['::10', str]
     """)
     cf = cfg.parse()
     PIXEL_MEANS = cf['rcnn.PIXEL_MEANS']
@@ -496,7 +497,7 @@ def eval_daly_tubes_RGB(workfolder, cfg_dict, add_args):
 
     df_isaver = snippets.Simple_isaver(
             small.mkdir(out/'tube_eval_isaver'),
-            chunk_keys, tube_eval_func, '::10', 120)
+            chunk_keys, tube_eval_func, cf['save_period'], 120)
     predicted_tubescores = df_isaver.run()
     tubescores_dict = dict(zip(chunk_keys, predicted_tubescores))
     small.save_pkl(out/'tubescores_dict.pkl', tubescores_dict)

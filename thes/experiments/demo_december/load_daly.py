@@ -241,9 +241,11 @@ def load_wein_tubes(workfolder, cfg_dict, add_args):
     extracted_tubes: Dict[DALY_tube_index, DALY_wein_tube] = {}
     for vid_mp4, wein_bunches in wein_package.items():
         vid = re.search(r'(.*)\.mp4', vid_mp4).group(1)
+        vmp4 = dataset.source_videos[vid]
         for bunch_id, wein_tubes in enumerate(wein_bunches):
             for tube_id, wein_tube in enumerate(wein_tubes):
-                frame_inds = wein_tube[:, 0].astype(np.int)
+                frame_inds = wein_tube[:, 0].astype(np.int) - 1
+                assert max(frame_inds) < vmp4['frames_reached']
                 boxes_ltrd = wein_tube[:, 1:5]  # ltrd
                 human_scores = wein_tube[:, 5]
                 instance_scores = wein_tube[:, 6]
