@@ -1036,7 +1036,10 @@ def custom_nms(
         score_func: Callable[[T], float],
         thresh
             ) -> List[T]:
-    """ Provided with function to compare overlap between two elements performs NMS on tubes """
+    """
+    Provided with function to compare overlap between two elements performs NMS
+    on tubes
+    """
 
     scores = [score_func(e) for e in element_list]
     sorted_ids = np.argsort(scores)[::-1]  # In decreasing order
@@ -1074,46 +1077,48 @@ def nms_on_scored_tubes(
     return nmsed_scored_tubes_per_video
 
 
-def actual_eval_of_nicphil_etubes(workfolder, cfg_dict, add_args):
-    """
-    Evaluate "tubes" as if they were VOC objects
-    """
-    out, = snippets.get_subfolders(workfolder, ['out'])
-    cfg = snippets.YConfig(cfg_dict)
-    cfg.set_deftype("""
-    tubescores_dict: [~, ~]
-    dataset:
-        name: [~, ['daly']]
-        cache_folder: [~, str]
-        subset: ['train', str]
-    tubes:
-        imported_wein_tubes: [~, ~]
-        filter_gt: [False, bool]
-    """)
-    cf = cfg.parse()
+def scored_tube_nms(
+        stubes_va, thresh, nms_folder):
+    nmsed_stubes_va = {}
+    for action_name, scored_tubes_per_video in stubes_va.items():
+        nmsed_stubes_v = small.stash2(
+                nms_folder/f'scored_tubes_nms_{thresh:.2f}_at_{action_name}.pkl')(
+                nms_on_scored_tubes,
+                scored_tubes_per_video, thresh)
+        nmsed_stubes_va[action_name] = nmsed_stubes_v
+    return nmsed_stubes_va
 
-    dataset = DatasetDALY()
-    dataset.populate_from_folder(cf['dataset.cache_folder'])
 
-    # // Obtain GT tubes
-    split_label = cf['dataset.subset']
-    split_vids = get_daly_split_vids(dataset, split_label)
-    gt_tubes = get_daly_gt_tubes(dataset)
-    daly_tubes_temp_per_action = \
-            _get_gt_sparsetubes(dataset, split_vids, gt_tubes)
+def _daly_tube_map(cf, out, dataset, stubes_va, gttubes_va):
 
-    # // Obtain detected tubes
-    tubes_per_video: \
-            Dict[DALY_tube_index, DALY_wein_tube] = _set_tubes(cf, dataset)
-    # Refer to the originals for start_frame/end_frame
-    original_tubes_per_video: Dict[DALY_tube_index, DALY_wein_tube] = \
-        small.load_pkl(cf['tubes.imported_wein_tubes'])
-    split_label = cf['dataset.subset']
-    original_tubes_per_video = \
-        get_subset_tubes(dataset, split_label, original_tubes_per_video)
+    # Apply per-class NMS
+    if cf['tube_nms.enabled']:
+        tube_nms_thresh = cf['tube_nms.thresh']
+        stubes_va = scored_tube_nms(stubes_va, tube_nms_thresh, out)
 
-    tubescores_dict = small.load_pkl(cf['tubescores_dict'])
-    scored_tubes_per_video_per_action: \
+    all_actions = dataset.action_names
+
+    options_tube_ap: Options_tube_ap = {
+            'iou_thresh': None,
+            'spatiotemporal': cf['eval.spatiotemporal'],
+            'use_07_metric': cf['eval.use_07_metric'],
+            'use_diff': cf['eval.use_diff'],
+    }
+    iou_thresholds = cf['eval.iou_thresholds']
+    for iou_thresh in iou_thresholds:
+        options_tube_ap['iou_thresh'] = iou_thresh
+        coverage = compute_daly_coverage(all_actions,
+                stubes_va, gttubes_va)
+        series_rec_s, series_rec_st = _daly_recall_as_series(coverage, iou_thresh)
+        series_ap, ap_per_cls = _daly_ap_as_series(
+                all_actions, stubes_va, gttubes_va, options_tube_ap)
+        df_recap = pd.concat((series_rec_s, series_rec_st, series_ap), axis=1)
+        log.info('For thresh {:.2f}\n{}'.format(iou_thresh, df_to_table(df_recap)))
+
+
+def nicphil_evaluations_to_tubes(
+        dataset, tubes_per_video, original_tubes_per_video, tubescores_dict):
+    stubes_va: \
             Dict[DALY_action_name,
                     Dict[DALY_vid, List[DALY_sparse_frametube_scored]]] = {}
     for ckey, tube in tubes_per_video.items():
@@ -1134,104 +1139,27 @@ def actual_eval_of_nicphil_etubes(workfolder, cfg_dict, add_args):
                     'start_frame': start_frame,
                     'end_frame': end_frame,
                     'score': score}
-            (scored_tubes_per_video_per_action
+            (stubes_va
                     .setdefault(action_name, {})
                     .setdefault(vid, []).append(sparse_scored_tube))
-
-    # Apply per-class NMS
-    nmsed_scored_tubes_per_video_per_action = {}
-    tube_nms_thresh = 0.5
-    for action_name, scored_tubes_per_video in \
-            scored_tubes_per_video_per_action.items():
-        nmsed_scored_tubes_per_video = small.stash2(
-                out/f'scored_tubes_nms_at_{action_name}.pkl')(
-                nms_on_scored_tubes,
-                scored_tubes_per_video, tube_nms_thresh)
-        nmsed_scored_tubes_per_video_per_action[action_name] = \
-                nmsed_scored_tubes_per_video
-
-    scored_tubes_per_video_per_action = nmsed_scored_tubes_per_video_per_action
-
-    all_actions = dataset.action_names
-    coverage = compute_daly_coverage(all_actions,
-            scored_tubes_per_video_per_action, daly_tubes_temp_per_action)
-    iou_thresh = 0.5
-    series_rec_s, series_rec_st = _daly_recall_as_series(coverage, iou_thresh)
-    # options_tube_ap: Options_tube_ap = {
-    #         'iou_thresh': iou_thresh,
-    #         'spatiotemporal': cf['eval.spatiotemporal'],
-    #         'use_07_metric': cf['eval.use_07_metric'],
-    #         'use_diff': cf['eval.use_diff'],
-    # }
-    options_tube_ap: Options_tube_ap = {
-            'iou_thresh': iou_thresh,
-            'spatiotemporal': False,
-            'use_07_metric': False,
-            'use_diff': False,
-    }
-    series_ap, ap_per_cls = _daly_ap_as_series(
-            all_actions, scored_tubes_per_video_per_action,
-            daly_tubes_temp_per_action, options_tube_ap)
-    df_recap = pd.concat((series_rec_s, series_rec_st, series_ap), axis=1)
-    log.info('For thresh {:.2f}\n{}'.format(iou_thresh, df_to_table(df_recap)))
+    return stubes_va
 
 
-def actual_eval_of_action_object_predictions(workfolder, cfg_dict, add_args):
-    """
-    Evaluate "tubes" as if they were VOC objects
-    """
-    out, = snippets.get_subfolders(workfolder, ['out'])
-    cfg = snippets.YConfig(cfg_dict)
-    cfg.set_deftype("""
-    dataset:
-        name: [~, ['daly']]
-        cache_folder: [~, str]
-        subset: ['train', str]
-    tubes:
-        imported_wein_tubes: [~, ~]
-        filter_gt: [False, bool]
-    actobjects_evaluated: [~, ~]
-    """)
-    cf = cfg.parse()
-
-    dataset = DatasetDALY()
-    dataset.populate_from_folder(cf['dataset.cache_folder'])
-
-    # // Obtain GT tubes
-    split_label = cf['dataset.subset']
-    split_vids = get_daly_split_vids(dataset, split_label)
-    gt_tubes = get_daly_gt_tubes(dataset)
-    daly_tubes_temp_per_action = \
-            _get_gt_sparsetubes(dataset, split_vids, gt_tubes)
-
-    # // Obtain detected tubes
-    tubes_per_video: \
-            Dict[DALY_tube_index, DALY_wein_tube] = _set_tubes(cf, dataset)
-    # Refer to the originals for start_frame/end_frame
-    original_tubes_per_video: Dict[DALY_tube_index, DALY_wein_tube] = \
-        small.load_pkl(cf['tubes.imported_wein_tubes'])
-    split_label = cf['dataset.subset']
-    original_tubes_per_video = \
-        get_subset_tubes(dataset, split_label, original_tubes_per_video)
-
+def _create_objdetection_helper_structure(
+        dataset, split_label, actobjects_evaluated):
     # Assign scores to these tubes, based on intersections
     # with objaction detections
     datalist = simplest_daly_to_datalist(dataset, split_label)
     action_object_to_object = get_similar_action_objects_DALY()
     object_names = sorted([x
         for x in set(list(action_object_to_object.values())) if x])
-    num_classes = len(object_names)
+    # num_classes = len(object_names)
     def datalist_converter(datalist):  # NOQA
         datalist = make_datalist_objaction_similar_merged(
                 datalist, dataset.object_names, object_names,
                 action_object_to_object)
         return datalist
     datalist = datalist_converter(datalist)
-    actobjects_evaluated = small.load_pkl(cf['actobjects_evaluated'])
-
-    overlap_type = 'inner_overlap'
-    overlap_cutoff = 0.2
-    score_cutoff = 0.2
 
     # // Create a helper structure
     preds_per_framevid: Dict[DALY_vid, Dict[int, Dict]] = {}
@@ -1246,7 +1174,13 @@ def actual_eval_of_action_object_predictions(workfolder, cfg_dict, add_args):
         (preds_per_framevid
             .setdefault(dl_item['vid'], {})
             [dl_item['video_frame_number']]) = detections
+    return preds_per_framevid
 
+
+def _match_objectdetections_to_tubes(
+        dataset, tubes_per_video, original_tubes_per_video,
+        preds_per_framevid,
+        overlap_type, overlap_cutoff, score_cutoff):
     # To every tube, find matching keyframes
     n_classes = len(dataset.action_names)
     cls_scores_per_tube: Dict[DALY_tube_index, np.ndarray] = {}
@@ -1283,7 +1217,7 @@ def actual_eval_of_action_object_predictions(workfolder, cfg_dict, add_args):
         cls_scores_per_tube[k] = cls_scores
 
     # Create scored_tubes
-    scored_tubes_per_video_per_action: \
+    stubes_va: \
             Dict[DALY_action_name,
                     Dict[DALY_vid, List[DALY_sparse_frametube_scored]]] = {}
     for ckey, tube in tubes_per_video.items():
@@ -1306,38 +1240,123 @@ def actual_eval_of_action_object_predictions(workfolder, cfg_dict, add_args):
                     'score': score}
             if score < 0.05:
                 continue
-            (scored_tubes_per_video_per_action
+            (stubes_va
                     .setdefault(action_name, {})
                     .setdefault(vid, []).append(sparse_scored_tube))
+    return stubes_va
 
-    # Apply per-class NMS
-    nmsed_scored_tubes_per_video_per_action = {}
-    tube_nms_thresh = 0.5
-    for action_name, scored_tubes_per_video in \
-            scored_tubes_per_video_per_action.items():
-        nmsed_scored_tubes_per_video = small.stash2(
-                out/f'scored_tubes_nms_at_{action_name}.pkl')(
-                nms_on_scored_tubes,
-                scored_tubes_per_video, tube_nms_thresh)
-        nmsed_scored_tubes_per_video_per_action[action_name] = \
-                nmsed_scored_tubes_per_video
 
-    scored_tubes_per_video_per_action = nmsed_scored_tubes_per_video_per_action
+def actual_eval_of_nicphil_etubes(workfolder, cfg_dict, add_args):
+    """
+    Evaluate "tubes" as if they were VOC objects
+    """
+    out, = snippets.get_subfolders(workfolder, ['out'])
+    cfg = snippets.YConfig(cfg_dict)
+    cfg.set_deftype("""
+    tubescores_dict: [~, ~]
+    dataset:
+        name: [~, ['daly']]
+        cache_folder: [~, str]
+        subset: ['train', str]
+    tubes:
+        imported_wein_tubes: [~, ~]
+        filter_gt: [False, bool]
+    tube_nms:
+        enabled: [True, bool]
+        thresh: [0.5, float]
+    eval:
+        iou_thresholds: [[0.3, 0.5, 0.7], list]
+        spatiotemporal: [False, bool]
+        use_07_metric: [False, bool]
+        use_diff: [False, bool]
+    """)
+    cf = cfg.parse()
 
-    all_actions = dataset.action_names
-    coverage = compute_daly_coverage(all_actions,
-            scored_tubes_per_video_per_action, daly_tubes_temp_per_action)
-    iou_thresh = 0.5
-    series_rec_s, series_rec_st = _daly_recall_as_series(coverage, iou_thresh)
+    dataset = DatasetDALY()
+    dataset.populate_from_folder(cf['dataset.cache_folder'])
 
-    options_tube_ap: Options_tube_ap = {
-            'iou_thresh': iou_thresh,
-            'spatiotemporal': False,
-            'use_07_metric': False,
-            'use_diff': False,
-    }
-    series_ap, ap_per_cls = _daly_ap_as_series(
-            all_actions, scored_tubes_per_video_per_action,
-            daly_tubes_temp_per_action, options_tube_ap)
-    df_recap = pd.concat((series_rec_s, series_rec_st, series_ap), axis=1)
-    log.info('For thresh {:.2f}\n{}'.format(iou_thresh, df_to_table(df_recap)))
+    # // Obtain GT tubes
+    split_label = cf['dataset.subset']
+    split_vids = get_daly_split_vids(dataset, split_label)
+    gt_tubes = get_daly_gt_tubes(dataset)
+    gttubes_va = \
+            _get_gt_sparsetubes(dataset, split_vids, gt_tubes)
+
+    # // Obtain detected tubes
+    tubes_per_video: \
+            Dict[DALY_tube_index, DALY_wein_tube] = _set_tubes(cf, dataset)
+    # Refer to the originals for start_frame/end_frame
+    original_tubes_per_video: Dict[DALY_tube_index, DALY_wein_tube] = \
+        small.load_pkl(cf['tubes.imported_wein_tubes'])
+    split_label = cf['dataset.subset']
+    original_tubes_per_video = \
+        get_subset_tubes(dataset, split_label, original_tubes_per_video)
+
+    tubescores_dict = small.load_pkl(cf['tubescores_dict'])
+    stubes_va = nicphil_evaluations_to_tubes(
+            dataset, tubes_per_video,
+            original_tubes_per_video, tubescores_dict)
+    _daly_tube_map(cf, out, dataset, stubes_va, gttubes_va)
+
+
+def actual_eval_of_action_object_predictions(workfolder, cfg_dict, add_args):
+    """
+    Evaluate "tubes" as if they were VOC objects
+    """
+    out, = snippets.get_subfolders(workfolder, ['out'])
+    cfg = snippets.YConfig(cfg_dict)
+    cfg.set_deftype("""
+    dataset:
+        name: [~, ['daly']]
+        cache_folder: [~, str]
+        subset: ['train', str]
+    tubes:
+        imported_wein_tubes: [~, ~]
+        filter_gt: [False, bool]
+    tube_nms:
+        enabled: [True, bool]
+        thresh: [0.5, float]
+    eval:
+        iou_thresholds: [[0.3, 0.5, 0.7], list]
+        spatiotemporal: [False, bool]
+        use_07_metric: [False, bool]
+        use_diff: [False, bool]
+    actobjects_evaluated: [~, ~]
+    obj_to_tube:
+        overlap_type: ['inner_overlap', ['inner_overlap', 'iou']]
+        overlap_cutoff: [0.2, float]
+        score_cutoff: [0.2, float]
+    """)
+    cf = cfg.parse()
+
+    dataset = DatasetDALY()
+    dataset.populate_from_folder(cf['dataset.cache_folder'])
+
+    # // Obtain GT tubes
+    split_label = cf['dataset.subset']
+    split_vids = get_daly_split_vids(dataset, split_label)
+    gt_tubes = get_daly_gt_tubes(dataset)
+    gttubes_va = \
+            _get_gt_sparsetubes(dataset, split_vids, gt_tubes)
+
+    # // Obtain detected tubes
+    tubes_per_video: \
+            Dict[DALY_tube_index, DALY_wein_tube] = _set_tubes(cf, dataset)
+    # Refer to the originals for start_frame/end_frame
+    original_tubes_per_video: Dict[DALY_tube_index, DALY_wein_tube] = \
+        small.load_pkl(cf['tubes.imported_wein_tubes'])
+    split_label = cf['dataset.subset']
+    original_tubes_per_video = \
+        get_subset_tubes(dataset, split_label, original_tubes_per_video)
+
+    actobjects_evaluated = small.load_pkl(cf['actobjects_evaluated'])
+
+    preds_per_framevid = _create_objdetection_helper_structure(
+        dataset, split_label, actobjects_evaluated)
+    overlap_type = cf['obj_to_tube.overlap_type']
+    overlap_cutoff = cf['obj_to_tube.overlap_cutoff']
+    score_cutoff = cf['obj_to_tube.score_cutoff']
+    stubes_va = _match_objectdetections_to_tubes(
+        dataset, tubes_per_video, original_tubes_per_video,
+        preds_per_framevid, overlap_type, overlap_cutoff, score_cutoff)
+    _daly_tube_map(cf, out, dataset, stubes_va, gttubes_va)
