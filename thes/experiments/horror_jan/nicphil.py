@@ -1443,6 +1443,18 @@ def actual_eval_of_action_object_predictions(workfolder, cfg_dict, add_args):
     _daly_tube_map(cf, out, dataset, stubes_va, gttubes_va)
 
 
+def _recreate_datalist_for_detections(dataset, split_label):
+    # /// Recreate the datalist that was used for detections
+    action_object_to_object = get_similar_action_objects_DALY()
+    new_object_names = sorted([x
+        for x in set(list(action_object_to_object.values())) if x])
+    datalist = simplest_daly_to_datalist(dataset, split_label)
+    datalist = make_datalist_objaction_similar_merged(
+            datalist, dataset.object_names, new_object_names,
+            action_object_to_object)
+    return datalist
+
+
 def assign_objactions_to_tubes(workfolder, cfg_dict, add_args):
     """
     Assign objactions (real or gt-faked) to tubes (philippe or gt-faked)
@@ -1500,14 +1512,7 @@ def assign_objactions_to_tubes(workfolder, cfg_dict, add_args):
     # // Create objaction_dets in video frames
     objactions_vf: Dict[DALY_vid, Dict[int, Objaction_dets]] = {}
     if cf['actobjects.source'] == 'detected':
-        # /// Recreate the datalist that was used for detections
-        action_object_to_object = get_similar_action_objects_DALY()
-        new_object_names = sorted([x
-            for x in set(list(action_object_to_object.values())) if x])
-        datalist = simplest_daly_to_datalist(dataset, split_label)
-        datalist = make_datalist_objaction_similar_merged(
-                datalist, dataset.object_names, new_object_names,
-                action_object_to_object)
+        datalist = _recreate_datalist_for_detections(dataset, split_label)
         # /// Load detections themselves
         actobjects_evaluated = small.load_pkl(cf['actobjects.detected.path'])
         # /// Assign objactions
@@ -1525,7 +1530,25 @@ def assign_objactions_to_tubes(workfolder, cfg_dict, add_args):
                 .setdefault(dl_item['vid'], {})
                 [dl_item['video_frame_number']]) = detections
     elif cf['actobjects.source'] == 'gt':
-        pass
+        datalist = _recreate_datalist_for_detections(dataset, split_label)
+        # /// Create fake "perfect" detections
+        for dl_item in datalist:
+            pred_boxes = []
+            pred_classes = []
+            for anno in dl_item['annotations']:
+                pred_boxes.append(anno['bbox'])
+                pred_classes.append(
+                        dataset.action_names[anno['category_id']])
+            pred_boxes = np.array(pred_boxes)
+            pred_classes = np.array(pred_classes)
+            scores = np.ones(len(pred_boxes))
+            detections: Objaction_dets = {
+                    'pred_boxes': pred_boxes,
+                    'scores': scores,
+                    'pred_classes': pred_classes}
+            (objactions_vf
+                .setdefault(dl_item['vid'], {})
+                [dl_item['video_frame_number']]) = detections
     else:
         raise NotImplementedError()
     # // Define tubes
