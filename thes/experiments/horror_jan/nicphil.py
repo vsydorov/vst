@@ -539,45 +539,6 @@ def hacky_gather_evaluated_tubes(workfolder, cfg_dict, add_args):
 from detectron2.structures import BoxMode
 
 
-def convert_daly_to_action_based_datalist(dataset, split_label):
-    split_vids = get_daly_split_vids(dataset, split_label)
-
-    d2_datalist = []
-    for vid in split_vids:
-        v = dataset.video_odict[vid]
-        vmp4 = dataset.source_videos[vid]
-        video_path = vmp4['video_path']
-        height = vmp4['height']
-        width = vmp4['width']
-        for action_name, instances in v['instances'].items():
-            for ins_ind, instance in enumerate(instances):
-                for keyframe in instance['keyframes']:
-                    frame_number = keyframe['frameNumber']
-                    frame_time = keyframe['time']
-                    image_id = '{}_A{}_FN{}_FT{:.3f}'.format(
-                            vid, action_name, frame_number, frame_time)
-                    box_unscaled = keyframe['boundingBox'].squeeze()
-                    bbox = box_unscaled * np.tile([width, height], 2)
-                    bbox_mode = BoxMode.XYXY_ABS
-                    action_id = dataset.action_names.index(action_name)
-                    act_obj = {
-                            'bbox': bbox,
-                            'bbox_mode': bbox_mode,
-                            'category_id': action_id}
-                    annotations = [act_obj]
-                    record = {
-                            'video_path': video_path,
-                            'video_frame_number': frame_number,
-                            'video_frame_time': frame_time,
-                            'action_name': action_name,
-                            'image_id': image_id,
-                            'height': height,
-                            'width': width,
-                            'annotations': annotations}
-                    d2_datalist.append(record)
-    return d2_datalist
-
-
 def numpy_box_area(box):
     assert box.shape == (4,)
     return np.prod(box[2:] - box[:2])
