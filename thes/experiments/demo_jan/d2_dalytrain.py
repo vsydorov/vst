@@ -423,7 +423,7 @@ def eval_d2_dalyobj_hacky(workfolder, cfg_dict, add_args):
     datalist = datalist_converter(datalist)
 
     if cf['hacks.model_to_eval'] == 'what':
-        model_to_eval = cf['model_to_eval']
+        model_to_eval = cf['what_to_eval']
     elif cf['hacks.model_to_eval'] == 'what+foldname':
         import dervo
         EPATH = dervo.experiment.EXPERIMENT_PATH

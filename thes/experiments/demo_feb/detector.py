@@ -93,7 +93,7 @@ class DalyFrameDetectionsTrainer(DefaultTrainer):
         raise NotImplementedError()
 
 
-def _set_cfg_defaults_pfadet(cfg):
+def _set_cfg_defaults_pfadet_train(cfg):
     cfg.set_defaults_handling(['d2.'])
     cfg.set_deftype("""
     num_gpus: [~, int]
@@ -160,7 +160,7 @@ def _figure_out_disturl(add_args):
 def train_d2_framewise_action_detector(workfolder, cfg_dict, add_args):
     out, = snippets.get_subfolders(workfolder, ['out'])
     cfg = snippets.YConfig(cfg_dict)
-    _set_cfg_defaults_pfadet(cfg)
+    _set_cfg_defaults_pfadet_train(cfg)
     cf = cfg.parse()
     cf_add_d2 = cfg.without_prefix('d2.')
 
@@ -194,3 +194,88 @@ def train_d2_framewise_action_detector(workfolder, cfg_dict, add_args):
             machine_rank=0,
             dist_url=dist_url,
             args=(d_cfg, cf, nargs))
+
+
+def eval_d2_framewise_action_detector(workfolder, cfg_dict, add_args):
+    """
+    Evaluation code with hacks
+    """
+    out, = snippets.get_subfolders(workfolder, ['out'])
+    cfg = snippets.YConfig(cfg_dict)
+    # from _set_cfg_defaults_pfadet_train
+    cfg.set_defaults_handling(['d2.'])
+    cfg.set_deftype("""
+    dataset:
+        name: [~, ['daly']]
+        cache_folder: [~, str]
+        subset: ['train', ['train', 'test']]
+    """)
+    cfg.set_deftype("""
+    d2:
+        SEED: [42, int]
+    """)
+    cfg.set_deftype("""
+    what_to_eval: [~, str]
+    nms:
+        enable: [True, bool]
+        batched: [False, bool]
+        thresh: [0.3, float]
+    conf_thresh: [0.0, float]
+    """)
+    cf = cfg.parse()
+    cf_add_d2 = cfg.without_prefix('d2.')
+
+    # DALY Dataset
+    dataset = DatasetDALY()
+    dataset.populate_from_folder(cf['dataset.cache_folder'])
+    split_label = cf['dataset.subset']
+    split_vids = get_daly_split_vids(dataset, split_label)
+    datalist = daly_to_datalist_pfadet(dataset, split_vids)
+
+    cls_names = dataset.action_names
+    num_classes = len(cls_names)
+
+    # from _set_d2config_pfadet
+    d_cfg = base_d2_frcnn_config()
+    d_cfg.MODEL.WEIGHTS = cf['what_to_eval']
+    set_d2_cthresh(d_cfg, cf['conf_thresh'])
+    d_cfg.OUTPUT_DIR = str(small.mkdir(out/'d2_output'))
+    d_cfg.MODEL.ROI_HEADS.NUM_CLASSES = num_classes
+    yacs_add_d2 = yacs.config.CfgNode(
+            snippets.unflatten_nested_dict(cf_add_d2), [])
+    d_cfg.merge_from_other_cfg(yacs_add_d2)
+    d_cfg.freeze()
+
+    # evaluation
+    simple_d2_setup(d_cfg)
+    predictor = DefaultPredictor(d_cfg)
+    cpu_device = torch.device("cpu")
+
+    def eval_func(dl_item):
+        video_path = dl_item['video_path']
+        frame_number = dl_item['video_frame_number']
+        frame_time = dl_item['video_frame_number']
+        frame_u8 = get_frame_without_crashing(
+            video_path, frame_number, frame_time)
+        predictions = predictor(frame_u8)
+        cpu_instances = predictions["instances"].to(cpu_device)
+        return cpu_instances
+
+    df_isaver = snippets.Simple_isaver(
+            small.mkdir(out/'isaver'), datalist, eval_func, '::50')
+    predicted_datalist = df_isaver.run()
+
+    if cf['nms.enable']:
+        nms_thresh = cf['nms.thresh']
+        nmsed_predicted_datalist = []
+        for pred_item in predicted_datalist:
+            if cf['nms.batched']:
+                keep = batched_nms(pred_item.pred_boxes.tensor,
+                        pred_item.scores, pred_item.pred_classes, nms_thresh)
+            else:
+                keep = nms(pred_item.pred_boxes.tensor,
+                        pred_item.scores, nms_thresh)
+            nmsed_item = pred_item[keep]
+            nmsed_predicted_datalist.append(nmsed_item)
+        predicted_datalist = nmsed_predicted_datalist
+    legacy_evaluation(cls_names, datalist, predicted_datalist)
