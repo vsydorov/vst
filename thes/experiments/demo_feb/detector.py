@@ -3,10 +3,12 @@ import os
 import yacs
 import copy
 import logging
+import cv2
 import numpy as np
 import pandas as pd
 from pathlib import Path
 from typing import Dict, Tuple, cast
+from tqdm import tqdm
 
 from vsydorov_tools import small
 from vsydorov_tools import cv as vt_cv
@@ -24,6 +26,11 @@ from detectron2.data import transforms as d2_transforms
 from detectron2.engine.defaults import DefaultPredictor
 from detectron2.layers.nms import nms, batched_nms
 from detectron2.structures import BoxMode
+from detectron2.modeling import build_model
+from detectron2.checkpoint import DetectionCheckpointer
+from detectron2.structures import Boxes, Instances, pairwise_iou
+
+from detectron2.utils.visualizer import ColorMode, Visualizer
 
 from thes.data.external_dataset import (
         DatasetDALY, DALY_action_name, DALY_object_name)
@@ -39,6 +46,8 @@ from thes.daly_d2 import (
         get_daly_split_vids,
         DalyVideoDatasetMapper,)
 from thes.eval_tools import legacy_evaluation
+from thes.experiments.horror_jan.nicphil import (
+        _set_tubes, sample_some_tubes)
 
 
 log = logging.getLogger(__name__)
@@ -279,3 +288,197 @@ def eval_d2_framewise_action_detector(workfolder, cfg_dict, add_args):
             nmsed_predicted_datalist.append(nmsed_item)
         predicted_datalist = nmsed_predicted_datalist
     legacy_evaluation(cls_names, datalist, predicted_datalist)
+
+
+def _cpu_and_thresh_instances(predictions, post_thresh, cpu_device):
+    instances = predictions["instances"].to(cpu_device)
+    good_scores = instances.scores > post_thresh
+    tinstances = instances[good_scores]
+    return tinstances
+
+
+def _d2vis_draw_gtboxes(frame_u8, tinstances, metadata):
+    visualizer = Visualizer(frame_u8, metadata=metadata, scale=1)
+    img_vis = visualizer.draw_instance_predictions(
+            predictions=tinstances)
+    img = img_vis.get_image()
+    return img
+
+
+def _predict_rcnn_given_box_resized_proposals(
+        box4, frame_u8, transform_gen, model):
+
+    o_height, o_width = frame_u8.shape[:2]
+    got_transform = transform_gen.get_transform(frame_u8)
+
+    # Transform image
+    image = got_transform.apply_image(frame_u8)
+    image = torch.as_tensor(image.astype("float32").transpose(2, 0, 1))
+    imshape = tuple(image.shape[1:3])
+
+    # / Transform box
+    assert box4.shape == (4,)
+    boxes_unscaled = box4[None]
+    t_boxes = torch.as_tensor(boxes_unscaled.astype("float32"))
+    transformed_t_boxes = got_transform.apply_box(t_boxes)
+    # // Proposals w.r.t transformed imagesize
+    proposal = Instances(imshape)
+    tb_boxes = Boxes(transformed_t_boxes)
+    proposal.proposal_boxes = tb_boxes
+
+    inputs = {
+            "image": image,
+            "proposals": proposal,
+            "height": o_height,
+            "width": o_width}
+
+    with torch.no_grad():
+        predictions = model([inputs])[0]
+    return predictions
+
+
+def eval_daly_tubes_RGB_with_pfadet_demovis(workfolder, cfg_dict, add_args):
+    """
+    Run out own trained model on tubes
+    """
+    out, = snippets.get_subfolders(workfolder, ['out'])
+    cfg = snippets.YConfig(cfg_dict)
+    cfg.set_defaults_handling(['d2.'])
+    cfg.set_deftype("""
+    dataset:
+        name: [~, ['daly']]
+        cache_folder: [~, str]
+        subset: ['train', str]
+    tubes:
+        imported_wein_tubes: [~, ~]
+        filter_gt: [False, bool]
+    """)
+    cfg.set_deftype("""
+    compute:
+        chunk: [0, "VALUE >= 0"]
+        total: [1, int]
+    save_period: ['::10', str]
+    """)
+    cfg.set_deftype("""
+    some_tubes:
+        N: [50, int]
+        seed: [0, int]
+    conf_thresh: [0.0, float]
+    trained_d2_model: [~, ~]
+    d2:
+        SEED: [42, int]
+    """)
+    cf = cfg.parse()
+    cf_add_d2 = cfg.without_prefix('d2.')
+
+    dataset = DatasetDALY()
+    dataset.populate_from_folder(cf['dataset.cache_folder'])
+
+    cls_names = dataset.action_names
+    num_classes = len(cls_names)
+
+    # Dataset
+    split_label = cf['dataset.subset']
+    split_vids = get_daly_split_vids(dataset, split_label)
+    datalist = daly_to_datalist_pfadet(dataset, split_vids)
+    name = 'daly_pfadet_train'
+    DatasetCatalog.register(name, lambda: datalist)
+    MetadataCatalog.get(name).set(
+            thing_classes=cls_names)
+    metadata = MetadataCatalog.get(name)
+
+    # / Define d2 conf
+    d_cfg = base_d2_frcnn_config()
+    d_cfg.MODEL.WEIGHTS = cf['trained_d2_model']
+    d_cfg.OUTPUT_DIR = str(small.mkdir(out/'d2_output'))
+    d_cfg.MODEL.ROI_HEADS.NUM_CLASSES = num_classes
+    set_d2_cthresh(d_cfg, cf['conf_thresh'])
+    yacs_add_d2 = yacs.config.CfgNode(
+            snippets.unflatten_nested_dict(cf_add_d2), [])
+    d_cfg.merge_from_other_cfg(yacs_add_d2)
+    d_cfg2 = copy.deepcopy(d_cfg)
+    d_cfg.freeze()
+    # / Start d2
+    simple_d2_setup(d_cfg)
+
+    # Predictor with proposal generator
+    predictor = DefaultPredictor(d_cfg)
+
+    # Predictor without proposal generator
+
+    d_cfg2.MODEL.PROPOSAL_GENERATOR.NAME = "PrecomputedProposals"
+    d_cfg2.freeze()
+    model = build_model(d_cfg2)
+    model.eval()
+    checkpointer = DetectionCheckpointer(model)
+    checkpointer.load(d_cfg2.MODEL.WEIGHTS)
+    MIN_SIZE_TEST = d_cfg2.INPUT.MIN_SIZE_TEST
+    MAX_SIZE_TEST = d_cfg2.INPUT.MAX_SIZE_TEST
+    transform_gen = d2_transforms.ResizeShortestEdge(
+        [MIN_SIZE_TEST, MIN_SIZE_TEST], MAX_SIZE_TEST)
+    cpu_device = torch.device("cpu")
+
+    # Load tubes
+    tubes_per_video = _set_tubes(cf, dataset)
+    some_tubes = sample_some_tubes(
+            tubes_per_video, N=cf['some_tubes.N'],
+            NP_SEED=cf['some_tubes.seed'])
+    # k = ('S_PwpNZWgpk', 0, 19)
+    # some_tubes = {k: tubes_per_video[k]}
+
+    post_thresh = 0.2
+
+    for k, tube in tqdm(some_tubes.items(), 'tubes vis'):
+        (vid, bunch_id, tube_id) = k
+        vmp4 = dataset.source_videos[vid]
+        video_path = vmp4['video_path']
+        frame_inds = tube['frame_inds']
+        with vt_cv.video_capture_open(video_path) as vcap:
+            frames_u8 = vt_cv.video_sample(
+                    vcap, frame_inds, debug_filename=video_path)
+        tube_prefix = '{}_B{:02d}T{:02d}'.format(vid, bunch_id, tube_id)
+        tube_fold = small.mkdir(out/tube_prefix)
+        for i, (frame_ind, frame_u8) in enumerate(zip(frame_inds, frames_u8)):
+            frame_prefix = tube_fold/'I{}_F{:03d}'.format(i, frame_ind)
+
+            predictions = predictor(frame_u8)
+            tinstances = \
+                    _cpu_and_thresh_instances(predictions, post_thresh, cpu_device)
+            img = _d2vis_draw_gtboxes(frame_u8, tinstances, metadata)
+            cv2.imwrite(str(out/f'{frame_prefix}_frcnn.jpg'), img)
+
+            # Get tube box, pass tube box through the rcnn part
+            box4 = tube['boxes'][i]
+            predictions = _predict_rcnn_given_box_resized_proposals(
+                    box4, frame_u8, transform_gen, model)
+            tinstances = \
+                    _cpu_and_thresh_instances(predictions, post_thresh, cpu_device)
+            img = _d2vis_draw_gtboxes(frame_u8, tinstances, metadata)
+            snippets.cv_put_box_with_text(
+                    img, box4, text='philtube')
+            cv2.imwrite(str(out/f'{frame_prefix}_rcnn.jpg'), img)
+
+
+# def eval_daly_tubes_RGB_with_pfadet(workfolder, cfg_dict, add_args):
+#     """
+#     Run out own trained model on tubes
+#     """
+#     out, = snippets.get_subfolders(workfolder, ['out'])
+#     cfg = snippets.YConfig(cfg_dict)
+#     # _set_tubecfg
+#     cfg.set_deftype("""
+#     dataset:
+#         name: [~, ['daly']]
+#         cache_folder: [~, str]
+#         subset: ['train', str]
+#     tubes:
+#         imported_wein_tubes: [~, ~]
+#         filter_gt: [False, bool]
+#     """)
+#     _set_tubecfg(cfg)
+#     cfg.set_deftype("""
+#     compute:
+#         chunk: [0, "VALUE >= 0"]
+#         total: [1, int]
+#     save_period: ['::10', str]
+#     """)
