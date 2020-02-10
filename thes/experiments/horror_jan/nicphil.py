@@ -483,9 +483,6 @@ def hacky_gather_evaluated_tubes(workfolder, cfg_dict, add_args):
     small.save_pkl(out/'tubescores_dict.pkl', tubescores_dict)
 
 
-from detectron2.structures import BoxMode
-
-
 def numpy_box_area(box):
     assert box.shape == (4,)
     return np.prod(box[2:] - box[:2])

@@ -78,13 +78,16 @@ def gt_tubes_to_df(dataset, gt_tubes):
         max_kframe = max(v['frame_inds'])
         start_frame = int(v['start_time']*ocv_video_fps)
         end_frame = int(v['end_time']*ocv_video_fps)
+        frame_inds = v['frame_inds']
+        n_frames = len(frame_inds)
         gt_df.append([
             *k, min_kframe, max_kframe,
-            start_frame, end_frame, v['frame_inds']])
+            start_frame, end_frame, frame_inds, n_frames])
     gt_df = pd.DataFrame(gt_df)
     gt_df.columns = ['vid', 'action', 'ins_id',
             'min_kframe', 'max_kframe',
-            'start_frame', 'end_frame', 'frame_inds']
+            'start_frame', 'end_frame',
+            'frame_inds', 'n_frames']
     return gt_df
 
 

@@ -44,7 +44,8 @@ from thes.det2 import (
 from thes.daly_d2 import (
         simplest_daly_to_datalist,
         get_daly_split_vids,
-        DalyVideoDatasetMapper,)
+        DalyVideoDatasetMapper,
+        gt_tubes_to_df)
 from thes.eval_tools import legacy_evaluation
 from thes.experiments.horror_jan.nicphil import (
         _set_tubes, sample_some_tubes)
@@ -405,7 +406,6 @@ def eval_daly_tubes_RGB_with_pfadet_demovis(workfolder, cfg_dict, add_args):
     predictor = DefaultPredictor(d_cfg)
 
     # Predictor without proposal generator
-
     d_cfg2.MODEL.PROPOSAL_GENERATOR.NAME = "PrecomputedProposals"
     d_cfg2.freeze()
     model = build_model(d_cfg2)
@@ -459,26 +459,172 @@ def eval_daly_tubes_RGB_with_pfadet_demovis(workfolder, cfg_dict, add_args):
             cv2.imwrite(str(out/f'{frame_prefix}_rcnn.jpg'), img)
 
 
-# def eval_daly_tubes_RGB_with_pfadet(workfolder, cfg_dict, add_args):
-#     """
-#     Run out own trained model on tubes
-#     """
-#     out, = snippets.get_subfolders(workfolder, ['out'])
-#     cfg = snippets.YConfig(cfg_dict)
-#     # _set_tubecfg
-#     cfg.set_deftype("""
-#     dataset:
-#         name: [~, ['daly']]
-#         cache_folder: [~, str]
-#         subset: ['train', str]
-#     tubes:
-#         imported_wein_tubes: [~, ~]
-#         filter_gt: [False, bool]
-#     """)
-#     _set_tubecfg(cfg)
-#     cfg.set_deftype("""
-#     compute:
-#         chunk: [0, "VALUE >= 0"]
-#         total: [1, int]
-#     save_period: ['::10', str]
-#     """)
+def equal_tube_split(tubes_per_video, ct, split_kind):
+    key_indices = np.arange(len(tubes_per_video))
+    key_list = list(tubes_per_video.keys())
+
+    # Simple tube df
+    nframes_df = []
+    for k, v in tubes_per_video.items():
+        vid = k[0]
+        nframes = len(v['frame_inds'])
+        nframes_df.append([vid, nframes])
+    nframes_df = pd.DataFrame(nframes_df, columns=['vid', 'nframes'])
+    nframes_df['keys'] = key_list
+
+    # Divide indices
+    if split_kind == 'tubes':
+        equal_split = np.array_split(key_indices, ct)
+    elif split_kind == 'frames':
+        approx_nframes_per_split = nframes_df.nframes.sum() // ct
+        approx_split_indices = approx_nframes_per_split * np.arange(1, ct)
+        split_indices = np.searchsorted(
+                nframes_df.nframes.cumsum(), approx_split_indices)
+        equal_split = np.array_split(key_indices, split_indices)
+    else:
+        raise NotImplementedError()
+
+    # Assign splits
+    for i, inds in enumerate(equal_split):
+        nframes_df.loc[inds, 'split'] = i
+    nframes_df['split'] = nframes_df['split'].astype(int)
+
+    # Compute stats
+    gb_chunk = nframes_df.groupby('split')
+    all_nvids = gb_chunk['vid'].unique().apply(len)
+    all_nframes = gb_chunk['nframes'].sum()
+    split_stats = pd.concat((all_nvids, all_nframes), axis=1)
+
+    # Divide tubes
+    split_tubes = [{} for i in range(ct)]
+    for i, group in gb_chunk.groups.items():
+        keys = nframes_df.loc[group, 'keys'].tolist()
+        for k in keys:
+            split_tubes[i][k] = tubes_per_video[k]
+    return split_tubes, split_stats
+
+
+def _parcel_management(cf, tubes_per_video):
+    # // Computation of parcels
+    cc, ct = (cf['compute.chunk'], cf['compute.total'])
+    split_kind = cf['compute.equal_split']
+    split_tubes, split_stats = \
+            equal_tube_split(tubes_per_video, ct, split_kind)
+    ctubes_per_video = split_tubes[cc]
+    # Logging part
+    log.info('Chunk {}/{}: {} -> {}'.format(
+        cc, ct, len(tubes_per_video), len(ctubes_per_video)))
+    log.info('split_stats:\n{}'.format(split_stats))
+    return ctubes_per_video
+
+
+def eval_daly_tubes_RGB_with_pfadet(workfolder, cfg_dict, add_args):
+    """
+    Run out own trained model on tubes
+    """
+    out, = snippets.get_subfolders(workfolder, ['out'])
+    cfg = snippets.YConfig(cfg_dict)
+    # _set_tubecfg
+    cfg.set_deftype("""
+    dataset:
+        name: [~, ['daly']]
+        cache_folder: [~, str]
+        subset: ['train', str]
+    tubes:
+        imported_wein_tubes: [~, ~]
+        filter_gt: [False, bool]
+    """)
+    cfg.set_deftype("""
+    compute:
+        chunk: [0, "VALUE >= 0"]
+        total: [1, int]
+        equal_split: ['frames', ['frames', 'tubes']]
+    save_period: ['::10', str]
+    """)
+    cfg.set_deftype("""
+    some_tubes:
+        N: [50, int]
+        seed: [0, int]
+    conf_thresh: [0.0, float]
+    trained_d2_model: [~, ~]
+    d2:
+        SEED: [42, int]
+    """)
+    cf = cfg.parse()
+    cf_add_d2 = cfg.without_prefix('d2.')
+
+    dataset = DatasetDALY()
+    dataset.populate_from_folder(cf['dataset.cache_folder'])
+
+    cls_names = dataset.action_names
+    num_classes = len(cls_names)
+
+    # Dataset
+    split_label = cf['dataset.subset']
+    split_vids = get_daly_split_vids(dataset, split_label)
+    datalist = daly_to_datalist_pfadet(dataset, split_vids)
+    name = 'daly_pfadet_train'
+    DatasetCatalog.register(name, lambda: datalist)
+    MetadataCatalog.get(name).set(
+            thing_classes=cls_names)
+    metadata = MetadataCatalog.get(name)
+
+    # / Define d2 conf
+    d_cfg = base_d2_frcnn_config()
+    d_cfg.MODEL.WEIGHTS = cf['trained_d2_model']
+    d_cfg.OUTPUT_DIR = str(small.mkdir(out/'d2_output'))
+    d_cfg.MODEL.ROI_HEADS.NUM_CLASSES = num_classes
+    d_cfg.MODEL.PROPOSAL_GENERATOR.NAME = "PrecomputedProposals"
+    set_d2_cthresh(d_cfg, cf['conf_thresh'])
+    yacs_add_d2 = yacs.config.CfgNode(
+            snippets.unflatten_nested_dict(cf_add_d2), [])
+    d_cfg.merge_from_other_cfg(yacs_add_d2)
+    d_cfg.freeze()
+    # / Start d2
+    simple_d2_setup(d_cfg)
+
+    # Predictor without proposal generator
+    model = build_model(d_cfg)
+    model.eval()
+    checkpointer = DetectionCheckpointer(model)
+    checkpointer.load(d_cfg.MODEL.WEIGHTS)
+    MIN_SIZE_TEST = d_cfg.INPUT.MIN_SIZE_TEST
+    MAX_SIZE_TEST = d_cfg.INPUT.MAX_SIZE_TEST
+    transform_gen = d2_transforms.ResizeShortestEdge(
+        [MIN_SIZE_TEST, MIN_SIZE_TEST], MAX_SIZE_TEST)
+    cpu_device = torch.device("cpu")
+
+    # Load tubes
+    tubes_per_video = _set_tubes(cf, dataset)
+    ctubes_per_video = _parcel_management(cf, tubes_per_video)
+
+    def tube_eval_func(k):
+        tube = ctubes_per_video[k]
+        (vid, bunch_id, tube_id) = k
+        vmp4 = dataset.source_videos[vid]
+        video_path = vmp4['video_path']
+        frame_inds = tube['frame_inds']
+        with vt_cv.video_capture_open(video_path) as vcap:
+            frames_u8 = vt_cv.video_sample(
+                    vcap, frame_inds, debug_filename=video_path)
+
+        instances_per_frame = []
+        for i, (frame_ind, frame_u8) in enumerate(zip(frame_inds, frames_u8)):
+            # Get tube box, pass tube box through the rcnn part
+            box4 = tube['boxes'][i]
+            predictions = _predict_rcnn_given_box_resized_proposals(
+                    box4, frame_u8, transform_gen, model)
+            instances = predictions["instances"].to(cpu_device)
+            # Simply record all predictions
+            instances_per_frame.append(instances)
+        return instances_per_frame
+
+    df_isaver = snippets.Simple_isaver(
+            small.mkdir(out/'tube_eval_isaver'),
+            list(ctubes_per_video.keys()),
+            tube_eval_func, cf['save_period'], 120)
+    predicted_tube_instances = df_isaver.run()
+    tube_instances_dict = dict(zip(
+        ctubes_per_video.keys(),
+        predicted_tube_instances))
+    small.save_pkl(out/'tube_instances_dict.pkl', tube_instances_dict)
