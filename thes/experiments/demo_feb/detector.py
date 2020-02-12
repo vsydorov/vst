@@ -7,7 +7,7 @@ import cv2
 import numpy as np
 import pandas as pd
 from pathlib import Path
-from typing import Dict, Tuple, cast
+from typing import Dict, Tuple, cast, List
 from tqdm import tqdm
 
 from vsydorov_tools import small
@@ -33,7 +33,8 @@ from detectron2.structures import Boxes, Instances, pairwise_iou
 from detectron2.utils.visualizer import ColorMode, Visualizer
 
 from thes.data.external_dataset import (
-        DatasetDALY, DALY_action_name, DALY_object_name)
+        DatasetDALY, DALY_action_name, DALY_object_name,
+        DALY_vid)
 from thes.tools import snippets
 from thes.det2 import (
         YAML_Base_RCNN_C4, YAML_faster_rcnn_R_50_C4,
@@ -45,10 +46,15 @@ from thes.daly_d2 import (
         simplest_daly_to_datalist,
         get_daly_split_vids,
         DalyVideoDatasetMapper,
-        gt_tubes_to_df)
+        gt_tubes_to_df,
+        get_daly_gt_tubes)
 from thes.eval_tools import legacy_evaluation
 from thes.experiments.horror_jan.nicphil import (
-        _set_tubes, sample_some_tubes)
+        _set_tubes, sample_some_tubes, _get_gt_sparsetubes,
+        get_subset_tubes, DALY_sparse_frametube_scored,
+        _daly_tube_map)
+from thes.experiments.demo_december.load_daly import (
+        DALY_wein_tube, DALY_tube_index)
 
 
 log = logging.getLogger(__name__)
@@ -665,4 +671,78 @@ def eval_daly_tubes_RGB_with_pfadet_gather_evaluated(
 
 
 def map_score_tubes_and_pfadet_rcnn_scores(workfolder, cfg_dict, add_args):
-    pass
+    out, = snippets.get_subfolders(workfolder, ['out'])
+    cfg = snippets.YConfig(cfg_dict)
+    cfg.set_deftype("""
+    tube_instances_dict: [~, ~]
+    dataset:
+        name: [~, ['daly']]
+        cache_folder: [~, str]
+        subset: ['train', str]
+    tubes:
+        imported_wein_tubes: [~, ~]
+        filter_gt: [False, bool]
+    rcnn_assignment:
+        use_boxes: [False, bool]
+    tube_nms:
+        enabled: [True, bool]
+        thresh: [0.5, float]
+    eval:
+        iou_thresholds: [[0.3, 0.5, 0.7], list]
+        spatiotemporal: [False, bool]
+        use_07_metric: [False, bool]
+        use_diff: [False, bool]
+    """)
+    cf = cfg.parse()
+
+    dataset = DatasetDALY()
+    dataset.populate_from_folder(cf['dataset.cache_folder'])
+
+    # // Obtain GT tubes
+    split_label = cf['dataset.subset']
+    split_vids = get_daly_split_vids(dataset, split_label)
+    gt_tubes = get_daly_gt_tubes(dataset)
+    gttubes_va = \
+            _get_gt_sparsetubes(dataset, split_vids, gt_tubes)
+
+    # // Obtain detected tubes
+    tubes_per_video: \
+            Dict[DALY_tube_index, DALY_wein_tube] = _set_tubes(cf, dataset)
+    # Refer to the originals for start_frame/end_frame
+    original_tubes_per_video: Dict[DALY_tube_index, DALY_wein_tube] = \
+        small.load_pkl(cf['tubes.imported_wein_tubes'])
+    split_label = cf['dataset.subset']
+    original_tubes_per_video = \
+        get_subset_tubes(dataset, split_label, original_tubes_per_video)
+
+    tube_instances_dict = small.load_pkl(cf['tube_instances_dict'])
+    stubes_va: \
+            Dict[DALY_action_name,
+                    Dict[DALY_vid, List[DALY_sparse_frametube_scored]]] = {}
+
+    assert cf['rcnn_assignment.use_boxes'] is False
+    # # Only record scores > 0.01
+    # score_record_thresh = 0.01
+    for ckey, tube in tubes_per_video.items():
+        (vid, bunch_id, tube_id) = ckey
+        original_tube = original_tubes_per_video[ckey]
+        tube_instances = tube_instances_dict[ckey]
+        # Ignore boxes in tube instances
+        scores_per_actid = np.zeros(len(dataset.action_names))
+        for i, ins in enumerate(tube_instances):
+            for pred_cls, score in zip(ins.pred_classes, ins.scores):
+                scores_per_actid[pred_cls] += score
+        start_frame = original_tube['frame_inds'].min()
+        end_frame = original_tube['frame_inds'].max()
+        for action_name, score in zip(
+                dataset.action_names, scores_per_actid):
+            sparse_scored_tube = {
+                    'frame_inds': tube['frame_inds'],
+                    'boxes': tube['boxes'],
+                    'start_frame': start_frame,
+                    'end_frame': end_frame,
+                    'score': score}
+            (stubes_va
+                    .setdefault(action_name, {})
+                    .setdefault(vid, []).append(sparse_scored_tube))
+    _daly_tube_map(cf, out, dataset, stubes_va, gttubes_va)

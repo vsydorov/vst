@@ -1070,16 +1070,14 @@ def nicphil_evaluations_to_tubes(
         original_tube = original_tubes_per_video[ckey]
         tubescores = tubescores_dict[ckey]
         agg_tubescores = np.vstack(tubescores).sum(0)[1:]
-        frame_inds = tube['frame_inds']
-        boxes = tube['boxes']
         start_frame = original_tube['frame_inds'].min()
         end_frame = original_tube['frame_inds'].max()
         # Sum the perframe scores
         for action_name, score in zip(
                 dataset.action_names, agg_tubescores):
             sparse_scored_tube = {
-                    'frame_inds': frame_inds,
-                    'boxes': boxes,
+                    'frame_inds': tube['frame_inds'],
+                    'boxes': tube['boxes'],
                     'start_frame': start_frame,
                     'end_frame': end_frame,
                     'score': score}
