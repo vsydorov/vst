@@ -649,7 +649,7 @@ def eval_daly_tubes_RGB_with_pfadet_gather_evaluated(
 
     # Read tubes, merge dicts
     tubescores_dict = {}
-    for tubepath in cf['etubes']:
+    for tubepath in tqdm(cf['etubes'], 'loading etubes'):
         tubes = small.load_pkl(tubepath)
         tubescores_dict.update(tubes)
 
