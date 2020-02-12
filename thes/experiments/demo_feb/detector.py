@@ -628,3 +628,41 @@ def eval_daly_tubes_RGB_with_pfadet(workfolder, cfg_dict, add_args):
         ctubes_per_video.keys(),
         predicted_tube_instances))
     small.save_pkl(out/'tube_instances_dict.pkl', tube_instances_dict)
+
+
+def eval_daly_tubes_RGB_with_pfadet_gather_evaluated(
+        workfolder, cfg_dict, add_args):
+    out, = snippets.get_subfolders(workfolder, ['out'])
+    cfg = snippets.YConfig(cfg_dict)
+    cfg.set_defaults_handling(raise_without_defaults=False)
+    cfg.set_deftype("""
+    etubes: [~, ~]
+    dataset:
+        name: [~, ['daly']]
+        cache_folder: [~, str]
+        subset: ['train', str]
+    tubes:
+        imported_wein_tubes: [~, ~]
+        filter_gt: [False, bool]
+    """)
+    cf = cfg.parse()
+
+    # Read tubes, merge dicts
+    tubescores_dict = {}
+    for tubepath in cf['etubes']:
+        tubes = small.load_pkl(tubepath)
+        tubescores_dict.update(tubes)
+
+    # Confirm that keys match
+    dataset = DatasetDALY()
+    dataset.populate_from_folder(cf['dataset.cache_folder'])
+    tubes_per_video = _set_tubes(cf, dataset)
+
+    assert tubes_per_video.keys() == tubescores_dict.keys(), \
+            "Keys should match"
+
+    small.save_pkl(out/'tube_instances_dict.pkl', tubescores_dict)
+
+
+def map_score_tubes_and_pfadet_rcnn_scores(workfolder, cfg_dict, add_args):
+    pass
