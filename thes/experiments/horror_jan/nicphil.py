@@ -1022,6 +1022,7 @@ def _daly_tube_map(cf, out, dataset, stubes_va, gttubes_va):
             'use_diff': cf['eval.use_diff'],
     }
     iou_thresholds = cf['eval.iou_thresholds']
+    iou_thresh_tables = {}
     for iou_thresh in iou_thresholds:
         options_tube_ap['iou_thresh'] = iou_thresh
         coverage = compute_daly_coverage(all_actions,
@@ -1030,7 +1031,15 @@ def _daly_tube_map(cf, out, dataset, stubes_va, gttubes_va):
         series_ap, ap_per_cls = _daly_ap_as_series(
                 all_actions, stubes_va, gttubes_va, options_tube_ap)
         df_recap = pd.concat((series_rec_s, series_rec_st, series_ap), axis=1)
+        iou_thresh_tables[iou_thresh] = df_recap
+
+    columns = []
+    for iou_thresh, df_recap in iou_thresh_tables.items():
+        columns.append(df_recap[df_recap.columns[2]])
         log.info('For thresh {:.2f}\n{}'.format(iou_thresh, df_to_table(df_recap)))
+
+    log.info('For all thresh, MAP\n{}'.format(
+        df_to_table(pd.concat(columns, axis=1))))
 
 
 def _daly_tube_map_v2(cf, out, dataset, stubes_va, gttubes_va):
