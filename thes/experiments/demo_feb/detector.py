@@ -174,42 +174,7 @@ def _figure_out_disturl(add_args):
 
 
 def train_d2_framewise_action_detector(workfolder, cfg_dict, add_args):
-    out, = snippets.get_subfolders(workfolder, ['out'])
-    cfg = snippets.YConfig(cfg_dict)
-    _set_cfg_defaults_pfadet_train(cfg)
-    cf = cfg.parse()
-    cf_add_d2 = cfg.without_prefix('d2.')
-
-    dataset = DatasetDALY()
-    dataset.populate_from_folder(cf['dataset.cache_folder'])
-    split_label = cf['dataset.subset']
-    split_vids = get_daly_split_vids(dataset, split_label)
-    datalist = daly_to_datalist_pfadet(dataset, split_vids)
-
-    cls_names = dataset.action_names
-    num_classes = len(cls_names)
-    TRAIN_DATASET_NAME = 'daly_pfadet_train'
-
-    d_cfg = _set_d2config_pfadet(cf, cf_add_d2, TRAIN_DATASET_NAME)
-    d_cfg.OUTPUT_DIR = str(small.mkdir(out/'d2_output'))
-    d_cfg.MODEL.ROI_HEADS.NUM_CLASSES = num_classes
-    d_cfg.freeze()
-
-    num_gpus = cf['num_gpus']
-
-    nargs = argparse.Namespace()
-    nargs.datalist = datalist
-    nargs.TRAIN_DATASET_NAME = TRAIN_DATASET_NAME
-    nargs.cls_names = cls_names
-    nargs.resume = True
-
-    dist_url = _figure_out_disturl(add_args)
-    launch_w_logging(_train_func_pfadet,
-            num_gpus,
-            num_machines=1,
-            machine_rank=0,
-            dist_url=dist_url,
-            args=(d_cfg, cf, nargs))
+    raise NotImplementedError()
 
 
 def eval_d2_framewise_action_detector(workfolder, cfg_dict, add_args):
