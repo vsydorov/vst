@@ -74,8 +74,6 @@ def cv_put_box_with_text(
     return result
 
 
-
-
 class Averager(object):
     """
     Taken from kensh code. Also seen in Gunnar's code

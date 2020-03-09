@@ -25,7 +25,6 @@ from detectron2.data import detection_utils as d2_dutils
 from detectron2.data import transforms as d2_transforms
 from detectron2.engine.defaults import DefaultPredictor
 from detectron2.layers.nms import nms, batched_nms
-from detectron2.structures import BoxMode
 from detectron2.modeling import build_model
 from detectron2.checkpoint import DetectionCheckpointer
 from detectron2.structures import Boxes, Instances, pairwise_iou
@@ -40,7 +39,6 @@ from thes.det2 import (
         YAML_Base_RCNN_C4, YAML_faster_rcnn_R_50_C4,
         launch_w_logging, launch_without_logging, simple_d2_setup,
         base_d2_frcnn_config, set_d2_cthresh, d2dict_gpu_scaling,
-        D2DICT_GPU_SCALING_DEFAULTS,
         get_frame_without_crashing,)
 from thes.daly_d2 import (
         simplest_daly_to_datalist,
@@ -58,55 +56,6 @@ from thes.experiments.demo_december.load_daly import (
 
 
 log = logging.getLogger(__name__)
-
-
-def daly_to_datalist_pfadet(dataset, split_vids):
-    d2_datalist = []
-    for vid in split_vids:
-        v = dataset.video_odict[vid]
-        vmp4 = dataset.source_videos[vid]
-        video_path = vmp4['video_path']
-        height = vmp4['height']
-        width = vmp4['width']
-        for action_name, instances in v['instances'].items():
-            for ins_ind, instance in enumerate(instances):
-                for keyframe in instance['keyframes']:
-                    frame_number = keyframe['frameNumber']
-                    frame_time = keyframe['time']
-                    image_id = '{}_A{}_FN{}_FT{:.3f}'.format(
-                            vid, action_name, frame_number, frame_time)
-                    box_unscaled = keyframe['boundingBox'].squeeze()
-                    bbox = box_unscaled * np.tile([width, height], 2)
-                    bbox_mode = BoxMode.XYXY_ABS
-                    action_id = dataset.action_names.index(action_name)
-                    act_obj = {
-                            'bbox': bbox,
-                            'bbox_mode': bbox_mode,
-                            'category_id': action_id}
-                    annotations = [act_obj]
-                    record = {
-                            'video_path': video_path,
-                            'video_frame_number': frame_number,
-                            'video_frame_time': frame_time,
-                            'action_name': action_name,
-                            'image_id': image_id,
-                            'height': height,
-                            'width': width,
-                            'annotations': annotations}
-                    d2_datalist.append(record)
-    return d2_datalist
-
-
-class DalyFrameDetectionsTrainer(DefaultTrainer):
-    @classmethod
-    def build_train_loader(cls, cfg):
-        mapper = DalyVideoDatasetMapper(cfg, is_train=True)
-        return build_detection_train_loader(cfg,
-                mapper=mapper)
-
-    @classmethod
-    def build_test_loader(cls, cfg, dataset_name):
-        raise NotImplementedError()
 
 
 def _set_cfg_defaults_pfadet_train(cfg):
@@ -133,133 +82,12 @@ def _set_cfg_defaults_pfadet_train(cfg):
 PRETRAINED_WEIGHTS_MODELPATH = '/home/vsydorov/projects/deployed/2019_12_Thesis/links/horus/pytorch_model_zoo/pascal_voc_baseline/model_final_b1acc2.pkl'
 
 
-def _set_d2config_pfadet(cf, cf_add_d2, TRAIN_DATASET_NAME):
-    # // d2_config
-    d_cfg = base_d2_frcnn_config()
-    d_cfg.MODEL.WEIGHTS = PRETRAINED_WEIGHTS_MODELPATH
-    d_cfg.DATASETS.TRAIN = (
-            TRAIN_DATASET_NAME,)
-    d_cfg.DATASETS.TEST = ()
-    if cf['gpu_scaling.enabled']:
-        d2dict_gpu_scaling(cf, cf_add_d2, cf['num_gpus'])
-    # Merge additional keys
-    yacs_add_d2 = yacs.config.CfgNode(
-            snippets.unflatten_nested_dict(cf_add_d2), [])
-    d_cfg.merge_from_other_cfg(yacs_add_d2)
-    return d_cfg
-
-
-def _train_func_pfadet(d_cfg, cf, nargs):
-    simple_d2_setup(d_cfg)
-
-    name = nargs.TRAIN_DATASET_NAME
-    DatasetCatalog.register(name, lambda: nargs.datalist)
-    MetadataCatalog.get(name).set(
-            thing_classes=nargs.cls_names)
-
-    trainer = DalyFrameDetectionsTrainer(d_cfg)
-    trainer.resume_or_load(resume=nargs.resume)
-    trainer.train()
-
-
-def _figure_out_disturl(add_args):
-    if '--port_inc' in add_args:
-        ind = add_args.index('--port_inc')
-        port_inc = int(add_args[ind+1])
-    else:
-        port_inc = 0
-    port = 2 ** 15 + 2 ** 14 + hash(os.getuid()) % 2 ** 14 + port_inc
-    dist_url = "tcp://127.0.0.1:{}".format(port)
-    return dist_url
-
-
 def train_d2_framewise_action_detector(workfolder, cfg_dict, add_args):
-    raise NotImplementedError()
+    raise NotImplementedError('Refactoring in progress')
 
 
 def eval_d2_framewise_action_detector(workfolder, cfg_dict, add_args):
-    """
-    Evaluation code with hacks
-    """
-    out, = snippets.get_subfolders(workfolder, ['out'])
-    cfg = snippets.YConfig(cfg_dict)
-    # from _set_cfg_defaults_pfadet_train
-    cfg.set_defaults_handling(['d2.'])
-    cfg.set_deftype("""
-    dataset:
-        name: [~, ['daly']]
-        cache_folder: [~, str]
-        subset: ['train', ['train', 'test']]
-    """)
-    cfg.set_deftype("""
-    d2:
-        SEED: [42, int]
-    """)
-    cfg.set_deftype("""
-    what_to_eval: [~, str]
-    nms:
-        enable: [True, bool]
-        batched: [False, bool]
-        thresh: [0.3, float]
-    conf_thresh: [0.0, float]
-    """)
-    cf = cfg.parse()
-    cf_add_d2 = cfg.without_prefix('d2.')
-
-    # DALY Dataset
-    dataset = DatasetDALY()
-    dataset.populate_from_folder(cf['dataset.cache_folder'])
-    split_label = cf['dataset.subset']
-    split_vids = get_daly_split_vids(dataset, split_label)
-    datalist = daly_to_datalist_pfadet(dataset, split_vids)
-
-    cls_names = dataset.action_names
-    num_classes = len(cls_names)
-
-    # from _set_d2config_pfadet
-    d_cfg = base_d2_frcnn_config()
-    d_cfg.MODEL.WEIGHTS = cf['what_to_eval']
-    set_d2_cthresh(d_cfg, cf['conf_thresh'])
-    d_cfg.OUTPUT_DIR = str(small.mkdir(out/'d2_output'))
-    d_cfg.MODEL.ROI_HEADS.NUM_CLASSES = num_classes
-    yacs_add_d2 = yacs.config.CfgNode(
-            snippets.unflatten_nested_dict(cf_add_d2), [])
-    d_cfg.merge_from_other_cfg(yacs_add_d2)
-    d_cfg.freeze()
-
-    # evaluation
-    simple_d2_setup(d_cfg)
-    predictor = DefaultPredictor(d_cfg)
-    cpu_device = torch.device("cpu")
-
-    def eval_func(dl_item):
-        video_path = dl_item['video_path']
-        frame_number = dl_item['video_frame_number']
-        frame_time = dl_item['video_frame_number']
-        frame_u8 = get_frame_without_crashing(
-            video_path, frame_number, frame_time)
-        predictions = predictor(frame_u8)
-        cpu_instances = predictions["instances"].to(cpu_device)
-        return cpu_instances
-
-    df_isaver = snippets.Simple_isaver(
-            small.mkdir(out/'isaver'), datalist, eval_func, '::50')
-    predicted_datalist = df_isaver.run()
-
-    if cf['nms.enable']:
-        nms_thresh = cf['nms.thresh']
-        nmsed_predicted_datalist = []
-        for pred_item in predicted_datalist:
-            if cf['nms.batched']:
-                keep = batched_nms(pred_item.pred_boxes.tensor,
-                        pred_item.scores, pred_item.pred_classes, nms_thresh)
-            else:
-                keep = nms(pred_item.pred_boxes.tensor,
-                        pred_item.scores, nms_thresh)
-            nmsed_item = pred_item[keep]
-            nmsed_predicted_datalist.append(nmsed_item)
-        predicted_datalist = nmsed_predicted_datalist
-    legacy_evaluation(cls_names, datalist, predicted_datalist)
+    pass
 
 
 def _cpu_and_thresh_instances(predictions, post_thresh, cpu_device):
