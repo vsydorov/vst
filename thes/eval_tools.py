@@ -106,8 +106,10 @@ def oldcode_evaluate_voc_detections(
             ) -> Dict[str, float]:
     """
     Params:
-        use_07_metric: If True, will evaluate AP over 11 points, like in VOC2007 evaluation code
-        use_diff: If True, will eval difficult proposals in the same way as real ones
+    use_07_metric: If True, will evaluate AP over 11 points, like in
+        VOC2007 evaluation code
+    use_diff: If True, will eval difficult proposals in the same way as
+        real ones
     """
 
     assert len(annotation_list) == len(all_boxes)
@@ -217,7 +219,7 @@ def datalist_to_voclike(object_names, datalist):
     return voclike_annotation_list
 
 
-def legacy_evaluation(object_names, datalist, predicted_datalist):
+def voclike_legacy_evaluation(object_names, datalist, predicted_datalist):
     """
     This is the evaluation code I used 2 years ago
     """

@@ -116,22 +116,26 @@ def set_detectron_cfg_base(d2_output_dir, num_classes, seed):
 
 
 def set_detectron_cfg_train_and_freeze(
-        d_cfg, DATASET_NAME, cf_add_d2):
+        d_cfg, DATASET_NAME, cf_add_d2,
+        freeze=True):
     d_cfg.MODEL.WEIGHTS = PRETRAINED_WEIGHTS_MODELPATH
     d_cfg.DATASETS.TRAIN = (DATASET_NAME, )
     d_cfg.DATASETS.TEST = ()
     yacs_merge_additional_keys(d_cfg, cf_add_d2)
-    d_cfg.freeze()
+    if freeze:
+        d_cfg.freeze()
     return d_cfg
 
 
 def set_detectron_cfg_test_and_freeze(
         d_cfg, DATASET_NAME,
-        model_weights, conf_thresh, cf_add_d2):
+        model_weights, conf_thresh, cf_add_d2,
+        freeze=True):
     d_cfg.MODEL.WEIGHTS = model_weights
     d_cfg.DATASETS.TRAIN = ()
     d_cfg.DATASETS.TEST = (DATASET_NAME, )
     set_d2_cthresh(d_cfg, conf_thresh)
     yacs_merge_additional_keys(d_cfg, cf_add_d2)
-    d_cfg.freeze()
+    if freeze:
+        d_cfg.freeze()
     return d_cfg

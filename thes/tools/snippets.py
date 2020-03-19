@@ -1,4 +1,5 @@
 import cv2
+import pandas as pd
 import yaml
 import time
 import copy
@@ -555,3 +556,26 @@ class Simple_isaver(Base_isaver):
                         self._log_interval_seconds:
                     log.info(_tqdm_str(pbar))
         return self.result
+
+
+def df_to_table(df: pd.DataFrame, indexname=None) -> str:
+    # Header
+    if indexname is None:
+        indexname = df.index.name
+    if indexname is None:
+        indexname = 'index'
+    header = [indexname, ] + list(df.columns)
+    # Col formats
+    col_formats = ['{}']
+    for dt in df.dtypes:
+        form = '{}'
+        if dt in ['float32', 'float64']:
+            form = '{:.2f}'
+        col_formats.append(form)
+
+    table = string_table(
+            np.array(df.reset_index()),
+            header=header,
+            col_formats=col_formats,
+            pad=2)
+    return table

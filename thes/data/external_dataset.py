@@ -961,9 +961,8 @@ class DatasetDALY(object):
     object_names: List[DALY_object_name]
     joint_names: List[DALY_joint_name]
     split: Dict[DALY_vid, Dataset_subset]
-    video_odict: "OrderedDict[DALY_vid, DALY_video]"
-
-    source_videos = Dict[DALY_vid, RVideoMP4_reached]
+    video_odict: Dict[DALY_vid, DALY_video]
+    source_videos: Dict[DALY_vid, RVideoMP4_reached]
 
     def __init__(self):
         super().__init__()
