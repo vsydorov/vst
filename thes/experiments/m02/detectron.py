@@ -41,7 +41,8 @@ from thes.detectron.daly import (
         daly_to_datalist_pfadet, get_category_map_o100, make_datalist_o100,
         get_similar_action_objects_DALY,
         make_datalist_objaction_similar_merged)
-from thes.eval_tools import voclike_legacy_evaluation
+from thes.eval_tools import (
+        voclike_legacy_evaluation, voclike_legacy_evaluation_v2)
 
 
 log = logging.getLogger(__name__)
@@ -284,7 +285,12 @@ def _eval_routine(cf, cf_add_d2, out,
             nmsed_item = pred_item[keep]
             nmsed_predicted_datalist.append(nmsed_item)
         predicted_datalist = nmsed_predicted_datalist
+
+    log.info('AP v1:')
     voclike_legacy_evaluation(cls_names, datalist, predicted_datalist)
+
+    log.info('AP v2:')
+    voclike_legacy_evaluation_v2(cls_names, datalist, predicted_datalist)
 
 
 def eval_daly_action(workfolder, cfg_dict, add_args):

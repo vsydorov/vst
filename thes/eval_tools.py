@@ -1,19 +1,33 @@
 import logging
 import pandas as pd
 import numpy as np
-from mypy_extensions import TypedDict
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, TypedDict
 from collections import namedtuple
 from pathlib import Path
 
 from thes.tools import snippets
+from thes.tubes.routines import numpy_iou
+from thes.data.external_dataset import (
+        DALY_vid)
+
+
+log = logging.getLogger(__name__)
 
 BoxLTRD = namedtuple('BoxLTRD', 'l t r d')
 Flat_annotation = namedtuple('Flat_annotation', 'id diff l t r d')
 Flat_detection = namedtuple('Flat_detection', 'id id_box score l t r d')
 
 
-log = logging.getLogger(__name__)
+class AP_fgt_framebox(TypedDict):
+    ind: Tuple[DALY_vid, int, int]  # vid, frame, anno_id
+    obj: np.ndarray  # LTRD box
+    diff: bool
+
+
+class AP_fdet_framebox(TypedDict):
+    ind: Tuple[DALY_vid, int, int]  # vid, frame, det_id
+    obj: np.ndarray  # LTRD box
+    score: float
 
 
 VOClike_object = TypedDict('VOClike_object', {
@@ -250,6 +264,159 @@ def voclike_legacy_evaluation(object_names, datalist, predicted_datalist):
             all_boxes,
             object_classes,
             iou_thresh, use_07_metric, use_diff)
+
+    # Results printed nicely via pd.Series
+    x = pd.Series(ap_per_cls)*100
+    x.loc['AVERAGE'] = x.mean()
+    table = snippets.string_table(
+            np.array(x.reset_index()),
+            header=['Object', 'AP'],
+            col_formats=['{}', '{:.2f}'], pad=2)
+    log.info(f'AP@{iou_thresh:.3f}:\n{table}')
+
+
+def evaluate_voc_detections_v2(
+        fgts: List[AP_fgt_framebox],
+        fdets: List[AP_fdet_framebox],
+        iou_thresh,
+        use_07_metric,
+        use_diff
+            ) -> float:
+    """
+    Params:
+    use_07_metric: If True, will evaluate AP over 11 points, like in
+        VOC2007 evaluation code
+    use_diff: If True, will eval difficult proposals in the same way as
+        real ones
+    """
+    # Group fdets belonging to same frame, assign to fgts
+    ifdet_groups: Dict[Tuple[DALY_vid, int], List[int]] = {}
+    for ifdet, fdet in enumerate(fdets):
+        vf_id = (fdet['ind'][0], fdet['ind'][1])
+        ifdet_groups.setdefault(vf_id, []).append(ifdet)
+    ifgt_to_ifdets: Dict[int, List[int]] = {}
+    for ifgt, fgt in enumerate(fgts):
+        vf_id = (fgt['ind'][0], fgt['ind'][1])
+        ifgt_to_ifdets[ifgt] = ifdet_groups.get(vf_id, [])
+    ifdet_to_ifgts: Dict[int, List[int]] = {}
+    for ifgt, ifdets in ifgt_to_ifdets.items():
+        for ifdet in ifdets:
+            ifdet_to_ifgts.setdefault(ifdet, []).append(ifgt)
+    # Preparation
+    detection_matched = np.zeros(len(fdets), dtype=bool)
+    gt_already_matched = np.zeros(len(fgts), dtype=bool)
+    # Provenance
+    detection_matched_to_which_gt = np.ones(len(fdets), dtype=int)*-1
+    iou_coverages_per_detection_ind: Dict[int, List[float]] = {}
+
+    # VOC2007 preparation
+    nd = len(fdets)
+    tp = np.zeros(nd)
+    fp = np.zeros(nd)
+    if use_diff:
+        npos = len(fgts)
+    else:
+        npos = len([x for x in fgts if not x['diff']])
+
+    # Go through ordered detections
+    detection_scores = np.array([x['score'] for x in fdets])
+    detection_scores = detection_scores.round(3)
+    sorted_inds = np.argsort(-detection_scores)
+    for d, ifdet in enumerate(sorted_inds):
+        # Check available GTs
+        share_image_ifgts: List[int] = ifdet_to_ifgts.get(ifdet, [])
+        if not len(share_image_ifgts):
+            fp[d] = 1
+            continue
+
+        detection: AP_fdet_framebox = fdets[ifdet]
+        detection_box = detection['obj']
+
+        # Compute IOUs
+        iou_coverages: List[float] = []
+        for ifgt in share_image_ifgts:
+            gt_box_anno: AP_fgt_framebox = fgts[ifgt]
+            gt_box = gt_box_anno['obj']
+            iou = numpy_iou(gt_box, detection_box)
+            iou_coverages.append(iou)
+        # Provenance
+        iou_coverages_per_detection_ind[ifdet] = iou_coverages
+
+        max_coverage_local_id = np.argmax(iou_coverages)
+        max_coverage = iou_coverages[max_coverage_local_id]
+        max_coverage_ifgt = share_image_ifgts[max_coverage_local_id]
+
+        # Mirroring voc_eval
+        if max_coverage > iou_thresh:
+            if (not use_diff) and fgts[max_coverage_ifgt]['diff']:
+                continue
+            if not gt_already_matched[max_coverage_ifgt]:
+                tp[d] = 1
+                detection_matched[ifdet] = True
+                gt_already_matched[max_coverage_ifgt] = True
+                detection_matched_to_which_gt[ifdet] = max_coverage_ifgt
+            else:
+                fp[d] = 1
+        else:
+            fp[d] = 1
+    fp = np.cumsum(fp)
+    tp = np.cumsum(tp)
+    rec = tp / float(npos)
+    prec = tp / np.maximum(tp + fp, np.finfo(np.float64).eps)
+    ap = voc_ap(rec, prec, use_07_metric)
+    return ap
+
+
+def voclike_legacy_evaluation_v2(
+        object_names: List[str],
+        datalist,
+        predicted_datalist):
+    # // Transform to sensible data format
+    o_fgts: Dict[str, List[AP_fgt_framebox]] = \
+            {on: [] for on in object_names}
+    for record in datalist:
+        vid = record['vid']
+        iframe = record['video_frame_number']
+        for anno_id, anno in enumerate(record['annotations']):
+            object_name = object_names[anno['category_id']]
+            fgt: AP_fgt_framebox = {
+                'ind': (vid, iframe, anno_id),
+                'obj': anno['bbox'],
+                'diff': False
+            }
+            o_fgts[object_name].append(fgt)
+    # # We assume vid+frame is enough to assign  det to gt
+    # o_gt_to_det: Dict[str,
+    #         Dict[Tuple[DALY_vid, int], List[int]]] = {}
+    o_fdets: Dict[str, List[AP_fdet_framebox]] = \
+            {on: [] for on in object_names}
+    for record, pred_item in zip(datalist, predicted_datalist):
+        vid = record['vid']
+        iframe = record['video_frame_number']
+        pred_boxes = pred_item.pred_boxes.tensor.numpy()
+        scores = pred_item.scores.numpy()
+        pred_classes = pred_item.pred_classes.numpy()
+        for det_id, (bbox, score, cls_ind) in enumerate(
+                zip(pred_boxes, scores, pred_classes)):
+            object_name = object_names[cls_ind]
+            fdet: AP_fdet_framebox = {
+                'ind': (vid, iframe, anno_id),
+                'obj': bbox,
+                'score': score
+            }
+            o_fdets[object_name].append(fdet)
+    # Params
+    use_07_metric = False
+    use_diff = False
+    iou_thresh = 0.5
+    object_classes = object_names
+    ap_per_cls: Dict[str, float] = {}
+    for obj_cls in object_classes:
+        ap = evaluate_voc_detections_v2(
+            o_fgts[obj_cls],
+            o_fdets[obj_cls],
+            iou_thresh, use_07_metric, use_diff)
+        ap_per_cls[obj_cls] = ap
 
     # Results printed nicely via pd.Series
     x = pd.Series(ap_per_cls)*100

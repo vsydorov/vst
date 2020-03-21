@@ -115,7 +115,7 @@ def set_detectron_cfg_base(d2_output_dir, num_classes, seed):
     return d_cfg
 
 
-def set_detectron_cfg_train_and_freeze(
+def set_detectron_cfg_train(
         d_cfg, DATASET_NAME, cf_add_d2,
         freeze=True):
     d_cfg.MODEL.WEIGHTS = PRETRAINED_WEIGHTS_MODELPATH
@@ -127,7 +127,7 @@ def set_detectron_cfg_train_and_freeze(
     return d_cfg
 
 
-def set_detectron_cfg_test_and_freeze(
+def set_detectron_cfg_test(
         d_cfg, DATASET_NAME,
         model_weights, conf_thresh, cf_add_d2,
         freeze=True):

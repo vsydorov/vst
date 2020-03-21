@@ -219,10 +219,33 @@ def string_table(
     return '\n'.join(table)
 
 
-def df_to_table(df, pad=0):
+def df_to_table_v1(df, pad=0):
     return string_table(
             df.reset_index().values,
             ['', ]+df.columns.tolist(), pad=pad)
+
+
+def df_to_table_v2(df: pd.DataFrame, indexname=None) -> str:
+    # Header
+    if indexname is None:
+        indexname = df.index.name
+    if indexname is None:
+        indexname = 'index'
+    header = [indexname, ] + list(df.columns)
+    # Col formats
+    col_formats = ['{}']
+    for dt in df.dtypes:
+        form = '{}'
+        if dt in ['float32', 'float64']:
+            form = '{:.2f}'
+        col_formats.append(form)
+
+    table = string_table(
+            np.array(df.reset_index()),
+            header=header,
+            col_formats=col_formats,
+            pad=2)
+    return table
 
 
 # = Configuration =
@@ -556,26 +579,3 @@ class Simple_isaver(Base_isaver):
                         self._log_interval_seconds:
                     log.info(_tqdm_str(pbar))
         return self.result
-
-
-def df_to_table(df: pd.DataFrame, indexname=None) -> str:
-    # Header
-    if indexname is None:
-        indexname = df.index.name
-    if indexname is None:
-        indexname = 'index'
-    header = [indexname, ] + list(df.columns)
-    # Col formats
-    col_formats = ['{}']
-    for dt in df.dtypes:
-        form = '{}'
-        if dt in ['float32', 'float64']:
-            form = '{:.2f}'
-        col_formats.append(form)
-
-    table = string_table(
-            np.array(df.reset_index()),
-            header=header,
-            col_formats=col_formats,
-            pad=2)
-    return table

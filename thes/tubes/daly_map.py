@@ -18,7 +18,7 @@ from thes.detectron.daly import (
 from thes.tubes.routines import (
         numpy_iou, temporal_IOU,
         spatial_tube_iou,
-        spatial_tube_iou_v2
+        spatial_tube_iou_v2,
 )
 from thes.tubes.types import (Frametube, Sframetube, V_dict, AV_dict)
 from thes.eval_tools import voc_ap
@@ -192,7 +192,6 @@ def _tube_daly_ap_v(
                 'obj': stube,
                 'score': stube['score']}
             fdets.append(fdet)
-
     # Precompute 'temporal iou' and indices of tubes
     possible_matches_per_detection: List[Dict[int, float]] = []
     for fdet in fdets:
@@ -208,7 +207,6 @@ def _tube_daly_ap_v(
                 if temp_iou > 0.0:
                     ind_to_iou[i_fgt] = temp_iou
         possible_matches_per_detection.append(ind_to_iou)
-
     # Preparation
     detection_matched = np.zeros(len(fdets), dtype=bool)
     gt_already_matched = np.zeros(len(fgts), dtype=bool)
@@ -331,13 +329,9 @@ def daly_tube_map_per_thresh(
             df_rcovs, iou_thresholds, 'max_spatial')
     dft_recall_st = tube_daly_recall_as_df(
             df_rcovs, iou_thresholds, 'max_spatiotemp')
-    # // Print
-    dft_recall_s = (dft_recall_s*100).round(2)
-    dft_recall_st = (dft_recall_st*100).round(2)
-    log.info('Spatial Recall:\n{}'.format(dft_recall_s))
-    log.info('Spatiotemp Recall:\n{}'.format(dft_recall_st))
-
-    # // Compute MAP table
+    table_recall_s = snippets.df_to_table_v2((dft_recall_s*100).round(2))
+    table_recall_st = snippets.df_to_table_v2((dft_recall_st*100).round(2))
+    # // Compute ap table
     ap_per_thresh = {}
     for thresh in iou_thresholds:
         options_tube_ap['iou_thresh'] = thresh
@@ -350,7 +344,8 @@ def daly_tube_map_per_thresh(
         ap['all'] = ap.mean()
         lst.append(ap)
     dft_ap = pd.concat(lst, axis=1)
+    table_ap = snippets.df_to_table_v2((dft_ap*100).round(2))
     # // Print
-    dft_ap = (dft_ap*100).round(2)
-    table_ap = snippets.df_to_table(dft_ap)
+    log.info('Spatial Recall:\n{}'.format(table_recall_s))
+    log.info('Spatiotemp Recall:\n{}'.format(table_recall_st))
     log.info('AP:\n{}'.format(table_ap))

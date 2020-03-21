@@ -364,7 +364,7 @@ def numpy_iou(box1, box2):
     inter = np.r_[
         np.maximum(box1[:2], box2[:2]),
         np.minimum(box1[2:], box2[2:])]
-    if np.any(inter[:2] > inter[2:]):
+    if np.any(inter[:2] >= inter[2:]):
         iou = 0.0
     else:
         inter_area = numpy_box_area(inter)
