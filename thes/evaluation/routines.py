@@ -159,27 +159,50 @@ class AP_tube_computer(AP_computer):
 
     def prepare_computation(
             self, fgts: List[AP_fgt], fdets: List[AP_fdet]):
-        # Precompute 'temporal iou' and indices of tubes
-        possible_matches_per_detection: List[Dict[int, float]] = []
-        for fdet in fdets:
-            ind_to_iou: Dict[int, float] = {}
-            det_bf = fdet['obj']['start_frame']
-            det_ef = fdet['obj']['end_frame']
-            for i_fgt, fgt in enumerate(fgts):
-                if fgt['ind'][0] == fdet['ind'][0]:
-                    gt_bf = fgt['obj']['start_frame']
-                    gt_ef = fgt['obj']['end_frame']
-                    temp_iou = temporal_IOU(
-                            gt_bf, gt_ef, det_bf, det_ef)
-                    if temp_iou > 0.0:
-                        ind_to_iou[i_fgt] = temp_iou
-            possible_matches_per_detection.append(ind_to_iou)
-        self.possible_matches_per_detection = possible_matches_per_detection
+        # Group fdets belonging to same vid
+        ifdet_vid_groups: Dict[DALY_vid, List[int]] = {}
+        for ifdet, fdet in enumerate(fdets):
+            vid = fdet['ind'][0]
+            ifdet_vid_groups.setdefault(vid, []).append(ifdet)
+        # ifgts to ifdets (belonging to same vid)
+        ifgt_to_ifdets_vid_groups: Dict[int, List[int]] = {}
+        for ifgt, fgt in enumerate(fgts):
+            vid = fgt['ind'][0]
+            ifgt_to_ifdets_vid_groups[ifgt] = ifdet_vid_groups.get(vid, [])
+        proposals_frange = np.array([(
+            f['obj']['start_frame'], f['obj']['end_frame'])
+            for f in fdets])
+        ifgt_to_ifdets_tious: Dict[int, Dict[int, float]] = {}
+        for ifgt, ifdets in ifgt_to_ifdets_vid_groups.items():
+            current_frange = proposals_frange[ifdets, :]
+            if len(current_frange):
+                fgt = fgts[ifgt]
+                gt_bf = fgt['obj']['start_frame']
+                gt_ef = fgt['obj']['end_frame']
+                # Computing temporal intersection
+                ibegin = np.maximum(current_frange[:, 0], gt_bf)
+                iend = np.minimum(current_frange[:, 1], gt_ef)
+                temporal_intersections = iend-ibegin+1
+                for pid in np.where(temporal_intersections > 0)[0]:
+                    ifdet = ifdets[pid]
+                    temp_inter = temporal_intersections[pid]
+                    p_bf, p_ef = current_frange[pid]
+                    temp_union = (gt_ef - gt_bf + 1) + \
+                            (p_ef - p_bf + 1) - temp_inter
+                    tiou = temp_inter/temp_union
+                    ifgt_to_ifdets_tious.setdefault(
+                            ifgt, {})[ifdet] = tiou
+        ifdet_to_ifgt_tious: Dict[int, Dict[int, float]] = {}
+        for ifgt, ifdet_to_tiou in ifgt_to_ifdets_tious.items():
+            for ifdet, tiou in ifdet_to_tiou.items():
+                ifdet_to_ifgt_tious.setdefault(
+                        ifdet, {})[ifgt] = tiou
+        self.possible_matches_per_detection = ifdet_to_ifgt_tious
 
     def get_matchable_ifgts(self, ifdet: int) -> List[int]:
         # Check available GTs
         gt_ids_that_overlap: Dict[int, float] = \
-                self.possible_matches_per_detection[ifdet]
+                self.possible_matches_per_detection.get(ifdet, {})
         return list(gt_ids_that_overlap.keys())
 
     def compute_iou_coverages(self,
@@ -187,7 +210,7 @@ class AP_tube_computer(AP_computer):
             fdets, ifdet, fgts) -> List[float]:
         fdet = fdets[ifdet]
         gt_ids_that_overlap: Dict[int, float] = \
-                self.possible_matches_per_detection[ifdet]
+                self.possible_matches_per_detection.get(ifdet, {})
         # Compute IOUs
         iou_coverages: List[float] = []
         for gt_id, temp_iou in gt_ids_that_overlap.items():
