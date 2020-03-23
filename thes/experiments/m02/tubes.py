@@ -37,7 +37,6 @@ from thes.detectron.daly import (
     make_datalist_objaction_similar_merged,
     daly_to_datalist_pfadet,
 )
-from thes.evaluation.types import (Options_tube_ap)
 from thes.evaluation.routines import (
     compute_recall_for_avtubes,
     compute_ap_for_avtubes

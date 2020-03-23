@@ -46,8 +46,6 @@ from thes.detectron.daly import (
 from thes.data.dataset.external import (
         DatasetDALY)
 from thes.tools import snippets
-from thes.evaluation.types import (
-        AP_fgt_framebox, AP_fdet_framebox)
 from thes.evaluation.routines import (
         compute_ap_for_video_datalist)
 

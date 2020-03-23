@@ -1,21 +1,14 @@
 import logging
-import pandas as pd
 import numpy as np
 from abc import abstractmethod, ABC
-from collections import namedtuple
-from pathlib import Path
-
 from thes.data.dataset.external import (
-        DALY_vid, DALY_action_name)
+        DALY_vid)
 from typing import (
-    Any, Dict, List, Tuple, TypeVar, Literal,
-    Callable, TypedDict, NewType, NamedTuple)
+    Any, Dict, List, Tuple, TypedDict)
 from thes.data.tubes.routines import (
         numpy_iou, temporal_IOU,
-        spatial_tube_iou_v2,
-)
-from thes.data.tubes.types import (Frametube, Sframetube, V_dict, AV_dict)
-from thes.tools import snippets
+        spatial_tube_iou_v2,)
+from thes.data.tubes.types import (Frametube,)
 
 
 log = logging.getLogger(__name__)
@@ -116,13 +109,7 @@ def _compute_framebox_ap_old(
         use_07_metric: bool,
         use_diff: bool,
             ) -> float:
-    """
-    Params:
-    use_07_metric: If True, will evaluate AP over 11 points, like in
-        VOC2007 evaluation code
-    use_diff: If True, will eval difficult proposals in the same way as
-        real ones
-    """
+    raise Warning('To be removed')
     # Group fdets belonging to same frame, assign to fgts
     ifdet_groups: Dict[Tuple[DALY_vid, int], List[int]] = {}
     for ifdet, fdet in enumerate(fdets):
@@ -209,6 +196,7 @@ def _compute_tube_ap_old(
         use_diff: bool,
         spatiotemporal: bool,
             ) -> float:
+    raise Warning('To be removed')
     # Precompute 'temporal iou' and indices of tubes
     possible_matches_per_detection: List[Dict[int, float]] = []
     for fdet in fdets:
@@ -306,6 +294,12 @@ def _compute_tube_ap_old(
 
 
 class AP_computer(ABC):
+    """
+    use_07_metric: If True, will evaluate AP over 11 points, like in
+        VOC2007 evaluation code
+    use_diff: If True, will eval difficult proposals in the same way as
+        real ones
+    """
     def __init__(self):
         pass
 
