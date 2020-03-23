@@ -47,20 +47,22 @@ from thes.evaluation.routines import (
 def computeprint_recall_ap_for_avtubes(
         av_gt_tubes: AV_dict[Frametube],
         av_stubes: AV_dict[Sframetube],
-        iou_thresholds: List[float],
-        options_tube_ap: Options_tube_ap):
+        iou_thresholds: List[float]):
     """
     Will compute tube ap per threshold, print table per thresh,
     print aggregate table
     """
     table_recall_s, table_recall_st = compute_recall_for_avtubes(
             av_gt_tubes, av_stubes, iou_thresholds)
-    table_ap = compute_ap_for_avtubes(
-            av_gt_tubes, av_stubes, iou_thresholds, options_tube_ap)
+    table_ap_s = compute_ap_for_avtubes(
+            av_gt_tubes, av_stubes, iou_thresholds, False)
+    table_ap_st = compute_ap_for_avtubes(
+            av_gt_tubes, av_stubes, iou_thresholds, True)
     # // Print
     log.info('Spatial Recall:\n{}'.format(table_recall_s))
     log.info('Spatiotemp Recall:\n{}'.format(table_recall_st))
-    log.info('AP:\n{}'.format(table_ap))
+    log.info('Spatial AP:\n{}'.format(table_ap_s))
+    log.info('Spatiotemp AP:\n{}'.format(table_ap_st))
 
 
 log = logging.getLogger(__name__)
@@ -239,17 +241,9 @@ def _daly_tube_map(
     if cf['tube_nms.enabled']:
         tube_nms_thresh = cf['tube_nms.thresh']
         stubes_va = scored_tube_nms(stubes_va, tube_nms_thresh, out)
-
-    options_tube_ap: Options_tube_ap = {
-            'iou_thresh': None,
-            'spatiotemporal': cf['eval.spatiotemporal'],
-            'use_07_metric': cf['eval.use_07_metric'],
-            'use_diff': cf['eval.use_diff'],
-    }
     iou_thresholds = cf['eval.iou_thresholds']
     computeprint_recall_ap_for_avtubes(
-            stubes_va, gttubes_va,
-            iou_thresholds, options_tube_ap)
+            stubes_va, gttubes_va, iou_thresholds)
 
 
 def _recreate_datalist_for_detections(dataset, split_label):
@@ -396,9 +390,6 @@ def assign_objactions_to_tubes(workfolder, cfg_dict, add_args):
             thresh: [0.5, float]
         params:
             iou_thresholds: [[0.3, 0.5, 0.7], list]
-            spatiotemporal: [False, bool]
-            use_07_metric: [False, bool]
-            use_diff: [False, bool]
     """)
     cf = cfg.parse()
 
@@ -489,15 +480,9 @@ def assign_objactions_to_tubes(workfolder, cfg_dict, add_args):
     if cf['tube_eval.nms.enabled']:
         tube_nms_thresh = cf['tube_eval.nms.thresh']
         av_stubes = scored_tube_nms(av_stubes, tube_nms_thresh, out)
-    options_tube_ap: Options_tube_ap = {
-            'iou_thresh': None,
-            'spatiotemporal': cf['tube_eval.params.spatiotemporal'],
-            'use_07_metric': cf['tube_eval.params.use_07_metric'],
-            'use_diff': cf['tube_eval.params.use_diff'],
-    }
     iou_thresholds = cf['tube_eval.params.iou_thresholds']
     computeprint_recall_ap_for_avtubes(
-            av_gt_tubes, av_stubes, iou_thresholds, options_tube_ap)
+            av_gt_tubes, av_stubes, iou_thresholds)
 
 
 def eval_daly_tubes_RGB(workfolder, cfg_dict, add_args):

@@ -231,7 +231,7 @@ def df_to_table_v2(df: pd.DataFrame, indexname=None) -> str:
         indexname = df.index.name
     if indexname is None:
         indexname = 'index'
-    header = [indexname, ] + list(df.columns)
+    header = [indexname, ] + [str(x) for x in df.columns]
     # Col formats
     col_formats = ['{}']
     for dt in df.dtypes:

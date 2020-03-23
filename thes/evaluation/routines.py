@@ -15,408 +15,18 @@ from thes.data.dataset.external import (
         DALY_vid, DALY_action_name)
 from thes.data.tubes.routines import (
         numpy_iou, temporal_IOU,
-        spatial_tube_iou, spatial_tube_iou_v2,
+        spatial_tube_iou_v2,
 )
 from thes.data.tubes.types import (Frametube, Sframetube, V_dict, AV_dict)
 from thes.evaluation.types import (
+        Recall_coverage,)
+from thes.evaluation.ap import (
         AP_fgt_framebox, AP_fdet_framebox,
         AP_fgt_tube, AP_fdet_tube,
-        Recall_coverage, Options_tube_ap, Stats_daly_ap)
-from thes.evaluation.ap import voc_ap
+        AP_tube_computer, AP_framebox_computer)
 
 
 log = logging.getLogger(__name__)
-
-
-class AP_fgt(TypedDict):
-    ind: Any
-    obj: Any
-    diff: bool
-
-
-class AP_fdet(TypedDict):
-    ind: Any
-    obj: Any
-    score: float
-
-
-class AP_computer(ABC):
-    def __init__(self):
-        pass
-
-    @abstractmethod
-    def get_matchable_ifgts(ifdet: int) -> List[int]:
-        pass
-
-    @abstractmethod
-    def prepare_computation(
-            fgts: List[AP_fgt], fdets: List[AP_fdet]):
-        pass
-
-    @abstractmethod
-    def compute_iou_coverages(self,
-            matchable_ifgts: List[int],
-            fdets, ifdet, fgts) -> List[float]:
-        pass
-
-    def compute_ap(
-            self,
-            fgts: List[AP_fgt],
-            fdets: List[AP_fdet],
-            use_diff: bool,
-            iou_thresh: float,
-            use_07_metric: bool
-            ) -> float:
-        gt_already_matched = np.zeros(len(fgts), dtype=bool)
-        nd = len(fdets)
-        tp = np.zeros(nd)
-        fp = np.zeros(nd)
-        if use_diff:
-            npos = len(fgts)
-        else:
-            npos = len([x for x in fgts if not x['diff']])
-        # Go through ordered detections
-        detection_scores = np.array([x['score'] for x in fdets])
-        detection_scores = detection_scores.round(3)
-        sorted_inds = np.argsort(-detection_scores)
-
-        for d, ifdet in enumerate(sorted_inds):
-            matchable_ifgts: List[int] = self.get_matchable_ifgts(ifdet)
-            if not len(matchable_ifgts):
-                fp[d] = 1
-                continue
-            iou_coverages: List[float] = \
-                self.compute_iou_coverages(matchable_ifgts, fdets, ifdet, fgts)
-            max_coverage_local_id: int = np.argmax(iou_coverages)
-            max_coverage: float = iou_coverages[max_coverage_local_id]
-            max_coverage_ifgt: int = matchable_ifgts[max_coverage_local_id]
-            if max_coverage > iou_thresh:
-                if (not use_diff) and fgts[max_coverage_ifgt]['diff']:
-                    continue
-                if not gt_already_matched[max_coverage_ifgt]:
-                    tp[d] = 1
-                    gt_already_matched[max_coverage_ifgt] = True
-                else:
-                    fp[d] = 1
-            else:
-                fp[d] = 1
-        fp = np.cumsum(fp)
-        tp = np.cumsum(tp)
-        rec = tp / float(npos)
-        prec = tp / np.maximum(tp + fp, np.finfo(np.float64).eps)
-        ap = voc_ap(rec, prec, use_07_metric)
-        return ap
-
-
-class AP_framebox_computer(AP_computer):
-    # ifgts that are in the same frame as ifdets
-    ifdet_to_ifgts: Dict[int, List[int]]
-
-    def __init__(self):
-        pass
-
-    def prepare_computation(
-            self, fgts: List[AP_fgt], fdets: List[AP_fdet]):
-        # Group fdets belonging to same frame, assign to fgts
-        ifdet_groups: Dict[Tuple[DALY_vid, int], List[int]] = {}
-        for ifdet, fdet in enumerate(fdets):
-            vf_id = (fdet['ind'][0], fdet['ind'][1])
-            ifdet_groups.setdefault(vf_id, []).append(ifdet)
-        ifgt_to_ifdets: Dict[int, List[int]] = {}
-        for ifgt, fgt in enumerate(fgts):
-            vf_id = (fgt['ind'][0], fgt['ind'][1])
-            ifgt_to_ifdets[ifgt] = ifdet_groups.get(vf_id, [])
-        ifdet_to_ifgts: Dict[int, List[int]] = {}
-        for ifgt, ifdets in ifgt_to_ifdets.items():
-            for ifdet in ifdets:
-                ifdet_to_ifgts.setdefault(ifdet, []).append(ifgt)
-        self.ifdet_to_ifgts = ifdet_to_ifgts
-
-    def get_matchable_ifgts(self, ifdet: int) -> List[int]:
-        # Check available GTs
-        share_image_ifgts: List[int] = self.ifdet_to_ifgts.get(ifdet, [])
-        return share_image_ifgts
-
-    def compute_iou_coverages(self,
-            matchable_ifgts: List[int],
-            fdets, ifdet, fgts) -> List[float]:
-        fdet = fdets[ifdet]
-        # Compute IOUs
-        iou_coverages: List[float] = []
-        for ifgt in matchable_ifgts:
-            fgt: AP_fgt_framebox = fgts[ifgt]
-            iou = numpy_iou(fgt['obj'], fdet['obj'])
-            iou_coverages.append(iou)
-        return iou_coverages
-
-
-class AP_tube_computer(AP_computer):
-    possible_matches_per_detection: List[Dict[int, float]]
-    spatiotemporal: bool
-
-    def __init__(self, spatiotemporal: bool):
-        self.spatiotemporal = spatiotemporal
-
-    def prepare_computation(
-            self, fgts: List[AP_fgt], fdets: List[AP_fdet]):
-        # Group fdets belonging to same vid
-        ifdet_vid_groups: Dict[DALY_vid, List[int]] = {}
-        for ifdet, fdet in enumerate(fdets):
-            vid = fdet['ind'][0]
-            ifdet_vid_groups.setdefault(vid, []).append(ifdet)
-        # ifgts to ifdets (belonging to same vid)
-        ifgt_to_ifdets_vid_groups: Dict[int, List[int]] = {}
-        for ifgt, fgt in enumerate(fgts):
-            vid = fgt['ind'][0]
-            ifgt_to_ifdets_vid_groups[ifgt] = ifdet_vid_groups.get(vid, [])
-        proposals_frange = np.array([(
-            f['obj']['start_frame'], f['obj']['end_frame'])
-            for f in fdets])
-        ifgt_to_ifdets_tious: Dict[int, Dict[int, float]] = {}
-        for ifgt, ifdets in ifgt_to_ifdets_vid_groups.items():
-            current_frange = proposals_frange[ifdets, :]
-            if len(current_frange):
-                fgt = fgts[ifgt]
-                gt_bf = fgt['obj']['start_frame']
-                gt_ef = fgt['obj']['end_frame']
-                # Computing temporal intersection
-                ibegin = np.maximum(current_frange[:, 0], gt_bf)
-                iend = np.minimum(current_frange[:, 1], gt_ef)
-                temporal_intersections = iend-ibegin+1
-                for pid in np.where(temporal_intersections > 0)[0]:
-                    ifdet = ifdets[pid]
-                    temp_inter = temporal_intersections[pid]
-                    p_bf, p_ef = current_frange[pid]
-                    temp_union = (gt_ef - gt_bf + 1) + \
-                            (p_ef - p_bf + 1) - temp_inter
-                    tiou = temp_inter/temp_union
-                    ifgt_to_ifdets_tious.setdefault(
-                            ifgt, {})[ifdet] = tiou
-        ifdet_to_ifgt_tious: Dict[int, Dict[int, float]] = {}
-        for ifgt, ifdet_to_tiou in ifgt_to_ifdets_tious.items():
-            for ifdet, tiou in ifdet_to_tiou.items():
-                ifdet_to_ifgt_tious.setdefault(
-                        ifdet, {})[ifgt] = tiou
-        self.possible_matches_per_detection = ifdet_to_ifgt_tious
-
-    def get_matchable_ifgts(self, ifdet: int) -> List[int]:
-        # Check available GTs
-        gt_ids_that_overlap: Dict[int, float] = \
-                self.possible_matches_per_detection.get(ifdet, {})
-        return list(gt_ids_that_overlap.keys())
-
-    def compute_iou_coverages(self,
-            matchable_ifgts: List[int],
-            fdets, ifdet, fgts) -> List[float]:
-        fdet = fdets[ifdet]
-        gt_ids_that_overlap: Dict[int, float] = \
-                self.possible_matches_per_detection.get(ifdet, {})
-        # Compute IOUs
-        iou_coverages: List[float] = []
-        for gt_id, temp_iou in gt_ids_that_overlap.items():
-            fgt: AP_fgt_tube = fgts[gt_id]
-            spatial_iou = spatial_tube_iou(fgt['obj'], fdet['obj'])
-            if self.spatiotemporal:
-                iou = temp_iou * spatial_iou
-            else:
-                iou = spatial_iou
-            iou_coverages.append(iou)
-        return iou_coverages
-
-
-def compute_framebox_ap(
-        fgts: List[AP_fgt_framebox],
-        fdets: List[AP_fdet_framebox],
-        iou_thresh: float,
-        use_07_metric: bool,
-        use_diff: bool,
-            ) -> float:
-    """
-    Params:
-    use_07_metric: If True, will evaluate AP over 11 points, like in
-        VOC2007 evaluation code
-    use_diff: If True, will eval difficult proposals in the same way as
-        real ones
-    """
-    # Group fdets belonging to same frame, assign to fgts
-    ifdet_groups: Dict[Tuple[DALY_vid, int], List[int]] = {}
-    for ifdet, fdet in enumerate(fdets):
-        vf_id = (fdet['ind'][0], fdet['ind'][1])
-        ifdet_groups.setdefault(vf_id, []).append(ifdet)
-    ifgt_to_ifdets: Dict[int, List[int]] = {}
-    for ifgt, fgt in enumerate(fgts):
-        vf_id = (fgt['ind'][0], fgt['ind'][1])
-        ifgt_to_ifdets[ifgt] = ifdet_groups.get(vf_id, [])
-    ifdet_to_ifgts: Dict[int, List[int]] = {}
-    for ifgt, ifdets in ifgt_to_ifdets.items():
-        for ifdet in ifdets:
-            ifdet_to_ifgts.setdefault(ifdet, []).append(ifgt)
-    # Preparation
-    detection_matched = np.zeros(len(fdets), dtype=bool)
-    gt_already_matched = np.zeros(len(fgts), dtype=bool)
-    # Provenance
-    detection_matched_to_which_gt = np.ones(len(fdets), dtype=int)*-1
-    iou_coverages_per_detection_ind: Dict[int, List[float]] = {}
-
-    # VOC2007 preparation
-    nd = len(fdets)
-    tp = np.zeros(nd)
-    fp = np.zeros(nd)
-    if use_diff:
-        npos = len(fgts)
-    else:
-        npos = len([x for x in fgts if not x['diff']])
-
-    # Go through ordered detections
-    detection_scores = np.array([x['score'] for x in fdets])
-    detection_scores = detection_scores.round(3)
-    sorted_inds = np.argsort(-detection_scores)
-    for d, ifdet in enumerate(sorted_inds):
-        # Check available GTs
-        share_image_ifgts: List[int] = ifdet_to_ifgts.get(ifdet, [])
-        if not len(share_image_ifgts):
-            fp[d] = 1
-            continue
-
-        detection: AP_fdet_framebox = fdets[ifdet]
-        detection_box = detection['obj']
-
-        # Compute IOUs
-        iou_coverages: List[float] = []
-        for ifgt in share_image_ifgts:
-            gt_box_anno: AP_fgt_framebox = fgts[ifgt]
-            gt_box = gt_box_anno['obj']
-            iou = numpy_iou(gt_box, detection_box)
-            iou_coverages.append(iou)
-        # Provenance
-        iou_coverages_per_detection_ind[ifdet] = iou_coverages
-
-        max_coverage_local_id = np.argmax(iou_coverages)
-        max_coverage = iou_coverages[max_coverage_local_id]
-        max_coverage_ifgt = share_image_ifgts[max_coverage_local_id]
-
-        # Mirroring voc_eval
-        if max_coverage > iou_thresh:
-            if (not use_diff) and fgts[max_coverage_ifgt]['diff']:
-                continue
-            if not gt_already_matched[max_coverage_ifgt]:
-                tp[d] = 1
-                detection_matched[ifdet] = True
-                gt_already_matched[max_coverage_ifgt] = True
-                detection_matched_to_which_gt[ifdet] = max_coverage_ifgt
-            else:
-                fp[d] = 1
-        else:
-            fp[d] = 1
-    fp = np.cumsum(fp)
-    tp = np.cumsum(tp)
-    rec = tp / float(npos)
-    prec = tp / np.maximum(tp + fp, np.finfo(np.float64).eps)
-    ap = voc_ap(rec, prec, use_07_metric)
-    return ap
-
-
-def compute_tube_ap(
-        fgts: List[AP_fgt_tube],
-        fdets: List[AP_fdet_tube],
-        iou_thresh: float,
-        use_07_metric: bool,
-        use_diff: bool,
-        spatiotemporal: bool,
-            ) -> float:
-    # Precompute 'temporal iou' and indices of tubes
-    possible_matches_per_detection: List[Dict[int, float]] = []
-    for fdet in fdets:
-        ind_to_iou: Dict[int, float] = {}
-        det_bf = fdet['obj']['start_frame']
-        det_ef = fdet['obj']['end_frame']
-        for i_fgt, fgt in enumerate(fgts):
-            if fgt['ind'][0] == fdet['ind'][0]:
-                gt_bf = fgt['obj']['start_frame']
-                gt_ef = fgt['obj']['end_frame']
-                temp_iou = temporal_IOU(
-                        gt_bf, gt_ef, det_bf, det_ef)
-                if temp_iou > 0.0:
-                    ind_to_iou[i_fgt] = temp_iou
-        possible_matches_per_detection.append(ind_to_iou)
-    # Preparation
-    detection_matched = np.zeros(len(fdets), dtype=bool)
-    gt_already_matched = np.zeros(len(fgts), dtype=bool)
-    # Provenance
-    detection_matched_to_which_gt = np.ones(len(fdets), dtype=int)*-1
-    iou_coverages_per_detection_ind: Dict[int, List[float]] = {}
-
-    # VOC2007 preparation
-    nd = len(fdets)
-    tp = np.zeros(nd)
-    fp = np.zeros(nd)
-    if use_diff:
-        npos = len(fgts)
-    else:
-        npos = len([x for x in fgts if not x['diff']])
-
-    # Go through ordered detections
-    detection_scores = np.array([x['score'] for x in fdets])
-    detection_scores = detection_scores.round(3)
-    sorted_inds = np.argsort(-detection_scores)
-    for d, detection_ind in enumerate(sorted_inds):
-        # Check available GTs
-        gt_ids_that_overlap = possible_matches_per_detection[detection_ind]
-        if len(gt_ids_that_overlap) == 0:
-            fp[d] = 1
-            continue
-
-        detection: AP_fdet_tube = fdets[detection_ind]
-        detection_tube: Frametube = detection['obj']
-
-        # Compute IOUs
-        iou_coverages: List[float] = []
-        for gt_id, temp_iou in gt_ids_that_overlap.items():
-            gt_tube_anno: AP_fgt_tube = fgts[gt_id]
-            gt_tube = gt_tube_anno['obj']
-            spatial_iou = spatial_tube_iou(gt_tube, detection_tube)
-            if spatiotemporal:
-                iou = temp_iou * spatial_iou
-            else:
-                iou = spatial_iou
-            iou_coverages.append(iou)
-        # Provenance
-        iou_coverages_per_detection_ind[detection_ind] = iou_coverages
-
-        max_coverage_id = np.argmax(iou_coverages)
-        max_coverage = iou_coverages[max_coverage_id]
-        max_coverage_gt_id = list(gt_ids_that_overlap.keys())[max_coverage_id]
-
-        # Mirror VOC eval
-        if max_coverage > iou_thresh:
-            if (not use_diff) and fgts[max_coverage_gt_id]['diff']:
-                continue
-            if not gt_already_matched[max_coverage_gt_id]:
-                tp[d] = 1
-                detection_matched[detection_ind] = True
-                gt_already_matched[max_coverage_gt_id] = True
-                detection_matched_to_which_gt[detection_ind] = max_coverage_gt_id
-            else:
-                fp[d] = 1
-        else:
-            fp[d] = 1
-    fp = np.cumsum(fp)
-    tp = np.cumsum(tp)
-    rec = tp / float(npos)
-    prec = tp / np.maximum(tp + fp, np.finfo(np.float64).eps)
-    ap = voc_ap(rec, prec, use_07_metric)
-
-    # All kinds of stats gathered together
-    stats = Stats_daly_ap(flat_annotations=fgts,
-            flat_detections=fdets,
-            detection_matched=detection_matched,
-            gt_already_matched=gt_already_matched,
-            possible_matches=possible_matches_per_detection,
-            iou_coverages_per_detection_ind=iou_coverages_per_detection_ind,
-            detection_matched_to_which_gt=detection_matched_to_which_gt,
-            sorted_inds=sorted_inds, fp=fp, tp=tp, npos=npos, rec=rec,
-            prec=prec, ap=ap)
-    return stats
 
 
 def _compute_daly_recall_coverage(
@@ -443,7 +53,6 @@ def _compute_daly_recall_coverage(
     # intersection
     for pid in np.where(temporal_intersections > 0)[0]:
         proposal_tube: Sframetube = proposals[pid]
-        # spatial_miou_ = spatial_tube_iou(proposal_tube, gt_tube)
         spatial_miou, spatial_ious = \
                 spatial_tube_iou_v2(proposal_tube, gt_tube)
         # Temporal IOU
@@ -516,14 +125,12 @@ def tube_daly_recall_as_df(
 def _tube_daly_ap_v(
         v_gt_tubes: V_dict[Frametube],
         v_stubes: V_dict[Sframetube],
-        options_tube_ap: Options_tube_ap,
-            ) -> Stats_daly_ap:
-    """
-    We always compute stats
-    """
-    (iou_thresh, spatiotemporal, use_07_metric, use_diff) = \
-            options_tube_ap.values()
+        iou_thresholds: List[float],
+        spatiotemporal: bool,
+            ) -> Dict[float, float]:
     # Convert to flat ap-able representation
+    use_diff = True  # no difference, since no diff flags exist
+    use_07_metric = False  # no reason to use this metric
     fgts: List[AP_fgt_tube] = []
     fdets: List[AP_fdet_tube] = []
     for vid, gt_tubes in v_gt_tubes.items():
@@ -541,34 +148,28 @@ def _tube_daly_ap_v(
                 'obj': stube,
                 'score': stube['score']}
             fdets.append(fdet)
-
-    stats = compute_tube_ap(
-            fgts, fdets, iou_thresh,
-            use_07_metric, use_diff, spatiotemporal)
-
     # compute via cls
-    ap_computer = AP_tube_computer(spatiotemporal)
-    ap_computer.prepare_computation(fgts, fdets)
-    ap = ap_computer.compute_ap(
-            fgts, fdets, use_diff, iou_thresh, use_07_metric)
-    assert stats['ap'] == ap
-    return stats
+    thresh_ap: Dict[float, float] = {}
+    ap_computer = AP_tube_computer(fgts, fdets)
+    for iou_thresh in iou_thresholds:
+        thresh_ap[iou_thresh] = ap_computer.compute_ap(
+                iou_thresh, spatiotemporal, use_diff, use_07_metric)
+    return thresh_ap
 
 
-def tube_daly_ap_av(
+def _tube_daly_ap_av(
     av_gt_tubes: AV_dict[Frametube],
     av_stubes: AV_dict[Sframetube],
-    options_tube_ap: Options_tube_ap
-        ):
-    ap_per_cls = {}
+    iou_thresholds: List[float],
+    spatiotemporal: bool,
+        ) -> Dict[DALY_action_name, Dict[float, float]]:
+    cls_thresh_ap = {}
     for action_cls in av_gt_tubes.keys():
-        stats = _tube_daly_ap_v(
-                av_gt_tubes[action_cls],
-                av_stubes[action_cls],
-                options_tube_ap)
-        ap = stats['ap']
-        ap_per_cls[action_cls] = ap
-    return ap_per_cls
+        thresh_ap = _tube_daly_ap_v(
+            av_gt_tubes[action_cls], av_stubes[action_cls],
+            iou_thresholds, spatiotemporal)
+        cls_thresh_ap[action_cls] = thresh_ap
+    return cls_thresh_ap
 
 
 def compute_recall_for_avtubes(
@@ -600,23 +201,18 @@ def compute_ap_for_avtubes(
     av_gt_tubes: AV_dict[Frametube],
     av_stubes: AV_dict[Sframetube],
     iou_thresholds: List[float],
-    options_tube_ap: Options_tube_ap,
+    spatiotemporal: bool,
         ) -> pd.DataFrame:
     """
     Compute ap table
     """
-    ap_per_thresh = {}
-    for thresh in iou_thresholds:
-        options_tube_ap['iou_thresh'] = thresh
-        ap_per_cls = tube_daly_ap_av(
-            av_gt_tubes, av_stubes, options_tube_ap)
-        ap_per_thresh[thresh] = ap_per_cls
-    lst = []
-    for thresh, ap_per_cls in ap_per_thresh.items():
-        ap = pd.Series(ap_per_cls, name=f'{thresh:.2f}')
-        ap['all'] = ap.mean()
-        lst.append(ap)
-    dft_ap = pd.concat(lst, axis=1)
+    cls_thresh_ap: \
+        Dict[DALY_action_name, Dict[float, float]] = _tube_daly_ap_av(
+            av_gt_tubes, av_stubes, iou_thresholds, spatiotemporal)
+
+    dft_ap = pd.DataFrame(cls_thresh_ap).T
+    dft_ap = dft_ap.sort_index()
+    dft_ap.loc['all'] = dft_ap.mean()
     table_ap = snippets.df_to_table_v2((dft_ap*100).round(2))
     return table_ap
 
@@ -662,19 +258,10 @@ def compute_ap_for_video_datalist(
     object_classes = object_names
     ap_per_cls: Dict[str, float] = {}
     for obj_cls in object_classes:
-        ap = compute_framebox_ap(
-            o_fgts[obj_cls],
-            o_fdets[obj_cls],
-            iou_thresh, use_07_metric, use_diff)
-
         fgts = o_fgts[obj_cls]
         fdets = o_fdets[obj_cls]
-        ap_computer = AP_framebox_computer()
-        ap_computer.prepare_computation(fgts, fdets)
-        ap_ = ap_computer.compute_ap(
-                fgts, fdets, use_diff, iou_thresh, use_07_metric)
-
-        assert ap == ap_
-
+        ap_computer = AP_framebox_computer(fgts, fdets)
+        ap = ap_computer.compute_ap(
+                use_diff, iou_thresh, use_07_metric)
         ap_per_cls[obj_cls] = ap
     return ap_per_cls
