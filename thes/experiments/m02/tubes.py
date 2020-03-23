@@ -11,14 +11,14 @@ from vsydorov_tools import cv as vt_cv
 
 from thes.tools import snippets
 from thes.caffe import (nicolas_net, get_scores_per_frame_RGB)
-from thes.tubes.types import (
+from thes.data.tubes.types import (
     DALY_wein_tube,
     DALY_wein_tube_index, DALY_gt_tube_index,
     Objaction_dets, Frametube, Sframetube,
     convert_dwein_tube, dtindex_filter_split,
     get_daly_gt_tubes, AV_dict
 )
-from thes.tubes.routines import (
+from thes.data.tubes.routines import (
     filter_tube_keyframes_only_gt,
     filter_tube_keyframes_only_gt_v2,
     nicphil_evaluations_to_tubes,
@@ -28,11 +28,7 @@ from thes.tubes.routines import (
     _match_objectdetections_to_tubes,
     av_stubes_above_score
 )
-from thes.tubes.daly_map import (
-    daly_tube_map_per_thresh,
-    Options_tube_ap,
-)
-from thes.data.external_dataset import (
+from thes.data.dataset.external import (
     DatasetDALY, DALY_action_name, DALY_object_name, DALY_vid)
 from thes.detectron.daly import (
     get_daly_split_vids,
@@ -41,6 +37,30 @@ from thes.detectron.daly import (
     make_datalist_objaction_similar_merged,
     daly_to_datalist_pfadet,
 )
+from thes.evaluation.types import (Options_tube_ap)
+from thes.evaluation.routines import (
+    compute_recall_for_avtubes,
+    compute_ap_for_avtubes
+)
+
+
+def computeprint_recall_ap_for_avtubes(
+        av_gt_tubes: AV_dict[Frametube],
+        av_stubes: AV_dict[Sframetube],
+        iou_thresholds: List[float],
+        options_tube_ap: Options_tube_ap):
+    """
+    Will compute tube ap per threshold, print table per thresh,
+    print aggregate table
+    """
+    table_recall_s, table_recall_st = compute_recall_for_avtubes(
+            av_gt_tubes, av_stubes, iou_thresholds)
+    table_ap = compute_ap_for_avtubes(
+            av_gt_tubes, av_stubes, iou_thresholds, options_tube_ap)
+    # // Print
+    log.info('Spatial Recall:\n{}'.format(table_recall_s))
+    log.info('Spatiotemp Recall:\n{}'.format(table_recall_st))
+    log.info('AP:\n{}'.format(table_ap))
 
 
 log = logging.getLogger(__name__)
@@ -220,8 +240,6 @@ def _daly_tube_map(
         tube_nms_thresh = cf['tube_nms.thresh']
         stubes_va = scored_tube_nms(stubes_va, tube_nms_thresh, out)
 
-    all_actions = dataset.action_names
-
     options_tube_ap: Options_tube_ap = {
             'iou_thresh': None,
             'spatiotemporal': cf['eval.spatiotemporal'],
@@ -229,9 +247,9 @@ def _daly_tube_map(
             'use_diff': cf['eval.use_diff'],
     }
     iou_thresholds = cf['eval.iou_thresholds']
-    daly_tube_map_per_thresh(
+    computeprint_recall_ap_for_avtubes(
             stubes_va, gttubes_va,
-            iou_thresholds, all_actions, options_tube_ap)
+            iou_thresholds, options_tube_ap)
 
 
 def _recreate_datalist_for_detections(dataset, split_label):
@@ -471,7 +489,6 @@ def assign_objactions_to_tubes(workfolder, cfg_dict, add_args):
     if cf['tube_eval.nms.enabled']:
         tube_nms_thresh = cf['tube_eval.nms.thresh']
         av_stubes = scored_tube_nms(av_stubes, tube_nms_thresh, out)
-    all_actions = dataset.action_names
     options_tube_ap: Options_tube_ap = {
             'iou_thresh': None,
             'spatiotemporal': cf['tube_eval.params.spatiotemporal'],
@@ -479,8 +496,8 @@ def assign_objactions_to_tubes(workfolder, cfg_dict, add_args):
             'use_diff': cf['tube_eval.params.use_diff'],
     }
     iou_thresholds = cf['tube_eval.params.iou_thresholds']
-    daly_tube_map_per_thresh(
-            av_gt_tubes, av_stubes, iou_thresholds, all_actions, options_tube_ap)
+    computeprint_recall_ap_for_avtubes(
+            av_gt_tubes, av_stubes, iou_thresholds, options_tube_ap)
 
 
 def eval_daly_tubes_RGB(workfolder, cfg_dict, add_args):

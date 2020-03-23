@@ -10,9 +10,6 @@ import torch.backends.cudnn as cudnn
 
 from vsydorov_tools import small
 
-from tavid.tools import snippets
-from tavid.data.external_dataset import (DatasetCharades)
-
 log = logging.getLogger(__name__)
 
 

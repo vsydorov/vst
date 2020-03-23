@@ -60,10 +60,8 @@ from fvcore.common.file_io import PathManager
 from vsydorov_tools import small
 from vsydorov_tools import cv as vt_cv
 
-from thes.data import video_utils
-from thes.eval_tools import legacy_evaluation
 from thes.tools import snippets
-from thes.data.external_dataset import DatasetVOC2007, DatasetDALY
+from thes.data.dataset.external import DatasetVOC2007, DatasetDALY
 from thes.det2 import (
         YAML_Base_RCNN_C4, YAML_faster_rcnn_R_50_C4,
         launch_w_logging, launch_without_logging, simple_d2_setup,
@@ -455,7 +453,7 @@ def demo_d2_dalyobj_vis(workfolder, cfg_dict, add_args):
 
         visualizer = Visualizer(frame_u8, metadata=metadata, scale=0.5)
         img_vis = visualizer.draw_dataset_dict(dl_item)
-        filename = 'i{:02d}_id.jpg'.format(i, dl_item['image_id'])
+        filename = 'i{:02d}_id{}.jpg'.format(i, dl_item['image_id'])
         cv2.imwrite(str(out/filename), img_vis.get_image())
 
 

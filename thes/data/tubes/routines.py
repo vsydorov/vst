@@ -9,14 +9,14 @@ from typing import (
     Callable, TypedDict, NewType, NamedTuple)
 
 from thes.tools import snippets
-from thes.data.external_dataset import (
+from thes.data.dataset.external import (
         DatasetDALY, DALY_vid,
         DALY_action_name, DALY_object_name)
 from thes.detectron.daly import (
         get_daly_split_vids, simplest_daly_to_datalist_v2,
         get_similar_action_objects_DALY, make_datalist_objaction_similar_merged)
 
-from thes.tubes.types import (
+from thes.data.tubes.types import (
         Sframetube, Frametube, Base_frametube,
         DALY_wein_tube_index, DALY_gt_tube_index,
         Objaction_dets,

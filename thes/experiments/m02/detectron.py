@@ -1,4 +1,6 @@
 import cv2
+import numpy as np
+import pandas as pd
 import copy
 import yacs
 import os
@@ -6,6 +8,9 @@ import logging
 import argparse
 from pathlib import Path
 from tqdm import tqdm
+from typing import (
+    Dict, List, Tuple, TypeVar, Literal,
+    Callable, TypedDict, NewType, NamedTuple)
 
 import torch
 
@@ -22,9 +27,6 @@ from detectron2.structures import Boxes, Instances, pairwise_iou
 from vsydorov_tools import small
 from vsydorov_tools import cv as vt_cv
 
-from thes.tools import snippets
-from thes.data.external_dataset import (
-        DatasetDALY)
 from thes.detectron.cfg import (
         D2DICT_GPU_SCALING_DEFAULTS,
         d2dict_gpu_scaling,
@@ -41,8 +43,13 @@ from thes.detectron.daly import (
         daly_to_datalist_pfadet, get_category_map_o100, make_datalist_o100,
         get_similar_action_objects_DALY,
         make_datalist_objaction_similar_merged)
-from thes.eval_tools import (
-        voclike_legacy_evaluation, voclike_legacy_evaluation_v2)
+from thes.data.dataset.external import (
+        DatasetDALY)
+from thes.tools import snippets
+from thes.evaluation.types import (
+        AP_fgt_framebox, AP_fdet_framebox)
+from thes.evaluation.routines import (
+        compute_ap_for_video_datalist)
 
 
 log = logging.getLogger(__name__)
@@ -229,6 +236,25 @@ def train_daly_object(workfolder, cfg_dict, add_args):
         cls_names, TRAIN_DATASET_NAME, datalist, add_args)
 
 
+def computeprint_ap_for_video_datalist(
+        object_names: List[str],
+        datalist,
+        predicted_datalist):
+    # // Transform to sensible data format
+    iou_thresh = 0.5
+    ap_per_cls = compute_ap_for_video_datalist(
+        datalist, predicted_datalist, object_names, iou_thresh)
+
+    # Results printed nicely via pd.Series
+    x = pd.Series(ap_per_cls)*100
+    x.loc['AVERAGE'] = x.mean()
+    table = snippets.string_table(
+            np.array(x.reset_index()),
+            header=['Object', 'AP'],
+            col_formats=['{}', '{:.2f}'], pad=2)
+    log.info(f'AP@{iou_thresh:.3f}:\n{table}')
+
+
 def _eval_foldname_hack(cf):
     if cf['eval_hacks.model_to_eval'] == 'what':
         model_to_eval = cf['what_to_eval']
@@ -286,11 +312,8 @@ def _eval_routine(cf, cf_add_d2, out,
             nmsed_predicted_datalist.append(nmsed_item)
         predicted_datalist = nmsed_predicted_datalist
 
-    log.info('AP v1:')
-    voclike_legacy_evaluation(cls_names, datalist, predicted_datalist)
-
     log.info('AP v2:')
-    voclike_legacy_evaluation_v2(cls_names, datalist, predicted_datalist)
+    computeprint_ap_for_video_datalist(cls_names, datalist, predicted_datalist)
 
 
 def eval_daly_action(workfolder, cfg_dict, add_args):

@@ -8,7 +8,7 @@ from typing import Dict, Tuple, cast
 
 from detectron2.structures import BoxMode
 
-from thes.data.external_dataset import (
+from thes.data.dataset.external import (
         DALY_action_name, DALY_object_name)
 
 

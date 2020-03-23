@@ -1,5 +1,5 @@
 from thes.tools import snippets
-from thes.data.external_dataset import DatasetDALY, DatasetVOC2007
+from thes.data.dataset.external import DatasetDALY, DatasetVOC2007
 
 
 def precompute_cache(workfolder, cfg_dict, add_args):

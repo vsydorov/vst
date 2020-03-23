@@ -3,7 +3,7 @@ import numpy as np
 from typing import (
         Tuple, TypedDict, NewType, Dict, List, TypeVar)
 
-from thes.data.external_dataset import (
+from thes.data.dataset.external import (
         DatasetDALY, DALY_vid, DALY_action_name)
 
 log = logging.getLogger(__name__)

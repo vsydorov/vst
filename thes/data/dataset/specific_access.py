@@ -1,5 +1,5 @@
 """
-Interface over classes defined in external_dataset.py
+Interface over classes defined in external.py
 """
 import numpy as np
 import logging
@@ -11,7 +11,7 @@ import torch
 
 from vsydorov_tools import cv as vt_cv
 
-from tavid.data.external_dataset import (DatasetCharades, Charades_vid, Vid,
+from thes.data.dataset.external import (DatasetCharades, Charades_vid, Vid,
         Charades_video, VideoMP4, DatasetHMDB51, HMDB51_vid, HMDB51_video,
         VideoMP4_reached)
 
