@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 from typing import (
     Dict, List, Tuple, TypeVar, Set, Optional,
-    Callable, TypedDict, NewType, NamedTuple)
+    Callable, TypedDict, NewType, NamedTuple, Sequence)
 
 from thes.tools import snippets
 from thes.data.dataset.external import (
@@ -21,8 +21,7 @@ from thes.data.tubes.types import (
         DALY_wein_tube_index, DALY_gt_tube_index,
         Objaction_dets,
         DALY_gt_tube,
-        get_daly_gt_tubes,
-        convert_dgt_tubes_to_framebased, AV_dict)
+        get_daly_gt_tubes, V_dict, AV_dict)
 
 from vsydorov_tools import small
 
@@ -98,23 +97,21 @@ def filter_tube_keyframes_only_gt(
 
 
 def filter_tube_keyframes_only_gt_v2(
-        dataset: DatasetDALY,
         tubes: Dict[DALY_wein_tube_index, Frametube],
+        av_gttubes: AV_dict[Frametube],
         keep_temporal: bool,
             ) -> Dict[DALY_wein_tube_index, Frametube]:
     """
     Filter "tubes" to contain only those frames,
     which are present in the DALY GT annotations
     """
-    dgt_tubes: Dict[DALY_gt_tube_index, DALY_gt_tube] = \
-            get_daly_gt_tubes(dataset)
-    daly_frametubes: Dict[DALY_gt_tube_index, Frametube] = \
-            convert_dgt_tubes_to_framebased(dataset, dgt_tubes)
 
     # Query good inds per vid
     gtinds: Dict[DALY_vid, Set[int]] = {}
-    for (vid, action_name, ins_ind), tube in daly_frametubes.items():
-        gtinds[vid] = gtinds.get(vid, set()) | set(tube['frame_inds'])
+    for action_name, v_gttubes in av_gttubes.items():
+        for vid, gttubes in v_gttubes.items():
+            for t in gttubes:
+                gtinds[vid] = gtinds.get(vid, set()) | set(t['frame_inds'])
 
     # Filter tubes to only gt keyframes
     ftubes: Dict[DALY_wein_tube_index, Frametube] = {}
@@ -415,11 +412,6 @@ def custom_nms(
         score_func: Callable[[T], float],
         thresh
             ) -> List[T]:
-    """
-    Provided with function to compare overlap between two elements performs NMS
-    on tubes
-    """
-
     scores = [score_func(e) for e in element_list]
     sorted_ids = np.argsort(scores)[::-1]  # In decreasing order
     sorted_candidates = [element_list[i] for i in sorted_ids]
@@ -430,6 +422,25 @@ def custom_nms(
         overlaps = [overlap_func(taken, c) for c in sorted_candidates]
         sorted_candidates = [c for c, o in zip(sorted_candidates, overlaps) if o < thresh]
 
+    return results
+
+
+def custom_nms_v2(
+        element_list: List[T],
+        overlaps_func: Callable[[T, Sequence[T]], List[float]],
+        score_func: Callable[[T], float],
+        thresh: float,
+        ) -> List[T]:
+    scores = [score_func(e) for e in element_list]
+    sorted_ids = np.argsort(scores)[::-1]  # In decreasing order
+    sorted_candidates = [element_list[i] for i in sorted_ids]
+    results = []
+    while len(sorted_candidates):
+        taken = sorted_candidates.pop(0)
+        results.append(taken)
+        overlaps = overlaps_func(taken, sorted_candidates)
+        sorted_candidates = [
+                c for c, o in zip(sorted_candidates, overlaps) if o < thresh]
     return results
 
 
@@ -547,6 +558,76 @@ def scored_tube_nms(
     return nmsed_stubes_va
 
 
+def temporal_ious_where_positive(x_bf, x_ef, y_frange):
+    """
+    Temporal ious between inter X and multiple Y inters
+    Inputs:
+        x_bg, x_ef - temporal range of input
+    Returns 2 np.ndarrays:
+        pids: indices of ytubes with >0 temporal iou
+        ptious: >0 temporal ious
+    """
+    if len(y_frange) == 0:
+        pids = np.array([], dtype=np.int)
+        ptious = np.array([])
+        return ptious, pids
+    ibegin = np.maximum(y_frange[:, 0], x_bf)
+    iend = np.minimum(y_frange[:, 1], x_ef)
+    temporal_intersections = iend-ibegin+1
+    pids = np.where(temporal_intersections > 0)[0]
+    if len(pids) == 0:
+        ptious = np.array([])
+    else:
+        ptemp_inters = temporal_intersections[pids]
+        p_bfs, p_efs = y_frange[pids].T
+        ptemp_unions = (x_ef - x_bf + 1) + (p_efs - p_bfs + 1) - ptemp_inters
+        ptious = ptemp_inters/ptemp_unions
+    return ptious, pids
+
+
+def stube_overlaps_func(
+        x: Sframetube,
+        ys: Sequence[Sframetube]) -> np.ndarray:
+    y_frange = np.array([(y['start_frame'], y['end_frame']) for y in ys])
+    ptious, pids = temporal_ious_where_positive(
+            x['start_frame'], x['end_frame'], y_frange)
+    st_overlaps = np.zeros(len(ys))
+    if len(pids):
+        pys = [ys[pid] for pid in pids]
+        pmious = [spatial_tube_iou_v2(y, x)[0] for y in pys]
+        st_overlaps[pids] = ptious * pmious
+    return st_overlaps
+
+
+def nms_on_scored_tubes_v2(
+        v_stubes: V_dict[Sframetube],
+        thresh: float) -> V_dict[Sframetube]:
+
+    def score_func(x: Sframetube):
+        return x['score']
+
+    v_stubes_nms = {}
+    for vid, tubes in tqdm(v_stubes.items(), desc='nms'):
+        nmsed_tubes = custom_nms_v2(
+                tubes, stube_overlaps_func, score_func, thresh)
+        v_stubes_nms[vid] = nmsed_tubes
+    return v_stubes_nms
+
+
+def scored_tube_nms_v2(
+        av_stubes: AV_dict[Sframetube],
+        thresh: float,
+        nms_folder):
+    av_stubes_nms = {}
+    for a, v_stubes in av_stubes.items():
+        nmsed_stubes_v = small.stash2(
+            nms_folder/f'scored_tubes_nms_{thresh:.2f}_at_{a}_v2.pkl')(
+            nms_on_scored_tubes_v2,
+            v_stubes, thresh)
+        av_stubes_nms[a] = nmsed_stubes_v
+    return av_stubes_nms
+
+
 def _objectdetections_into_scores(
         objactions_vf: Dict[DALY_vid, Dict[int, Objaction_dets]],
         ftubes: Dict[DALY_wein_tube_index, Frametube],
@@ -580,7 +661,6 @@ def _objectdetections_into_scores(
             good_score = mobjactions['scores'] > score_cutoff
             # Merge
             good = good_overlaps & good_score
-
             for score, cls in zip(
                     mobjactions['scores'][good],
                     mobjactions['pred_classes'][good]):

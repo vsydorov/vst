@@ -1,4 +1,5 @@
 import pandas as pd
+import warnings
 import logging
 import re
 import cv2
@@ -15,7 +16,8 @@ from thes.data.tubes.types import (
     DALY_wein_tube,
     DALY_wein_tube_index, DALY_gt_tube_index,
     Objaction_dets, Frametube, Sframetube,
-    convert_dwein_tube, dtindex_filter_split,
+    convert_dwein_tube, convert_dgt_tubes,
+    dtindex_filter_split, av_filter_split,
     get_daly_gt_tubes, AV_dict
 )
 from thes.data.tubes.routines import (
@@ -23,6 +25,7 @@ from thes.data.tubes.routines import (
     filter_tube_keyframes_only_gt_v2,
     nicphil_evaluations_to_tubes,
     scored_tube_nms,
+    scored_tube_nms_v2,
     _objectdetections_into_scores,
     _create_objdetection_helper_structure,
     _match_objectdetections_to_tubes,
@@ -32,10 +35,8 @@ from thes.data.dataset.external import (
     DatasetDALY, DALY_action_name, DALY_object_name, DALY_vid)
 from thes.detectron.daly import (
     get_daly_split_vids,
-    get_similar_action_objects_DALY,
     simplest_daly_to_datalist_v2,
-    make_datalist_objaction_similar_merged,
-    daly_to_datalist_pfadet,
+    get_datalist_action_object_converter,
 )
 from thes.evaluation.routines import (
     compute_recall_for_avtubes,
@@ -111,28 +112,73 @@ def _set_defcfg_rcnn(cfg):
 
 
 def _resolve_tubes(
-        cf, dataset, split_vids
+        cf, av_gt_tubes, split_vids
         ) -> Dict[DALY_wein_tube_index, Frametube]:
     # // Define tubes
+
     ftubes: Dict[DALY_wein_tube_index, Frametube]
     if cf['tubes.source'] == 'wein':
         dwein_tubes: Dict[DALY_wein_tube_index, DALY_wein_tube] = \
                 small.load_pkl(cf['tubes.wein.path'])
         dwein_tubes = dtindex_filter_split(dwein_tubes, split_vids)
-        # Convert wein_tubes to sparse tubes
-        ftubes = {}
-        for k, tube in dwein_tubes.items():
-            ftubes[k] = convert_dwein_tube(tube)
+        # Convert dwein_tubes to sparse tubes
+        ftubes = {k: convert_dwein_tube(t) for k, t in dwein_tubes.items()}
         # Filter tubes optionally
         if cf['tubes.wein.leave_only_gt_keyframes.enabled']:
             keep_temporal = cf['tubes.wein.leave_only_gt_keyframes.keep_temporal']
             ftubes = filter_tube_keyframes_only_gt_v2(
-                    dataset, ftubes, keep_temporal)
+                    ftubes, av_gt_tubes, keep_temporal)
     elif cf['tubes.source'] == 'gt':
         raise NotImplementedError()
     else:
         raise NotImplementedError()
     return ftubes
+
+
+def _resolve_actobjects(cf, dataset, split_vids):
+    # / Assign objects to tubes
+    # // Create objaction_dets in video frames
+    objactions_vf: Dict[DALY_vid, Dict[int, Objaction_dets]] = {}
+    datalist = _recreate_actobject_datalist(dataset, split_vids)
+    if cf['actobjects.source'] == 'detected':
+        # /// Load detections themselves
+        actobjects_evaluated = small.load_pkl(cf['actobjects.detected.path'])
+        # /// Assign objactions
+        for dl_item, pred_item in zip(datalist, actobjects_evaluated):
+            pred_boxes = pred_item.pred_boxes.tensor.numpy()
+            scores = pred_item.scores.numpy()
+            pred_classes = pred_item.pred_classes.numpy()
+            pred_classes = np.array([dataset.action_names[i]
+                for i in pred_classes])
+            detections: Objaction_dets = {
+                    'pred_boxes': pred_boxes,
+                    'scores': scores,
+                    'pred_classes': pred_classes}
+            (objactions_vf
+                .setdefault(dl_item['vid'], {})
+                [dl_item['video_frame_number']]) = detections
+    elif cf['actobjects.source'] == 'gt':
+        # /// Create fake "perfect" detections
+        for dl_item in datalist:
+            pred_boxes = []
+            pred_classes = []
+            for anno in dl_item['annotations']:
+                pred_boxes.append(anno['bbox'])
+                pred_classes.append(
+                        dataset.action_names[anno['category_id']])
+            pred_boxes = np.array(pred_boxes)
+            pred_classes = np.array(pred_classes)
+            scores = np.ones(len(pred_boxes))
+            detections: Objaction_dets = {
+                    'pred_boxes': pred_boxes,
+                    'scores': scores,
+                    'pred_classes': pred_classes}
+            (objactions_vf
+                .setdefault(dl_item['vid'], {})
+                [dl_item['video_frame_number']]) = detections
+    else:
+        raise NotImplementedError()
+    return objactions_vf
 
 
 def sample_some_tubes(
@@ -205,6 +251,7 @@ def _perform_tube_demovis(dataset, some_tubes, out,
 
 
 def _get_gt_sparsetubes(dataset, split_vids, gt_tubes) -> AV_dict[Frametube]:
+    warnings.warn('Deprecated')
     av_gttubes: AV_dict[Frametube] = {}
 
     for ckey, gt_tube in gt_tubes.items():
@@ -245,16 +292,12 @@ def _daly_tube_map(
             stubes_va, gttubes_va, iou_thresholds)
 
 
-def _recreate_datalist_for_detections(dataset, split_label):
+def _recreate_actobject_datalist(dataset, split_vids):
     # /// Recreate the datalist that was used for detections
-    action_object_to_object = get_similar_action_objects_DALY()
-    new_object_names = sorted([x
-        for x in set(list(action_object_to_object.values())) if x])
-    split_vids = get_daly_split_vids(dataset, split_label)
     datalist = simplest_daly_to_datalist_v2(dataset, split_vids)
-    datalist = make_datalist_objaction_similar_merged(
-            datalist, dataset.object_names, new_object_names,
-            action_object_to_object)
+    object_names, datalist_converter = \
+            get_datalist_action_object_converter(dataset)
+    datalist = datalist_converter(datalist)
     return datalist
 
 
@@ -395,69 +438,25 @@ def assign_objactions_to_tubes(workfolder, cfg_dict, add_args):
     dataset = DatasetDALY()
     dataset.populate_from_folder(cf['dataset.cache_folder'])
     split_label = cf['dataset.subset']
-
-    # / GT tubes
-    gt_tubes = get_daly_gt_tubes(dataset)
     split_vids = get_daly_split_vids(dataset, split_label)
+
     av_gt_tubes: AV_dict[Frametube] = \
-            _get_gt_sparsetubes(dataset, split_vids, gt_tubes)
+            convert_dgt_tubes(get_daly_gt_tubes(dataset))
+    av_gt_tubes = av_filter_split(av_gt_tubes, split_vids)
 
-    # Process tubes
     ftubes: Dict[DALY_wein_tube_index, Frametube] = \
-            _resolve_tubes(cf, dataset, split_vids)
+            _resolve_tubes(cf, av_gt_tubes, split_vids)
+    objactions_vf: Dict[DALY_vid, Dict[int, Objaction_dets]] = \
+            _resolve_actobjects(cf, dataset, split_vids)
 
-    # / Assign objects to tubes
-    # // Create objaction_dets in video frames
-    objactions_vf: Dict[DALY_vid, Dict[int, Objaction_dets]] = {}
-    if cf['actobjects.source'] == 'detected':
-        datalist = _recreate_datalist_for_detections(dataset, split_label)
-        # /// Load detections themselves
-        actobjects_evaluated = small.load_pkl(cf['actobjects.detected.path'])
-        # /// Assign objactions
-        for dl_item, pred_item in zip(datalist, actobjects_evaluated):
-            pred_boxes = pred_item.pred_boxes.tensor.numpy()
-            scores = pred_item.scores.numpy()
-            pred_classes = pred_item.pred_classes.numpy()
-            pred_classes = np.array([dataset.action_names[i]
-                for i in pred_classes])
-            detections: Objaction_dets = {
-                    'pred_boxes': pred_boxes,
-                    'scores': scores,
-                    'pred_classes': pred_classes}
-            (objactions_vf
-                .setdefault(dl_item['vid'], {})
-                [dl_item['video_frame_number']]) = detections
-    elif cf['actobjects.source'] == 'gt':
-        datalist = _recreate_datalist_for_detections(dataset, split_label)
-        # /// Create fake "perfect" detections
-        for dl_item in datalist:
-            pred_boxes = []
-            pred_classes = []
-            for anno in dl_item['annotations']:
-                pred_boxes.append(anno['bbox'])
-                pred_classes.append(
-                        dataset.action_names[anno['category_id']])
-            pred_boxes = np.array(pred_boxes)
-            pred_classes = np.array(pred_classes)
-            scores = np.ones(len(pred_boxes))
-            detections: Objaction_dets = {
-                    'pred_boxes': pred_boxes,
-                    'scores': scores,
-                    'pred_classes': pred_classes}
-            (objactions_vf
-                .setdefault(dl_item['vid'], {})
-                [dl_item['video_frame_number']]) = detections
-    else:
-        raise NotImplementedError()
     # // Assignment itself
     # /// Sum the scores
     overlap_type = cf['obj_to_tube.overlap_type']
     overlap_cutoff = cf['obj_to_tube.overlap_cutoff']
     score_cutoff = cf['obj_to_tube.score_cutoff']
     scores_t: Dict[DALY_wein_tube_index, Dict[DALY_action_name, float]] = \
-            _objectdetections_into_scores(
-                objactions_vf, ftubes,
-                overlap_type, overlap_cutoff, score_cutoff)
+        _objectdetections_into_scores(
+            objactions_vf, ftubes, overlap_type, overlap_cutoff, score_cutoff)
     # /// Create "sparse scores tubes"
     av_stubes: AV_dict[Sframetube] = {}
     for dwt_index, tube in ftubes.items():
@@ -468,8 +467,6 @@ def assign_objactions_to_tubes(workfolder, cfg_dict, add_args):
             stube = tube.copy()
             stube['score'] = score
             stube = cast(Sframetube, stube)
-            if score < 0.05:
-                continue
             (av_stubes
                     .setdefault(action_name, {})
                     .setdefault(vid, []).append(stube))
@@ -478,7 +475,8 @@ def assign_objactions_to_tubes(workfolder, cfg_dict, add_args):
     # [optionally] Apply per-class NMS
     if cf['tube_eval.nms.enabled']:
         tube_nms_thresh = cf['tube_eval.nms.thresh']
-        av_stubes = scored_tube_nms(av_stubes, tube_nms_thresh, out)
+        # av_stubes = scored_tube_nms(av_stubes, tube_nms_thresh, out)
+        av_stubes = scored_tube_nms_v2(av_stubes, tube_nms_thresh, out)
     iou_thresholds = cf['tube_eval.params.iou_thresholds']
     computeprint_recall_ap_for_avtubes(
             av_gt_tubes, av_stubes, iou_thresholds)

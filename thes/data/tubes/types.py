@@ -1,4 +1,5 @@
 import logging
+import math
 import numpy as np
 from typing import (
         Tuple, TypedDict, NewType, Dict, List, TypeVar)
@@ -17,7 +18,7 @@ Scores_per_frame = Dict[FrameNumber0, np.ndarray]
 
 class Base_frametube(TypedDict):
     frame_inds: np.ndarray
-    boxes: np.ndarray  # LTRD
+    boxes: np.ndarray  # LTRD, absolute scale
 
 
 class DALY_wein_tube(Base_frametube):
@@ -29,6 +30,8 @@ class DALY_gt_tube(Base_frametube):
     times: np.ndarray
     start_time: float
     end_time: float
+    start_frame: int
+    end_frame: int
 
 
 class Frametube(Base_frametube):
@@ -68,55 +71,65 @@ def get_daly_gt_tubes(
         dataset: DatasetDALY
             ) -> Dict[DALY_gt_tube_index, DALY_gt_tube]:
     # Daly GT tubes
-    gt_tubes: Dict[DALY_gt_tube_index, DALY_gt_tube] = {}
+    dgt_tubes: Dict[DALY_gt_tube_index, DALY_gt_tube] = {}
     for vid, v in dataset.video_odict.items():
+        vmp4 = dataset.source_videos[vid]
+        height = vmp4['height']
+        width = vmp4['width']
+        ocv_video_fps = vmp4['frames_reached']/vmp4['length_reached']
+        box_scale = np.tile([width, height], 2)
         for action_name, instances in v['instances'].items():
             for ins_ind, instance in enumerate(instances):
                 # Read keyframes
                 frame_inds = []
                 times = []
-                boxes = []
+                uboxes = []
                 for keyframe in instance['keyframes']:
                     frame_inds.append(keyframe['frameNumber'])
                     times.append(keyframe['time'])
-                    boxes.append(keyframe['boundingBox'].squeeze())
+                    uboxes.append(keyframe['boundingBox'].squeeze())
+                start_time = instance['beginTime']
+                end_time = instance['endTime']
+                start_frame = math.floor(start_time * ocv_video_fps)
+                end_frame = math.floor(end_time * ocv_video_fps)
                 tube: DALY_gt_tube = {
-                    'start_time': instance['beginTime'],
-                    'end_time': instance['endTime'],
+                    'start_time': start_time,
+                    'end_time': end_time,
+                    'start_frame': start_frame,
+                    'end_frame': end_frame,
                     'frame_inds': np.array(frame_inds),
                     'times': np.array(times),
-                    'boxes': np.array(boxes)}
-                gt_tubes[(vid, action_name, ins_ind)] = tube
-    return gt_tubes
+                    'boxes': np.array(uboxes)* box_scale}
+                dgt_tubes[(vid, action_name, ins_ind)] = tube
+    return dgt_tubes
 
 
-def convert_dgt_tube(
-        tube: DALY_gt_tube,
-        ocv_video_fps: float) -> Frametube:
-    start_frame = int(tube['start_time'] * ocv_video_fps)
-    end_frame = int(tube['end_time'] * ocv_video_fps)
-    ftube: Frametube = {
-        'frame_inds': tube['frame_inds'],
-        'boxes': tube['boxes'],
-        'start_frame': start_frame,
-        'end_frame': end_frame}
-    return ftube
-
-
-def convert_dgt_tubes_to_framebased(
-        dataset: DatasetDALY,
+def convert_dgt_tubes(
         dgt_tubes: Dict[DALY_gt_tube_index, DALY_gt_tube]
-            ) -> Dict[DALY_gt_tube_index, Frametube]:
+            ) -> AV_dict[Frametube]:
     """
     - Accesses opencv inferred fps to estimate frame limits
     """
-    ftubes: Dict[DALY_gt_tube_index, Frametube] = {}
-    for dgt_index, dgt_tube in dgt_tubes.items():
+    av_gt_tubes: AV_dict[Frametube] = {}
+    for dgt_index, tube in dgt_tubes.items():
         vid, action_name, ins_ind = dgt_index
-        vmp4 = dataset.source_videos[vid]
-        ocv_video_fps = vmp4['frames_reached']/vmp4['length_reached']
-        ftubes[dgt_index] = convert_dgt_tube(dgt_tube, ocv_video_fps)
-    return ftubes
+        ftube: Frametube = {
+            'frame_inds': tube['frame_inds'],
+            'boxes': tube['boxes'],
+            'start_frame': tube['start_frame'],
+            'end_frame': tube['end_frame']}
+        (av_gt_tubes.setdefault(action_name, {})
+                .setdefault(vid, []).append(ftube))
+    return av_gt_tubes
+
+
+def av_filter_split(
+        avx: AV_dict[T],
+        split_vids: List[DALY_vid]) -> AV_dict[T]:
+    favx = {}
+    for a, vx in avx.items():
+        favx[a] = {v: x for v, x in vx.items() if v in split_vids}
+    return favx
 
 
 def dtindex_filter_split(

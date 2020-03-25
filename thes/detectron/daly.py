@@ -254,6 +254,20 @@ def get_similar_action_objects_DALY() -> Dict[Tuple[DALY_action_name, DALY_objec
     return cast(Dict[Tuple[DALY_action_name, DALY_object_name], str], action_object_to_object)
 
 
+def get_datalist_action_object_converter(dataset):
+    action_object_to_object = get_similar_action_objects_DALY()
+    object_names = sorted([x
+        for x in set(list(action_object_to_object.values())) if x])
+
+    def datalist_converter(datalist):
+        datalist = make_datalist_objaction_similar_merged(
+                datalist, dataset.object_names, object_names,
+                action_object_to_object)
+        return datalist
+
+    return object_names, datalist_converter
+
+
 def get_biggest_objects_DALY() -> Tuple[DALY_action_name, DALY_object_name]:
     """ Biggest object category per action class """
     primal_configurations = [

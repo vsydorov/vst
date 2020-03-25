@@ -4,7 +4,8 @@ import numpy as np
 from typing import (TypedDict, List,)
 from thes.data.tubes.types import (Frametube, Sframetube, V_dict, AV_dict)
 from thes.data.tubes.routines import (
-        spatial_tube_iou_v2,)
+        spatial_tube_iou_v2,
+        temporal_ious_where_positive)
 
 
 log = logging.getLogger(__name__)
@@ -18,37 +19,21 @@ class Recall_coverage(TypedDict):
 def _compute_daly_recall_coverage(
         gt_tube: Frametube,
         proposals: List[Sframetube],
-        proposals_frange: np.ndarray,
-            ) -> Recall_coverage:
+        proposals_frange: np.ndarray,) -> Recall_coverage:
     if len(proposals) == 0:
         return {'max_spatial': np.nan,
                 'max_spatiotemp': np.nan}
-    assert len(proposals_frange.shape) == 2
-    assert proposals_frange.shape[1] == 2
-    # Extract min/max frames
-    gt_bf = gt_tube['start_frame']
-    gt_ef = gt_tube['end_frame']
-    # Computing temporal intersection
-    ibegin = np.maximum(proposals_frange[:, 0], gt_bf)
-    iend = np.minimum(proposals_frange[:, 1], gt_ef)
-    temporal_intersections = iend-ibegin+1
-    # Prepare iou values
-    spatial_mious = np.zeros(len(proposals))
+    spatial_mious = np.ones(len(proposals)) * np.nan
     temp_ious = np.zeros(len(proposals))
-    # Loop over proposal tubes that have at least some temporal
-    # intersection
-    for pid in np.where(temporal_intersections > 0)[0]:
-        proposal_tube: Sframetube = proposals[pid]
-        spatial_miou, spatial_ious = \
-                spatial_tube_iou_v2(proposal_tube, gt_tube)
-        # Temporal IOU
-        temp_inter = temporal_intersections[pid]
-        p_bf, p_ef = proposals_frange[pid]
-        temp_union = (gt_ef - gt_bf + 1) + (p_ef - p_bf + 1) - temp_inter
-        temp_iou = temp_inter/temp_union
-        # Report upstairs
-        spatial_mious[pid] = spatial_miou
-        temp_ious[pid] = temp_iou
+    # Temporal
+    ptious, pids = temporal_ious_where_positive(
+            gt_tube['start_frame'], gt_tube['end_frame'], proposals_frange)
+    temp_ious[pids] = ptious
+    # Spatial (where temporal >0)
+    pproposals = [proposals[pid] for pid in pids]
+    pmious = [spatial_tube_iou_v2(p, gt_tube)[0] for p in pproposals]
+    spatial_mious[pids] = pmious
+    # Spatio-temporal
     st_mious = spatial_mious * temp_ious
     # N_viable = len(np.where(possible_spatial_temp_ious > 0)[0])
     with warnings.catch_warnings():

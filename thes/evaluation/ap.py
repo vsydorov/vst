@@ -7,7 +7,8 @@ from typing import (
     Any, Dict, List, Tuple, TypedDict)
 from thes.data.tubes.routines import (
         numpy_iou, temporal_IOU,
-        spatial_tube_iou_v2,)
+        spatial_tube_iou_v2,
+        temporal_ious_where_positive)
 from thes.data.tubes.types import (Frametube,)
 
 
@@ -300,11 +301,14 @@ class AP_computer(ABC):
     use_diff: If True, will eval difficult proposals in the same way as
         real ones
     """
+    fgts: List[AP_fgt]
+    fdets: List[AP_fdet]
+
     def __init__(self):
         pass
 
     @abstractmethod
-    def _get_matchable_ifgts(ifdet: int) -> List[int]:
+    def _get_matchable_ifgts(self, ifdet: int) -> List[int]:
         pass
 
     @abstractmethod
@@ -424,7 +428,7 @@ class AP_tube_computer(AP_computer):
     fgts: List[AP_fgt_tube]
     fdets: List[AP_fdet_tube]
     _spatiotemporal: bool
-    _possible_matches_per_detection: List[Dict[int, float]]
+    _possible_matches_per_detection: Dict[int, Dict[int, float]]
 
     def __init__(self,
             fgts: List[AP_fgt_tube], fdets: List[AP_fdet_tube]):
@@ -450,24 +454,13 @@ class AP_tube_computer(AP_computer):
             for f in fdets])
         ifgt_to_ifdets_tious: Dict[int, Dict[int, float]] = {}
         for ifgt, ifdets in ifgt_to_ifdets_vid_groups.items():
-            current_frange = proposals_frange[ifdets, :]
-            if len(current_frange):
-                fgt = fgts[ifgt]
-                gt_bf = fgt['obj']['start_frame']
-                gt_ef = fgt['obj']['end_frame']
-                # Computing temporal intersection
-                ibegin = np.maximum(current_frange[:, 0], gt_bf)
-                iend = np.minimum(current_frange[:, 1], gt_ef)
-                temporal_intersections = iend-ibegin+1
-                for pid in np.where(temporal_intersections > 0)[0]:
-                    ifdet = ifdets[pid]
-                    temp_inter = temporal_intersections[pid]
-                    p_bf, p_ef = current_frange[pid]
-                    temp_union = (gt_ef - gt_bf + 1) + \
-                            (p_ef - p_bf + 1) - temp_inter
-                    tiou = temp_inter/temp_union
-                    ifgt_to_ifdets_tious.setdefault(
-                            ifgt, {})[ifdet] = tiou
+            fgt = fgts[ifgt]
+            ptious, pids = temporal_ious_where_positive(
+                fgt['obj']['start_frame'], fgt['obj']['end_frame'],
+                proposals_frange[ifdets, :])
+            for pid, ptiou in zip(pids, ptious):
+                ifdet = ifdets[pid]
+                ifgt_to_ifdets_tious.setdefault(ifgt, {})[ifdet] = ptiou
         ifdet_to_ifgt_tious: Dict[int, Dict[int, float]] = {}
         for ifgt, ifdet_to_tiou in ifgt_to_ifdets_tious.items():
             for ifdet, tiou in ifdet_to_tiou.items():

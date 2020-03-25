@@ -41,8 +41,8 @@ from thes.detectron.externals import (
 from thes.detectron.daly import (
         get_daly_split_vids, simplest_daly_to_datalist_v2,
         daly_to_datalist_pfadet, get_category_map_o100, make_datalist_o100,
-        get_similar_action_objects_DALY,
-        make_datalist_objaction_similar_merged)
+        get_datalist_action_object_converter
+        )
 from thes.data.dataset.external import (
         DatasetDALY)
 from thes.tools import snippets
@@ -122,7 +122,6 @@ def _detectron_train_function(d_cfg, cf, nargs):
 
 def _datalist_hacky_converter(cf, dataset):
     if cf['object_hacks.dataset'] == 'normal':
-        num_classes = 43
         object_names = dataset.object_names
 
         def datalist_converter(datalist):
@@ -130,7 +129,6 @@ def _datalist_hacky_converter(cf, dataset):
 
     elif cf['object_hacks.dataset'] == 'o100':
         o100_objects, category_map = get_category_map_o100(dataset)
-        num_classes = len(o100_objects)
         assert len(o100_objects) == 16
         object_names = o100_objects
 
@@ -140,20 +138,11 @@ def _datalist_hacky_converter(cf, dataset):
 
     elif cf['object_hacks.dataset'] == 'action_object':
         assert cf['object_hacks.action_object.merge'] == 'sane'
-        action_object_to_object = get_similar_action_objects_DALY()
-        object_names = sorted([x
-            for x in set(list(action_object_to_object.values())) if x])
-        num_classes = len(object_names)
-
-        def datalist_converter(datalist):
-            datalist = make_datalist_objaction_similar_merged(
-                    datalist, dataset.object_names, object_names,
-                    action_object_to_object)
-            return datalist
-
+        object_names, datalist_converter = \
+                get_datalist_action_object_converter(dataset)
     else:
         raise NotImplementedError()
-    return num_classes, object_names, datalist_converter
+    return object_names, datalist_converter
 
 
 def _train_routine(cf, cf_add_d2, out,
@@ -225,7 +214,7 @@ def train_daly_object(workfolder, cfg_dict, add_args):
     split_vids = get_daly_split_vids(dataset, split_label)
     datalist = simplest_daly_to_datalist_v2(dataset, split_vids)
 
-    num_classes, cls_names, datalist_converter = \
+    cls_names, datalist_converter = \
             _datalist_hacky_converter(cf, dataset)
     datalist = datalist_converter(datalist)
 
@@ -369,7 +358,7 @@ def eval_daly_object(workfolder, cfg_dict, add_args):
     split_vids = get_daly_split_vids(dataset, split_label)
     datalist = simplest_daly_to_datalist_v2(dataset, split_vids)
 
-    num_classes, cls_names, datalist_converter = \
+    cls_names, datalist_converter = \
             _datalist_hacky_converter(cf, dataset)
     datalist = datalist_converter(datalist)
 
