@@ -4,7 +4,7 @@ import numpy as np
 from typing import (TypedDict, List,)
 from thes.data.tubes.types import (Frametube, Sframetube, V_dict, AV_dict)
 from thes.data.tubes.routines import (
-        spatial_tube_iou_v2,
+        spatial_tube_iou_v3,
         temporal_ious_where_positive)
 
 
@@ -31,7 +31,7 @@ def _compute_daly_recall_coverage(
     temp_ious[pids] = ptious
     # Spatial (where temporal >0)
     pproposals = [proposals[pid] for pid in pids]
-    pmious = [spatial_tube_iou_v2(p, gt_tube)[0] for p in pproposals]
+    pmious = [spatial_tube_iou_v3(p, gt_tube) for p in pproposals]
     spatial_mious[pids] = pmious
     # Spatio-temporal
     st_mious = spatial_mious * temp_ious

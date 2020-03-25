@@ -7,7 +7,7 @@ from typing import (
     Any, Dict, List, Tuple, TypedDict)
 from thes.data.tubes.routines import (
         numpy_iou, temporal_IOU,
-        spatial_tube_iou_v2,
+        spatial_tube_iou_v3,
         temporal_ious_where_positive)
 from thes.data.tubes.types import (Frametube,)
 
@@ -248,8 +248,8 @@ def _compute_tube_ap_old(
         for gt_id, temp_iou in gt_ids_that_overlap.items():
             gt_tube_anno: AP_fgt_tube = fgts[gt_id]
             gt_tube = gt_tube_anno['obj']
-            spatial_miou, spatial_ious = \
-                    spatial_tube_iou_v2(gt_tube, detection_tube)
+            spatial_miou = \
+                spatial_tube_iou_v3(gt_tube, detection_tube)
             if spatiotemporal:
                 iou = temp_iou * spatial_miou
             else:
@@ -486,8 +486,8 @@ class AP_tube_computer(AP_computer):
         iou_coverages: List[float] = []
         for gt_id, temp_iou in gt_ids_that_overlap.items():
             fgt: AP_fgt_tube = fgts[gt_id]
-            spatial_miou, spatial_ious = \
-                    spatial_tube_iou_v2(fdet['obj'], fgt['obj'])
+            spatial_miou = \
+                    spatial_tube_iou_v3(fdet['obj'], fgt['obj'])
             if self._spatiotemporal:
                 iou = temp_iou * spatial_miou
             else:

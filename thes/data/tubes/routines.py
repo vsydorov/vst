@@ -372,6 +372,41 @@ def numpy_iou(box1, box2):
     return iou
 
 
+def numpy_iou_N1(boxes1, box2):
+    assert len(boxes1.shape) == 2
+    assert boxes1.shape[-1] == 4
+    assert box2.shape == (4,)
+    inter = np.c_[
+        np.maximum(boxes1[..., :2], box2[:2]),
+        np.minimum(boxes1[..., 2:], box2[2:])]
+    # Intersection area
+    inter_subs = inter[..., 2:] - inter[..., :2]
+    inter_areas = np.prod(inter_subs, axis=1)
+    inter_areas[(inter_subs < 0).any(axis=1)] = 0.0
+
+    boxes1_areas = np.prod(boxes1[..., 2:] - boxes1[..., :2], axis=1)
+    box2_area = np.prod(box2[2:] - box2[:2])
+    union_areas = boxes1_areas + box2_area - inter_areas
+    ious = inter_areas / union_areas
+    return ious
+
+
+def numpy_iou_NN(boxes1, boxes2):
+    inter = np.c_[
+        np.maximum(boxes1[..., :2], boxes2[..., :2]),
+        np.minimum(boxes1[..., 2:], boxes2[..., 2:])]
+    # Intersection area
+    inter_subs = inter[..., 2:] - inter[..., :2]
+    inter_areas = np.prod(inter_subs, axis=1)
+    inter_areas[(inter_subs < 0).any(axis=1)] = 0.0
+
+    boxes1_areas = np.prod(boxes1[..., 2:] - boxes1[..., :2], axis=1)
+    boxes2_areas = np.prod(boxes2[..., 2:] - boxes2[..., :2], axis=1)
+    union_areas = boxes1_areas + boxes2_areas - inter_areas
+    ious = inter_areas / union_areas
+    return ious
+
+
 def numpy_inner_overlap_11(box1, box2):
     assert box1.shape == (4,)
     assert box2.shape == (4,)
@@ -390,16 +425,13 @@ def numpy_inner_overlap_N1(boxes1, box2):
     assert len(boxes1.shape) == 2
     assert boxes1.shape[-1] == 4
     assert box2.shape == (4,)
-
     inter = np.c_[
         np.maximum(boxes1[..., :2], box2[:2]),
         np.minimum(boxes1[..., 2:], box2[2:])]
-
     # Intersection area
     inter_subs = inter[..., 2:] - inter[..., :2]
     inter_area = np.prod(inter_subs, axis=1)
     inter_area[(inter_subs < 0).any(axis=1)] = 0.0
-
     # Divide
     boxes1_areas = np.prod(boxes1[..., 2:] - boxes1[..., :2], axis=1)
     ioverlaps = inter_area / boxes1_areas
@@ -502,6 +534,26 @@ def spatial_tube_iou_v2(
     return miou, ious1
 
 
+def spatial_tube_iou_v3(
+        tube1: Base_frametube,
+        tube2: Base_frametube,
+        ) -> float:
+    """
+    Compute avg iou over matching keyframes
+    """
+    ii, c1, c2 = np.intersect1d(
+            tube1['frame_inds'], tube2['frame_inds'],
+            assume_unique=True, return_indices=True)
+    if len(ii):
+        c1_boxes = tube1['boxes'][c1]
+        c2_boxes = tube2['boxes'][c2]
+        ious = numpy_iou_NN(c1_boxes, c2_boxes)
+        miou = np.mean(ious)
+    else:
+        miou = np.nan
+    return miou
+
+
 def overlap_DALY_sparse_frametube(
         x: Frametube, y: Frametube) -> float:
     """
@@ -515,7 +567,7 @@ def overlap_DALY_sparse_frametube(
     if len(union_keys) == 0:
         return 0.0
     # Spatial
-    spat = spatial_tube_iou(x, y)
+    spat = spatial_tube_iou_v3(x, y)
     # Temporal
     temp = temporal_IOU(
             x['start_frame'], x['end_frame'],
@@ -585,7 +637,7 @@ def temporal_ious_where_positive(x_bf, x_ef, y_frange):
     return ptious, pids
 
 
-def stube_overlaps_func(
+def tube_st_overlaps_func(
         x: Sframetube,
         ys: Sequence[Sframetube]) -> np.ndarray:
     y_frange = np.array([(y['start_frame'], y['end_frame']) for y in ys])
@@ -594,7 +646,7 @@ def stube_overlaps_func(
     st_overlaps = np.zeros(len(ys))
     if len(pids):
         pys = [ys[pid] for pid in pids]
-        pmious = [spatial_tube_iou_v2(y, x)[0] for y in pys]
+        pmious = [spatial_tube_iou_v3(y, x) for y in pys]
         st_overlaps[pids] = ptious * pmious
     return st_overlaps
 
@@ -609,7 +661,7 @@ def nms_on_scored_tubes_v2(
     v_stubes_nms = {}
     for vid, tubes in tqdm(v_stubes.items(), desc='nms'):
         nmsed_tubes = custom_nms_v2(
-                tubes, stube_overlaps_func, score_func, thresh)
+                tubes, tube_st_overlaps_func, score_func, thresh)
         v_stubes_nms[vid] = nmsed_tubes
     return v_stubes_nms
 
