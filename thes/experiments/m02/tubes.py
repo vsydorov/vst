@@ -24,8 +24,7 @@ from thes.data.tubes.routines import (
     filter_tube_keyframes_only_gt,
     filter_tube_keyframes_only_gt_v2,
     nicphil_evaluations_to_tubes,
-    scored_tube_nms,
-    scored_tube_nms_v2,
+    compute_nms_for_av_stubes,
     _objectdetections_into_scores,
     _create_objdetection_helper_structure,
     _match_objectdetections_to_tubes,
@@ -475,8 +474,7 @@ def assign_objactions_to_tubes(workfolder, cfg_dict, add_args):
     # [optionally] Apply per-class NMS
     if cf['tube_eval.nms.enabled']:
         tube_nms_thresh = cf['tube_eval.nms.thresh']
-        # av_stubes = scored_tube_nms(av_stubes, tube_nms_thresh, out)
-        av_stubes = scored_tube_nms_v2(av_stubes, tube_nms_thresh, out)
+        av_stubes = compute_nms_for_av_stubes(av_stubes, tube_nms_thresh)
     iou_thresholds = cf['tube_eval.params.iou_thresholds']
     computeprint_recall_ap_for_avtubes(
             av_gt_tubes, av_stubes, iou_thresholds)

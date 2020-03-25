@@ -349,12 +349,25 @@ def nicphil_evaluations_to_tubes(
     return stubes_va
 
 
-def numpy_box_area(box):
-    assert box.shape == (4,)
+def _barea(box):
     return np.prod(box[2:] - box[:2])
 
 
-def numpy_iou(box1, box2):
+def _bareas(boxes):
+    return np.prod(boxes[..., 2:] - boxes[..., :2], axis=1)
+
+
+def _inter_areas(boxes1, boxes2):
+    inter = np.c_[
+        np.maximum(boxes1[..., :2], boxes2[..., :2]),
+        np.minimum(boxes1[..., 2:], boxes2[..., 2:])]
+    inter_subs = inter[..., 2:] - inter[..., :2]
+    inter_areas = np.prod(inter_subs, axis=1)
+    inter_areas[(inter_subs < 0).any(axis=1)] = 0.0
+    return inter_areas
+
+
+def numpy_iou_11(box1, box2):
     assert box1.shape == (4,)
     assert box2.shape == (4,)
     # Computing IOU
@@ -364,100 +377,49 @@ def numpy_iou(box1, box2):
     if np.any(inter[:2] >= inter[2:]):
         iou = 0.0
     else:
-        inter_area = numpy_box_area(inter)
-        union_area = (
-            np.prod(box1[2:] - box1[:2]) +
-            np.prod(box2[2:] - box2[:2]) - inter_area)
+        inter_area = _barea(inter)
+        box1_area = _barea(box1)
+        box2_area = _barea(box2)
+        union_area = box1_area + box2_area - inter_area
         iou = inter_area/union_area
     return iou
-
-
-def numpy_iou_N1(boxes1, box2):
-    assert len(boxes1.shape) == 2
-    assert boxes1.shape[-1] == 4
-    assert box2.shape == (4,)
-    inter = np.c_[
-        np.maximum(boxes1[..., :2], box2[:2]),
-        np.minimum(boxes1[..., 2:], box2[2:])]
-    # Intersection area
-    inter_subs = inter[..., 2:] - inter[..., :2]
-    inter_areas = np.prod(inter_subs, axis=1)
-    inter_areas[(inter_subs < 0).any(axis=1)] = 0.0
-
-    boxes1_areas = np.prod(boxes1[..., 2:] - boxes1[..., :2], axis=1)
-    box2_area = np.prod(box2[2:] - box2[:2])
-    union_areas = boxes1_areas + box2_area - inter_areas
-    ious = inter_areas / union_areas
-    return ious
-
-
-def numpy_iou_NN(boxes1, boxes2):
-    inter = np.c_[
-        np.maximum(boxes1[..., :2], boxes2[..., :2]),
-        np.minimum(boxes1[..., 2:], boxes2[..., 2:])]
-    # Intersection area
-    inter_subs = inter[..., 2:] - inter[..., :2]
-    inter_areas = np.prod(inter_subs, axis=1)
-    inter_areas[(inter_subs < 0).any(axis=1)] = 0.0
-
-    boxes1_areas = np.prod(boxes1[..., 2:] - boxes1[..., :2], axis=1)
-    boxes2_areas = np.prod(boxes2[..., 2:] - boxes2[..., :2], axis=1)
-    union_areas = boxes1_areas + boxes2_areas - inter_areas
-    ious = inter_areas / union_areas
-    return ious
-
-
-def numpy_inner_overlap_11(box1, box2):
-    assert box1.shape == (4,)
-    assert box2.shape == (4,)
-    inter = np.r_[
-        np.maximum(box1[:2], box2[:2]),
-        np.minimum(box1[2:], box2[2:])]
-    if np.any(inter[:2] > inter[2:]):
-        inter = 0.0
-    else:
-        inter_area = numpy_box_area(inter)
-        inter = inter_area/numpy_box_area(box1)
-    return inter
 
 
 def numpy_inner_overlap_N1(boxes1, box2):
     assert len(boxes1.shape) == 2
     assert boxes1.shape[-1] == 4
     assert box2.shape == (4,)
-    inter = np.c_[
-        np.maximum(boxes1[..., :2], box2[:2]),
-        np.minimum(boxes1[..., 2:], box2[2:])]
-    # Intersection area
-    inter_subs = inter[..., 2:] - inter[..., :2]
-    inter_area = np.prod(inter_subs, axis=1)
-    inter_area[(inter_subs < 0).any(axis=1)] = 0.0
-    # Divide
-    boxes1_areas = np.prod(boxes1[..., 2:] - boxes1[..., :2], axis=1)
-    ioverlaps = inter_area / boxes1_areas
+    inter_areas = _inter_areas(boxes1, box2)
+    boxes1_areas = _bareas(boxes1)
+    ioverlaps = inter_areas / boxes1_areas
     return ioverlaps
 
 
-def custom_nms(
-        element_list: List[T],
-        overlap_func: Callable[[T, T], float],
-        score_func: Callable[[T], float],
-        thresh
-            ) -> List[T]:
-    scores = [score_func(e) for e in element_list]
-    sorted_ids = np.argsort(scores)[::-1]  # In decreasing order
-    sorted_candidates = [element_list[i] for i in sorted_ids]
-    results = []
-    while len(sorted_candidates):
-        taken = sorted_candidates.pop(0)
-        results.append(taken)
-        overlaps = [overlap_func(taken, c) for c in sorted_candidates]
-        sorted_candidates = [c for c, o in zip(sorted_candidates, overlaps) if o < thresh]
-
-    return results
+def numpy_iou_N1(boxes1, box2):
+    assert len(boxes1.shape) == 2
+    assert boxes1.shape[-1] == 4
+    assert box2.shape == (4,)
+    inter_areas = _inter_areas(boxes1, box2)
+    boxes1_areas = _bareas(boxes1)
+    box2_area = _barea(box2)
+    union_areas = boxes1_areas + box2_area - inter_areas
+    ious = inter_areas / union_areas
+    return ious
 
 
-def custom_nms_v2(
+def numpy_iou_NN(boxes1, boxes2):
+    assert boxes1.shape == boxes2.shape
+    assert len(boxes1.shape) == 2
+    assert boxes1.shape[-1] == 4
+    inter_areas = _inter_areas(boxes1, boxes2)
+    boxes1_areas = _bareas(boxes1)
+    boxes2_areas = _bareas(boxes2)
+    union_areas = boxes1_areas + boxes2_areas - inter_areas
+    ious = inter_areas / union_areas
+    return ious
+
+
+def nms_over_custom_elements(
         element_list: List[T],
         overlaps_func: Callable[[T, Sequence[T]], List[float]],
         score_func: Callable[[T], float],
@@ -488,52 +450,6 @@ def temporal_IOU(
         return inter/union
 
 
-def spatial_tube_iou(
-        tube1: Base_frametube,
-        tube2: Base_frametube,
-            ) -> float:
-    tubedict1 = dict(zip(tube1['frame_inds'], tube1['boxes']))
-    tubedict2 = dict(zip(tube2['frame_inds'], tube2['boxes']))
-    spatial_ious: List[float] = []
-    for kf_id1, box1 in tubedict1.items():
-        if kf_id1 in tubedict2:
-            box2 = tubedict2[kf_id1]
-            iou = numpy_iou(box1, box2)
-            spatial_ious.append(iou)
-    if len(spatial_ious):
-        avg_iou = np.mean(spatial_ious)
-    else:
-        avg_iou = 0.
-    return avg_iou
-
-
-def spatial_tube_iou_v2(
-        tube1: Base_frametube,
-        tube2: Base_frametube,
-            ) -> Tuple[float, np.ndarray]:
-    """
-    Compute spatial IOU for each kf1 in tube1
-    Returns:
-      - mean IOU for keyboxes present in both tubes
-      - iou per each keyframe in tube1 (nan if no match)
-    """
-    ious1: List[float] = []
-    for kf_id1, box1 in zip(
-            tube1['frame_inds'], tube1['boxes']):
-        if kf_id1 in tube2['frame_inds']:
-            found_ind = np.searchsorted(
-                tube2['frame_inds'], kf_id1)
-            box2 = tube2['boxes'][found_ind]
-            iou = numpy_iou(box1, box2)
-        else:
-            iou = np.nan
-        ious1.append(iou)
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", category=RuntimeWarning)
-        miou = np.nanmean(ious1)
-    return miou, ious1
-
-
 def spatial_tube_iou_v3(
         tube1: Base_frametube,
         tube2: Base_frametube,
@@ -552,62 +468,6 @@ def spatial_tube_iou_v3(
     else:
         miou = np.nan
     return miou
-
-
-def overlap_DALY_sparse_frametube(
-        x: Frametube, y: Frametube) -> float:
-    """
-    - We utilize simple spatio-temporal overlap here:
-        - S = Mean spatial IOU for overlapping frames
-        - T = Temporal IOU of (start, end)
-    - We return S*T
-    """
-    # Find overlapping keyframes
-    union_keys = np.intersect1d(list(x), list(y))
-    if len(union_keys) == 0:
-        return 0.0
-    # Spatial
-    spat = spatial_tube_iou_v3(x, y)
-    # Temporal
-    temp = temporal_IOU(
-            x['start_frame'], x['end_frame'],
-            y['start_frame'], y['end_frame'])
-    return spat * temp
-
-
-def nms_on_scored_tubes(
-        scored_tubes_per_video: Dict[str, List[Sframetube]],
-        thresh: float
-            ) -> Dict[str, List[Sframetube]]:
-
-    def score_func(x: Sframetube):
-        return x['score']
-
-    def overlap_func(
-            x: Sframetube,
-            y: Sframetube) -> float:
-        return overlap_DALY_sparse_frametube(x, y)
-
-    nmsed_scored_tubes_per_video: \
-            Dict[str, List[Sframetube]] = {}
-
-    for video_name, tubes in tqdm(scored_tubes_per_video.items(), desc='nms'):
-        nmsed_tubes: List[Sframetube] = custom_nms(
-                tubes, overlap_func, score_func, thresh)
-        nmsed_scored_tubes_per_video[video_name] = nmsed_tubes
-    return nmsed_scored_tubes_per_video
-
-
-def scored_tube_nms(
-        stubes_va, thresh, nms_folder):
-    nmsed_stubes_va = {}
-    for action_name, scored_tubes_per_video in stubes_va.items():
-        nmsed_stubes_v = small.stash2(
-                nms_folder/f'scored_tubes_nms_{thresh:.2f}_at_{action_name}.pkl')(
-                nms_on_scored_tubes,
-                scored_tubes_per_video, thresh)
-        nmsed_stubes_va[action_name] = nmsed_stubes_v
-    return nmsed_stubes_va
 
 
 def temporal_ious_where_positive(x_bf, x_ef, y_frange):
@@ -637,9 +497,11 @@ def temporal_ious_where_positive(x_bf, x_ef, y_frange):
     return ptious, pids
 
 
-def tube_st_overlaps_func(
-        x: Sframetube,
-        ys: Sequence[Sframetube]) -> np.ndarray:
+def spatiotemp_tube_iou_1N(
+        x: Sframetube, ys: Sequence[Sframetube]) -> np.ndarray:
+    """
+    Spatiotemporal IOUs: x tube with every y tube
+    """
     y_frange = np.array([(y['start_frame'], y['end_frame']) for y in ys])
     ptious, pids = temporal_ious_where_positive(
             x['start_frame'], x['end_frame'], y_frange)
@@ -651,32 +513,38 @@ def tube_st_overlaps_func(
     return st_overlaps
 
 
-def nms_on_scored_tubes_v2(
+def compute_nms_for_v_stubes(
         v_stubes: V_dict[Sframetube],
         thresh: float) -> V_dict[Sframetube]:
-
-    def score_func(x: Sframetube):
-        return x['score']
-
     v_stubes_nms = {}
     for vid, tubes in tqdm(v_stubes.items(), desc='nms'):
-        nmsed_tubes = custom_nms_v2(
-                tubes, tube_st_overlaps_func, score_func, thresh)
+        nmsed_tubes = nms_over_custom_elements(
+            tubes, spatiotemp_tube_iou_1N, lambda x: x['score'], thresh)
         v_stubes_nms[vid] = nmsed_tubes
     return v_stubes_nms
 
 
-def scored_tube_nms_v2(
+def computecache_nms_for_av_stubes(
         av_stubes: AV_dict[Sframetube],
         thresh: float,
-        nms_folder):
+        nms_folder) -> AV_dict[Sframetube]:
     av_stubes_nms = {}
     for a, v_stubes in av_stubes.items():
         nmsed_stubes_v = small.stash2(
             nms_folder/f'scored_tubes_nms_{thresh:.2f}_at_{a}_v2.pkl')(
-            nms_on_scored_tubes_v2,
+            compute_nms_for_v_stubes,
             v_stubes, thresh)
         av_stubes_nms[a] = nmsed_stubes_v
+    return av_stubes_nms
+
+
+def compute_nms_for_av_stubes(
+        av_stubes: AV_dict[Sframetube],
+        thresh: float,
+        ) -> AV_dict[Sframetube]:
+    av_stubes_nms = {}
+    for a, v_stubes in av_stubes.items():
+        av_stubes_nms[a] = compute_nms_for_v_stubes(v_stubes, thresh)
     return av_stubes_nms
 
 
