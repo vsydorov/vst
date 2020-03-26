@@ -6,7 +6,8 @@ import numpy as np
 import pandas as pd
 from typing import (
     Dict, List, Tuple, TypeVar, Set, Optional,
-    Callable, TypedDict, NewType, NamedTuple, Sequence)
+    Callable, TypedDict, NewType, NamedTuple, Sequence,
+    Literal, cast)
 
 from thes.tools import snippets
 from thes.data.dataset.external import (
@@ -548,45 +549,57 @@ def compute_nms_for_av_stubes(
     return av_stubes_nms
 
 
-def _objectdetections_into_scores(
+def score_ftubes_via_objaction_overlap_aggregation(
         objactions_vf: Dict[DALY_vid, Dict[int, Objaction_dets]],
         ftubes: Dict[DALY_wein_tube_index, Frametube],
-        overlap_type, overlap_cutoff, score_cutoff
-        ) -> Dict[DALY_wein_tube_index, Dict[DALY_action_name, float]]:
+        overlap_type: Literal['inner_overlap', 'iou'],
+        overlap_cutoff: float,
+        score_cutoff: float
+        ) -> AV_dict[Sframetube]:
+    """
+    """
     # To every tube, find matching keyframes
-    cls_scores_per_tube: Dict[DALY_wein_tube_index,
-            Dict[DALY_action_name, float]] = {}
+    dwti_ascore: Dict[DALY_wein_tube_index, Dict[DALY_action_name, float]] = {}
     for dwt_index, tube in tqdm(ftubes.items(), 'match_keyframes'):
         (vid, bunch_id, tube_id) = dwt_index
         cls_scores: Dict[DALY_action_name, float] = {}
         for frame_ind, tube_box in zip(
                 tube['frame_inds'], tube['boxes']):
-            mobjactions: Optional[Objaction_dets] = \
+            # In frame, match box to all objections
+            odets: Optional[Objaction_dets] = \
                     objactions_vf.get(vid, {}).get(frame_ind)
-            if mobjactions is None:
+            if odets is None:
                 continue
+            # Check score
+            score_above = odets['scores'] > score_cutoff
+            sa_boxes = odets['pred_boxes'][score_above]
             # Check overlap
             if overlap_type == 'iou':
-                overlaps = []
-                for pred_box in mobjactions['pred_boxes']:
-                    overlaps.append(numpy_iou(pred_box, tube_box))
-                overlaps = np.array(overlaps)
+                sa_overlaps = numpy_iou_N1(sa_boxes, tube_box)
             elif overlap_type == 'inner_overlap':
-                overlaps = numpy_inner_overlap_N1(
-                        mobjactions['pred_boxes'], tube_box)
+                sa_overlaps = numpy_inner_overlap_N1(sa_boxes, tube_box)
             else:
                 raise RuntimeError()
-            good_overlaps = overlaps > overlap_cutoff
-            # Check score
-            good_score = mobjactions['scores'] > score_cutoff
-            # Merge
-            good = good_overlaps & good_score
-            for score, cls in zip(
-                    mobjactions['scores'][good],
-                    mobjactions['pred_classes'][good]):
+            sa_overlap_above = sa_overlaps > overlap_cutoff
+            sa_oa_scores = odets['scores'][score_above][sa_overlap_above]
+            sa_oa_classes = odets['pred_classes'][score_above][sa_overlap_above]
+            for score, cls in zip(sa_oa_scores, sa_oa_classes):
                 cls_scores[cls] = cls_scores.get(cls, 0.0) + score
-        cls_scores_per_tube[dwt_index] = cls_scores
-    return cls_scores_per_tube
+        dwti_ascore[dwt_index] = cls_scores
+    # Score the ftubes, convert to av_dict
+    av_stubes: AV_dict[Sframetube] = {}
+    for dwt_index, tube in ftubes.items():
+        (vid, bunch_id, tube_id) = dwt_index
+        scores: Dict[DALY_action_name, float] = dwti_ascore[dwt_index]
+        # Sum the perframe scores
+        for action_name, score in scores.items():
+            stube = tube.copy()
+            stube['score'] = score
+            stube = cast(Sframetube, stube)
+            (av_stubes
+                    .setdefault(action_name, {})
+                    .setdefault(vid, []).append(stube))
+    return av_stubes
 
 
 def _create_objdetection_helper_structure(
@@ -633,17 +646,14 @@ def _match_objectdetections_to_tubes(
         (vid, bunch_id, tube_id) = k
         cls_scores = np.zeros(n_classes)
         for frame_ind, tube_box in zip(
-                wein_tube['frame_inds'],
-                wein_tube['boxes']):
+                wein_tube['frame_inds'], wein_tube['boxes']):
             matching_keyframe = preds_per_framevid.get(vid, {}).get(frame_ind)
             if matching_keyframe is None:
                 continue
             # Check overlap
             if overlap_type == 'iou':
-                overlaps = []
-                for pred_box in matching_keyframe['pred_boxes']:
-                    overlaps.append(numpy_iou(pred_box, tube_box))
-                overlaps = np.array(overlaps)
+                overlaps = numpy_iou_N1(
+                        matching_keyframe['pred_boxes'], tube_box)
             elif overlap_type == 'inner_overlap':
                 overlaps = numpy_inner_overlap_N1(
                         matching_keyframe['pred_boxes'], tube_box)

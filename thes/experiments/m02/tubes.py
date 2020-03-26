@@ -25,7 +25,7 @@ from thes.data.tubes.routines import (
     filter_tube_keyframes_only_gt_v2,
     nicphil_evaluations_to_tubes,
     compute_nms_for_av_stubes,
-    _objectdetections_into_scores,
+    score_ftubes_via_objaction_overlap_aggregation,
     _create_objdetection_helper_structure,
     _match_objectdetections_to_tubes,
     av_stubes_above_score
@@ -408,7 +408,11 @@ def load_wein_tubes(workfolder, cfg_dict, add_args):
 
 def assign_objactions_to_tubes(workfolder, cfg_dict, add_args):
     """
-    Assign objactions (real or gt-faked) to tubes (philippe or gt-faked)
+    Score tubes by assigning objactions to them and pooling the scores,
+    then evaluate resulting scored tubes
+    - Objactions: detecton evaluated datalist or gt objects (per frame)
+    - Tubes: philippe tubes
+    - Assignment: inner overlap or iou scores
     """
     out, = snippets.get_subfolders(workfolder, ['out'])
     cfg = snippets.YConfig(cfg_dict)
@@ -438,37 +442,21 @@ def assign_objactions_to_tubes(workfolder, cfg_dict, add_args):
     dataset.populate_from_folder(cf['dataset.cache_folder'])
     split_label = cf['dataset.subset']
     split_vids = get_daly_split_vids(dataset, split_label)
-
     av_gt_tubes: AV_dict[Frametube] = \
             convert_dgt_tubes(get_daly_gt_tubes(dataset))
     av_gt_tubes = av_filter_split(av_gt_tubes, split_vids)
-
+    # Inputs to assignment routine
     ftubes: Dict[DALY_wein_tube_index, Frametube] = \
             _resolve_tubes(cf, av_gt_tubes, split_vids)
     objactions_vf: Dict[DALY_vid, Dict[int, Objaction_dets]] = \
             _resolve_actobjects(cf, dataset, split_vids)
-
-    # // Assignment itself
-    # /// Sum the scores
+    # Assignment itself
     overlap_type = cf['obj_to_tube.overlap_type']
     overlap_cutoff = cf['obj_to_tube.overlap_cutoff']
     score_cutoff = cf['obj_to_tube.score_cutoff']
-    scores_t: Dict[DALY_wein_tube_index, Dict[DALY_action_name, float]] = \
-        _objectdetections_into_scores(
-            objactions_vf, ftubes, overlap_type, overlap_cutoff, score_cutoff)
-    # /// Create "sparse scores tubes"
-    av_stubes: AV_dict[Sframetube] = {}
-    for dwt_index, tube in ftubes.items():
-        (vid, bunch_id, tube_id) = dwt_index
-        scores: Dict[DALY_action_name, float] = scores_t[dwt_index]
-        # Sum the perframe scores
-        for action_name, score in scores.items():
-            stube = tube.copy()
-            stube['score'] = score
-            stube = cast(Sframetube, stube)
-            (av_stubes
-                    .setdefault(action_name, {})
-                    .setdefault(vid, []).append(stube))
+    av_stubes: AV_dict[Sframetube] = \
+        score_ftubes_via_objaction_overlap_aggregation(
+        objactions_vf, ftubes, overlap_type, overlap_cutoff, score_cutoff)
     # Consider only tubes with score > 0.05
     av_stubes = av_stubes_above_score(av_stubes, 0.05)
     # [optionally] Apply per-class NMS
