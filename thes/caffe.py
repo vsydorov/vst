@@ -18,7 +18,7 @@ def revive_nicolas_caffe():
     caffe_root = NICPHIL_RCNN_CAFFE_PATH
     small.add_pypath(caffe_root)
     os.environ['GLOG_minloglevel'] = '3'  # Stop caffe outputs
-    import caffe
+    import caffe  # type: ignore
     caffe.set_device(0)
     caffe.set_mode_gpu()
     return caffe

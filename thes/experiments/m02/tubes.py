@@ -285,10 +285,10 @@ def _daly_tube_map(
     # Apply per-class NMS
     if cf['tube_nms.enabled']:
         tube_nms_thresh = cf['tube_nms.thresh']
-        stubes_va = scored_tube_nms(stubes_va, tube_nms_thresh, out)
+        stubes_va = compute_nms_for_av_stubes(stubes_va, tube_nms_thresh)
     iou_thresholds = cf['eval.iou_thresholds']
     computeprint_recall_ap_for_avtubes(
-            stubes_va, gttubes_va, iou_thresholds)
+            gttubes_va, stubes_va, iou_thresholds)
 
 
 def _recreate_actobject_datalist(dataset, split_vids):

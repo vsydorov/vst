@@ -6,6 +6,7 @@ from thes.tools import snippets
 from thes.data.dataset.external import (
         DALY_action_name,)
 from thes.data.tubes.types import (Frametube, Sframetube, V_dict, AV_dict)
+from thes.detectron.daly import (Datalist, Dl_record)
 from thes.evaluation.ap import (
         AP_fgt_framebox, AP_fdet_framebox,
         AP_fgt_tube, AP_fdet_tube,
@@ -129,11 +130,14 @@ def compute_ap_for_avtubes(
 
 
 def compute_ap_for_video_datalist(
-        datalist, predicted_datalist,
-        object_names, iou_thresh: float,
-        ) -> Dict[str, float]:
+        datalist: Datalist,
+        predicted_datalist,
+        object_names,
+        iou_thresh: float,
+            ) -> Dict[str, float]:
     o_fgts: Dict[str, List[AP_fgt_framebox]] = \
             {on: [] for on in object_names}
+    record: Dl_record
     for record in datalist:
         vid = record['vid']
         iframe = record['video_frame_number']
@@ -165,7 +169,6 @@ def compute_ap_for_video_datalist(
     # Params
     use_07_metric = False
     use_diff = False
-    iou_thresh = 0.5
     object_classes = object_names
     ap_per_cls: Dict[str, float] = {}
     for obj_cls in object_classes:
@@ -173,6 +176,6 @@ def compute_ap_for_video_datalist(
         fdets = o_fdets[obj_cls]
         ap_computer = AP_framebox_computer(fgts, fdets)
         ap = ap_computer.compute_ap(
-                use_diff, iou_thresh, use_07_metric)
+                iou_thresh, use_diff, use_07_metric)
         ap_per_cls[obj_cls] = ap
     return ap_per_cls

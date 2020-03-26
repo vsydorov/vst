@@ -133,7 +133,7 @@ class SA_Charades(SpecificAccess):
         video_actions = videodata.video['actions']
         tars = []
         for sampled_time in sampled_times:
-            target = torch.IntTensor(num_classes).zero_()
+            target = torch.IntTensor(num_classes).zero_()  # type: ignore
             for action_name, start, end in video_actions:
                 if start < sampled_time < end:
                     action_id = action_names.index(action_name)
@@ -210,7 +210,7 @@ class SA_HMDB51(SpecificAccess):
         action_name = videodata.video['action_name']
         num_classes = len(action_names)
 
-        target = torch.IntTensor(num_classes).zero_()
+        target = torch.IntTensor(num_classes).zero_()  # type: ignore
         action_id = action_names.index(action_name)
         target[action_id] = 1
         # Blow up to sample_times dimension

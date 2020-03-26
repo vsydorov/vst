@@ -2,7 +2,7 @@ import concurrent.futures
 import numpy as np
 import logging
 import cv2
-import ffmpeg
+import ffmpeg  # type: ignore
 
 log = logging.getLogger(__name__)
 

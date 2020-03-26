@@ -4,7 +4,7 @@ Module with small snippets
 import sys
 import logging
 import pickle
-import numpy as np
+import numpy as np  # type: ignore
 import string
 import random
 import platform

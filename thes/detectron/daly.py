@@ -4,12 +4,35 @@ Detectron intractions with DALY dataset
 import numpy as np
 import pandas as pd
 import copy
-from typing import Dict, Tuple, cast
+from pathlib import Path
+from typing import (List, Dict, Tuple, cast, TypedDict, Callable, Optional)
 
-from detectron2.structures import BoxMode
+from detectron2.structures import BoxMode  # type: ignore
 
 from thes.data.dataset.external import (
-        DALY_action_name, DALY_object_name)
+        DALY_vid, DALY_action_name, DALY_object_name)
+
+
+class Dl_anno(TypedDict):
+    bbox: np.ndarray
+    bbox_mode: BoxMode
+    category_id: int
+    is_occluded: bool
+
+
+class Dl_record(TypedDict):
+    vid: DALY_vid
+    video_path: Path
+    video_frame_number: int
+    video_frame_time: float
+    action_name: DALY_action_name
+    image_id: str
+    height: int
+    width: int
+    annotations: List[Dl_anno]
+
+
+Datalist = List[Dl_record]
 
 
 def get_daly_split_vids(dataset, split_label):
@@ -25,7 +48,8 @@ def get_daly_split_vids(dataset, split_label):
     return split_vids
 
 
-def daly_to_datalist_pfadet(dataset, split_vids):
+def daly_to_datalist_pfadet(
+        dataset, split_vids) -> Datalist:
     d2_datalist = []
     for vid in split_vids:
         v = dataset.video_odict[vid]
@@ -44,12 +68,14 @@ def daly_to_datalist_pfadet(dataset, split_vids):
                     bbox = box_unscaled * np.tile([width, height], 2)
                     bbox_mode = BoxMode.XYXY_ABS
                     action_id = dataset.action_names.index(action_name)
-                    act_obj = {
+                    act_obj: Dl_anno = {
                             'bbox': bbox,
                             'bbox_mode': bbox_mode,
-                            'category_id': action_id}
+                            'category_id': action_id,
+                            'is_occluded': False}
                     annotations = [act_obj]
-                    record = {
+                    record: Dl_record = {
+                            'vid': vid,
                             'video_path': video_path,
                             'video_frame_number': frame_number,
                             'video_frame_time': frame_time,
@@ -62,7 +88,8 @@ def daly_to_datalist_pfadet(dataset, split_vids):
     return d2_datalist
 
 
-def simplest_daly_to_datalist_v2(dataset, split_vids):
+def simplest_daly_to_datalist_v2(
+        dataset, split_vids) -> Datalist:
     d2_datalist = []
     for vid in split_vids:
         v = dataset.video_odict[vid]
@@ -89,7 +116,7 @@ def simplest_daly_to_datalist_v2(dataset, split_vids):
                         box_unscaled = np.array([xmin, ymin, xmax, ymax])
                         bbox = box_unscaled * np.tile([width, height], 2)
                         bbox_mode = BoxMode.XYXY_ABS
-                        obj = {
+                        obj: Dl_anno = {
                                 'bbox': bbox,
                                 'bbox_mode': bbox_mode,
                                 'category_id': int(objectID),
@@ -97,7 +124,7 @@ def simplest_daly_to_datalist_v2(dataset, split_vids):
                         annotations.append(obj)
                     if len(annotations) == 0:
                         continue
-                    record = {
+                    record: Dl_record = {
                             'vid': vid,
                             'video_path': video_path,
                             'video_frame_number': frame_number,
@@ -176,9 +203,10 @@ def make_datalist_o100(d2_datalist, category_map):
 
 
 def make_datalist_objaction_similar_merged(
-        d2_datalist,
-        old_object_names, new_object_names,
-        action_object_to_object):
+        d2_datalist: Datalist,
+        old_object_names: List[str],
+        new_object_names: List[str],
+        action_object_to_object: Dict) -> Datalist:
 
     filtered_datalist = []
     for record in d2_datalist:
@@ -254,7 +282,9 @@ def get_similar_action_objects_DALY() -> Dict[Tuple[DALY_action_name, DALY_objec
     return cast(Dict[Tuple[DALY_action_name, DALY_object_name], str], action_object_to_object)
 
 
-def get_datalist_action_object_converter(dataset):
+def get_datalist_action_object_converter(
+        dataset
+        ) -> Tuple[List[str], Callable[[Datalist], Datalist]]:
     action_object_to_object = get_similar_action_objects_DALY()
     object_names = sorted([x
         for x in set(list(action_object_to_object.values())) if x])

@@ -11,9 +11,9 @@ from mypy_extensions import TypedDict
 
 import torch
 
-from tavid.tools import snippets
-from tavid.data.specific_access import (SpecificAccess, VideoData)
-from tavid.data.video_utils import (tfm_video_resize_threaded,
+from thes.tools import snippets
+from thes.data.dataset.specific_access import (SpecificAccess, VideoData)
+from thes.tools.video import (tfm_video_resize_threaded,
         tfm_video_random_crop, tfm_video_center_crop, tfm_maybe_flip,)
 
 log = logging.getLogger(__name__)
@@ -223,6 +223,7 @@ class DataAccess_Eval(DataAccess):
                 videodata, unique_real_sampled_inds)
         unique_frames_rgb_u8 = np.flip(unique_frames, -1)  # Make RGB
 
+        stacked_targets: Optional[torch.Tensor]
         if self.sa.labels_present:
             all_targets = [self.sa.sample_targets(videodata, sampled_times)
                 for sampled_times in all_sampled_times]

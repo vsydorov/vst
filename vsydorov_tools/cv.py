@@ -4,9 +4,9 @@ Helpers for opencv functions
 - Rotations and stuff
 All images returned in BGR
 """
-import numpy as np
+import numpy as np  # type: ignore
 import time
-import cv2
+import cv2  # type: ignore
 import logging
 from contextlib import contextmanager
 from pathlib import Path

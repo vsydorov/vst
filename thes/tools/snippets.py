@@ -10,7 +10,7 @@ import re
 import itertools
 import platform
 import subprocess
-from abc import abstractmethod, ABC  # NOQA
+from abc import ABC
 from tqdm import tqdm
 from datetime import datetime
 from pathlib import Path

@@ -8,12 +8,12 @@ import hashlib
 import re
 import pandas as pd
 import numpy as np
-import cv2  # type: ignore
+import cv2
 import logging
 import concurrent.futures
 from abc import abstractmethod, ABC
 from tqdm import tqdm
-from pathlib import Path  # NOQA
+from pathlib import Path
 from collections import OrderedDict
 from mypy_extensions import TypedDict
 from typing import Dict, List, Tuple, cast, NewType, Any
@@ -642,6 +642,10 @@ VideoMP4_reached = TypedDict('VideoMP4_reached', {
     })
 
 
+def listdir_nondot(path):
+    return [f for f in path.iterdir() if not f.name.startswith('.')]
+
+
 class DatasetHMDB51(
         ActionDataset,
         PrecomputableDataset):
@@ -761,12 +765,12 @@ class DatasetHMDB51(
         - Remove videos that are not present in any split
         """
         unfinished_video_dict: Dict[HMDB51_vid, Dict] = {}
-        action_folders = snippets.listdir_nondot(video_folder)
+        action_folders = listdir_nondot(video_folder)
         for action_folder in action_folders:
             if not action_folder.is_dir():
                 continue
             action_name = HMDB51_action_name(action_folder.name)
-            video_files = snippets.listdir_nondot(action_folder)
+            video_files = listdir_nondot(action_folder)
             for video_file in video_files:
                 video_name = video_file.name
                 vid = HMDB51_vid(video_file.with_suffix('').name)

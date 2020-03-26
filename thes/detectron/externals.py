@@ -9,12 +9,13 @@ import time
 import numpy as np
 import copy
 import pandas as pd
+from pathlib import Path
 
 from vsydorov_tools import cv as vt_cv
 
 import torch
 
-from fvcore.common.file_io import PathManager
+from fvcore.common.file_io import PathManager  # type: ignore
 import detectron2.utils.comm as comm
 from detectron2.utils.collect_env import collect_env_info
 from detectron2.utils.env import seed_all_rng
@@ -33,7 +34,9 @@ log = logging.getLogger(__name__)
 
 
 def get_frame_without_crashing(
-        video_path, frame_number, frame_time,
+        video_path: Path,
+        frame_number: int,
+        frame_time: float,
         OCV_ATTEMPTS=3,
         PYAV_ATTEMPTS=0):
     """

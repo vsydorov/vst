@@ -2,15 +2,12 @@ import cv2
 import numpy as np
 import pandas as pd
 import copy
-import yacs
 import os
 import logging
 import argparse
 from pathlib import Path
 from tqdm import tqdm
-from typing import (
-    Dict, List, Tuple, TypeVar, Literal,
-    Callable, TypedDict, NewType, NamedTuple)
+from typing import (List, Tuple, Callable)
 
 import torch
 
@@ -21,8 +18,8 @@ from detectron2.layers.nms import nms, batched_nms
 from detectron2.modeling import build_model
 from detectron2.checkpoint import DetectionCheckpointer
 from detectron2.data import transforms as d2_transforms
-from detectron2.utils.visualizer import ColorMode, Visualizer
-from detectron2.structures import Boxes, Instances, pairwise_iou
+from detectron2.utils.visualizer import Visualizer
+from detectron2.structures import Boxes, Instances
 
 from vsydorov_tools import small
 from vsydorov_tools import cv as vt_cv
@@ -39,6 +36,7 @@ from thes.detectron.externals import (
         simple_d2_setup, DalyVideoDatasetTrainer,
         get_frame_without_crashing)
 from thes.detectron.daly import (
+        Datalist, Dl_record,
         get_daly_split_vids, simplest_daly_to_datalist_v2,
         daly_to_datalist_pfadet, get_category_map_o100, make_datalist_o100,
         get_datalist_action_object_converter
@@ -120,7 +118,9 @@ def _detectron_train_function(d_cfg, cf, nargs):
     trainer.train()
 
 
-def _datalist_hacky_converter(cf, dataset):
+def _datalist_hacky_converter(
+        cf, dataset
+        ) -> Tuple[List[str], Callable[[Datalist], Datalist]]:
     if cf['object_hacks.dataset'] == 'normal':
         object_names = dataset.object_names
 
@@ -187,7 +187,7 @@ def train_daly_action(workfolder, cfg_dict, add_args):
     dataset.populate_from_folder(cf['dataset.cache_folder'])
     split_label = cf['dataset.subset']
     split_vids = get_daly_split_vids(dataset, split_label)
-    datalist = daly_to_datalist_pfadet(dataset, split_vids)
+    datalist: Datalist = daly_to_datalist_pfadet(dataset, split_vids)
 
     cls_names = dataset.action_names
 
@@ -212,7 +212,7 @@ def train_daly_object(workfolder, cfg_dict, add_args):
     assert len(o100_objects) == 16
     split_label = cf['dataset.subset']
     split_vids = get_daly_split_vids(dataset, split_label)
-    datalist = simplest_daly_to_datalist_v2(dataset, split_vids)
+    datalist: Datalist = simplest_daly_to_datalist_v2(dataset, split_vids)
 
     cls_names, datalist_converter = \
             _datalist_hacky_converter(cf, dataset)
@@ -225,7 +225,7 @@ def train_daly_object(workfolder, cfg_dict, add_args):
 
 def computeprint_ap_for_video_datalist(
         object_names: List[str],
-        datalist,
+        datalist: Datalist,
         predicted_datalist):
     # // Transform to sensible data format
     iou_thresh = 0.5
@@ -246,7 +246,7 @@ def _eval_foldname_hack(cf):
     if cf['eval_hacks.model_to_eval'] == 'what':
         model_to_eval = cf['what_to_eval']
     elif cf['eval_hacks.model_to_eval'] == 'what+foldname':
-        import dervo
+        import dervo  # type: ignore
         EPATH = dervo.experiment.EXPERIMENT_PATH
         model_name = EPATH.resolve().name
         model_to_eval = str(Path(cf['what_to_eval'])/model_name)
@@ -257,7 +257,8 @@ def _eval_foldname_hack(cf):
 
 def _eval_routine(cf, cf_add_d2, out,
         cls_names, TEST_DATASET_NAME,
-        datalist, model_to_eval):
+        datalist: Datalist,
+        model_to_eval):
 
     num_classes = len(cls_names)
     d2_output_dir = str(small.mkdir(out/'d2_output'))
@@ -271,10 +272,10 @@ def _eval_routine(cf, cf_add_d2, out,
     predictor = DefaultPredictor(d_cfg)
     cpu_device = torch.device("cpu")
 
-    def eval_func(dl_item):
-        video_path = dl_item['video_path']
-        frame_number = dl_item['video_frame_number']
-        frame_time = dl_item['video_frame_number']
+    def eval_func(dl_item: Dl_record):
+        video_path: Path = dl_item['video_path']
+        frame_number: int = dl_item['video_frame_number']
+        frame_time: float = dl_item['video_frame_time']
         frame_u8 = get_frame_without_crashing(
             video_path, frame_number, frame_time)
         predictions = predictor(frame_u8)
@@ -324,7 +325,7 @@ def eval_daly_action(workfolder, cfg_dict, add_args):
     dataset.populate_from_folder(cf['dataset.cache_folder'])
     split_label = cf['dataset.subset']
     split_vids = get_daly_split_vids(dataset, split_label)
-    datalist = daly_to_datalist_pfadet(dataset, split_vids)
+    datalist: Datalist = daly_to_datalist_pfadet(dataset, split_vids)
     cls_names = dataset.action_names
 
     TEST_DATASET_NAME = 'daly_pfadet_test'
@@ -356,7 +357,7 @@ def eval_daly_object(workfolder, cfg_dict, add_args):
     dataset.populate_from_folder(cf['dataset.cache_folder'])
     split_label = cf['dataset.subset']
     split_vids = get_daly_split_vids(dataset, split_label)
-    datalist = simplest_daly_to_datalist_v2(dataset, split_vids)
+    datalist: Datalist = simplest_daly_to_datalist_v2(dataset, split_vids)
 
     cls_names, datalist_converter = \
             _datalist_hacky_converter(cf, dataset)

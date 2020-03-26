@@ -1,38 +1,22 @@
 import cv2
-import sys
-import copy
 import torch
 import logging
 import logging.handlers
-import threading
 import argparse
 import time
 import yacs
-import re
-import yaml
-import collections
-import pprint
 import os
-import random
 import numpy as np
-import pandas as pd
 import multiprocessing
 from collections import OrderedDict
-from collections import deque
 from tqdm import tqdm
-from abc import abstractmethod, ABC
-from pathlib import Path
-from typing import Dict, List, Tuple
-from mypy_extensions import TypedDict
 
 from detectron2.config import get_cfg
 from detectron2.engine.defaults import DefaultPredictor
-from detectron2.utils.video_visualizer import VideoVisualizer
 from detectron2.utils.visualizer import ColorMode, Visualizer
 from detectron2.data.detection_utils import read_image
 from detectron2.engine import (
-        DefaultTrainer, default_argument_parser,
-        default_setup, hooks, launch)
+        DefaultTrainer, hooks)
 from detectron2.data.datasets.pascal_voc import register_pascal_voc
 from detectron2.evaluation import (
     CityscapesEvaluator,
@@ -47,27 +31,22 @@ from detectron2.evaluation import (
 import detectron2.utils.comm as comm
 from detectron2.modeling import GeneralizedRCNNWithTTA
 from detectron2.checkpoint import DetectionCheckpointer
-from detectron2.structures import BoxMode
 from detectron2.data import DatasetCatalog, MetadataCatalog
-from detectron2.data import detection_utils as d2_dutils
-from detectron2.data import transforms as d2_transforms
-from detectron2.data import (
-        build_detection_train_loader,
-        build_detection_test_loader)
-from PIL import Image
-from fvcore.common.file_io import PathManager
 
 from vsydorov_tools import small
 from vsydorov_tools import cv as vt_cv
 
 from thes.tools import snippets
 from thes.data.dataset.external import DatasetVOC2007, DatasetDALY
-from thes.det2 import (
+from thes.detectron.cfg import (
         YAML_Base_RCNN_C4, YAML_faster_rcnn_R_50_C4,
-        launch_w_logging, launch_without_logging, simple_d2_setup,
-        base_d2_frcnn_config, set_d2_cthresh, D2DICT_GPU_SCALING_DEFAULTS,
-        get_frame_without_crashing)
-from thes.daly_d2 import simplest_daly_to_datalist
+        base_d2_frcnn_config, set_d2_cthresh)
+from thes.detectron.internals import (
+        launch_w_logging,)
+from thes.detectron.externals import (
+        simple_d2_setup, get_frame_without_crashing)
+from thes.detectron.daly import (
+        get_daly_split_vids, simplest_daly_to_datalist_v2,)
 
 
 log = logging.getLogger(__name__)
@@ -425,9 +404,10 @@ def demo_d2_dalyobj_vis(workfolder, cfg_dict, add_args):
     dataset.populate_from_folder(cf['dataset.cache_folder'])
 
     datalist_per_split = {}
-    for split in ['train', 'test']:
-        datalist = simplest_daly_to_datalist(dataset, split)
-        datalist_per_split[split] = datalist
+    for split_label in ['train', 'test']:
+        split_vids = get_daly_split_vids(dataset, split_label)
+        datalist = simplest_daly_to_datalist_v2(dataset, split_vids)
+        datalist_per_split[split_label] = datalist
 
     for split, datalist in datalist_per_split.items():
         d2_dataset_name = f'dalyobjects_{split}'
@@ -540,9 +520,10 @@ def evaldemo_d2_dalyobj_old(workfolder, cfg_dict, add_args):
 
     # D2 dataset compatible list of keyframes
     datalist_per_split = {}
-    for split in ['train', 'test']:
-        datalist = simplest_daly_to_datalist(dataset, split)
-        datalist_per_split[split] = datalist
+    for split_label in ['train', 'test']:
+        split_vids = get_daly_split_vids(dataset, split_label)
+        datalist = simplest_daly_to_datalist_v2(dataset, split_vids)
+        datalist_per_split[split_label] = datalist
 
     for split, datalist in datalist_per_split.items():
         d2_dataset_name = f'dalyobjects_{split}'
