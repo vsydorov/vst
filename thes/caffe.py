@@ -9,8 +9,8 @@ from vsydorov_tools import small
 log = logging.getLogger(__name__)
 
 
-# NICPHIL_RCNN_CAFFE_PATH = '/home/vsydorov/projects/deployed/2019_12_Thesis/links/scratch2/30_nicolas_rcnn_hackery/caffe/py-faster-rcnn/caffe-fast-rcnn/python'
-NICPHIL_RCNN_CAFFE_PATH = Path('/home/vsydorov/projects/deployed/2019_12_Thesis/links/scratch2/40_recompiled_caffe/caffe/py-faster-rcnn/caffe-fast-rcnn/python')
+# NICPHIL_RCNN_CAFFE_PATH = Path('/home/vsydorov/projects/deployed/2019_12_Thesis/links/scratch2/40_recompiled_caffe/caffe/py-faster-rcnn/caffe-fast-rcnn/python')
+NICPHIL_RCNN_CAFFE_PATH = Path('/home/vsydorov/projects/deployed/2019_12_Thesis/links/scratch2/50_recompiled_caffe_py3.8/caffe/py-faster-rcnn/caffe-fast-rcnn/python')
 NICPHIL_RCNN_MODEL_PATH = Path('/home/vsydorov/projects/deployed/2019_12_Thesis/links/scratch2/30_nicolas_rcnn_hackery/models')
 
 
@@ -117,3 +117,24 @@ def get_scores_per_frame_RGB(
         scores = cls_prob.flatten()
         tube_scores.append(scores)
     return tube_scores
+
+
+def get_boxscores_from_BGR_frame(
+        net, frame_BGR, boxes,
+        PIXEL_MEANS, TEST_SCALES, TEST_MAX_SIZE
+        ) -> np.ndarray:
+    """
+    """
+    blob_, im_scale_factors = model_test_get_image_blob(
+            frame_BGR, PIXEL_MEANS, TEST_SCALES, TEST_MAX_SIZE)
+    blob = blob_.transpose(0, 3, 1, 2)  # 1, H, W, 3 --> 1, 3, H, W
+    im_scale_factor = im_scale_factors[0]
+
+    net.blobs['data'].reshape(*blob.shape)
+    net.blobs['data'].data[...] = blob
+    sc_boxes = boxes * im_scale_factor
+    boxes5 = np.c_[np.zeros(len(sc_boxes)), sc_boxes]
+    net.blobs['rois'].reshape(len(boxes5), 5)
+    net.blobs['rois'].data[...] = boxes5
+    cls_prob = net.forward()['cls_prob']
+    return cls_prob

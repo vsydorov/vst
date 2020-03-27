@@ -5,13 +5,15 @@ import re
 import cv2
 import numpy as np
 from tqdm import tqdm
-from typing import (Dict, List, TypeVar, cast)
+from pathlib import Path
+from typing import (List, Tuple, Dict, List, TypeVar, cast, TypedDict, Set)  # NOQA
 
 from vsydorov_tools import small
 from vsydorov_tools import cv as vt_cv
 
 from thes.tools import snippets
-from thes.caffe import (nicolas_net, get_scores_per_frame_RGB)
+from thes.caffe import (nicolas_net, get_scores_per_frame_RGB,
+        get_boxscores_from_BGR_frame)
 from thes.data.tubes.types import (
     DALY_wein_tube,
     DALY_wein_tube_index, DALY_gt_tube_index,
@@ -43,6 +45,16 @@ from thes.evaluation.routines import (
 )
 
 
+log = logging.getLogger(__name__)
+
+
+class Box_connections_dwti(TypedDict):
+    vid: DALY_vid
+    frame_ind: int
+    dwti_sources: List[DALY_wein_tube_index]  # N
+    boxes: List[np.ndarray]  # N, 4
+
+
 def computeprint_recall_ap_for_avtubes(
         av_gt_tubes: AV_dict[Frametube],
         av_stubes: AV_dict[Sframetube],
@@ -62,9 +74,6 @@ def computeprint_recall_ap_for_avtubes(
     log.info('Spatiotemp Recall:\n{}'.format(table_recall_st))
     log.info('Spatial AP:\n{}'.format(table_ap_s))
     log.info('Spatiotemp AP:\n{}'.format(table_ap_st))
-
-
-log = logging.getLogger(__name__)
 
 
 def _set_defcfg_dataset_seed(cfg):
@@ -110,23 +119,35 @@ def _set_defcfg_rcnn(cfg):
     """)
 
 
-def _resolve_tubes(
-        cf, av_gt_tubes, split_vids
-        ) -> Dict[DALY_wein_tube_index, Frametube]:
-    # // Define tubes
+def resolve_wein_tubes(
+        av_gt_tubes: AV_dict[Frametube],
+        split_vids: List[DALY_vid],
+        wein_path: Path,
+        l_enabled: bool,
+        l_keeptemp: bool):
+    dwein_tubes: Dict[DALY_wein_tube_index, DALY_wein_tube] = \
+            small.load_pkl(wein_path)
+    dwein_tubes = dtindex_filter_split(dwein_tubes, split_vids)
+    # Convert dwein_tubes to sparse tubes
+    ftubes = {k: convert_dwein_tube(t) for k, t in dwein_tubes.items()}
+    # Filter tubes optionally
+    if l_enabled:
+        ftubes = filter_tube_keyframes_only_gt_v2(
+                ftubes, av_gt_tubes, l_keeptemp)
+    return ftubes
 
+
+def _resolve_tubes(
+        cf,
+        av_gt_tubes: AV_dict[Frametube],
+        split_vids: List[DALY_vid]
+        ) -> Dict[DALY_wein_tube_index, Frametube]:
     ftubes: Dict[DALY_wein_tube_index, Frametube]
     if cf['tubes.source'] == 'wein':
-        dwein_tubes: Dict[DALY_wein_tube_index, DALY_wein_tube] = \
-                small.load_pkl(cf['tubes.wein.path'])
-        dwein_tubes = dtindex_filter_split(dwein_tubes, split_vids)
-        # Convert dwein_tubes to sparse tubes
-        ftubes = {k: convert_dwein_tube(t) for k, t in dwein_tubes.items()}
-        # Filter tubes optionally
-        if cf['tubes.wein.leave_only_gt_keyframes.enabled']:
-            keep_temporal = cf['tubes.wein.leave_only_gt_keyframes.keep_temporal']
-            ftubes = filter_tube_keyframes_only_gt_v2(
-                    ftubes, av_gt_tubes, keep_temporal)
+        ftubes = resolve_wein_tubes(
+                av_gt_tubes, split_vids, cf['tubes.wein.path'],
+                cf['tubes.wein.leave_only_gt_keyframes.enabled'],
+                cf['tubes.wein.leave_only_gt_keyframes.keep_temporal'])
     elif cf['tubes.source'] == 'gt':
         raise NotImplementedError()
     else:
@@ -358,6 +379,55 @@ def _parcel_management(cf, tubes_per_video):
     log.info('split_stats:\n{}'.format(split_stats))
     return ctubes_per_video
 
+
+def get_daly_keyframes(dataset, split_vids) -> Dict[DALY_vid, np.ndarray]:
+    to_cover_: Dict[DALY_vid, Set] = {}
+    for vid in split_vids:
+        v = dataset.video_odict[vid]
+        for action_name, instances in v['instances'].items():
+            for ins_ind, instance in enumerate(instances):
+                keyframes = [kf['frameNumber'] for kf in instance['keyframes']]
+                to_cover_[vid] = to_cover_.get(vid, set()) | set(list(keyframes))
+    frames_to_cover = \
+            {k: np.array(sorted(v)) for k, v in to_cover_.items()}
+    return frames_to_cover
+
+
+def prepare_ftube_box_computations(
+        ftubes: Dict[DALY_wein_tube_index, Frametube],
+        frames_to_cover: Dict[DALY_vid, np.ndarray]
+        ) -> Dict[DALY_vid, Dict[int, Box_connections_dwti]]:
+    # Assign boxes (and keep connections to original ftubes)
+    vf_connections_dwti_list: Dict[DALY_vid, Dict[int,
+        List[Tuple[DALY_wein_tube_index, np.ndarray]]]] = {}
+    for dwt_index, tube in ftubes.items():
+        (vid, bunch_id, tube_id) = dwt_index
+        tube_finds = tube['frame_inds']
+        good_finds = frames_to_cover[vid]
+        common_finds, comm1, comm2 = np.intersect1d(
+            tube_finds, good_finds, assume_unique=True, return_indices=True)
+        if len(common_finds) == 0:
+            continue
+        good_tube_boxes = tube['boxes'][comm1]
+        for find, box in zip(common_finds, good_tube_boxes):
+            (vf_connections_dwti_list
+                .setdefault(vid, {})
+                .setdefault(find, []).append((dwt_index, box)))
+    # Prettify
+    vf_connections_dwti: Dict[DALY_vid, Dict[int, Box_connections_dwti]] = {}
+    for vid, f_connections_dwti_list in vf_connections_dwti_list.items():
+        for find, connections_dwti_list in f_connections_dwti_list.items():
+            lsources, lboxes = zip(*connections_dwti_list)
+            boxes = np.vstack(lboxes)
+            bcs: Box_connections_dwti = {
+                'vid': vid,
+                'frame_ind': find,
+                'dwti_sources': lsources,
+                'boxes': boxes
+            }
+            vf_connections_dwti.setdefault(vid, {})[find] = bcs
+    return vf_connections_dwti
+
 # Experiments
 
 
@@ -468,7 +538,7 @@ def assign_objactions_to_tubes(workfolder, cfg_dict, add_args):
             av_gt_tubes, av_stubes, iou_thresholds)
 
 
-def eval_daly_tubes_RGB(workfolder, cfg_dict, add_args):
+def apply_pncaffe_rcnn_in_frames(workfolder, cfg_dict, add_args):
     """
     Run Philippes/Nicolas caffe model to extract 'rcnn scores'
     """
@@ -483,6 +553,12 @@ def eval_daly_tubes_RGB(workfolder, cfg_dict, add_args):
         chunk: [0, "VALUE >= 0"]
         total: [1, int]
     save_period: ['::10', str]
+    tube_eval:
+        nms:
+            enabled: [True, bool]
+            thresh: [0.5, float]
+        params:
+            iou_thresholds: [[0.3, 0.5, 0.7], list]
     """)
     cf = cfg.parse()
     PIXEL_MEANS = cf['rcnn.PIXEL_MEANS']
@@ -491,52 +567,98 @@ def eval_daly_tubes_RGB(workfolder, cfg_dict, add_args):
 
     dataset = DatasetDALY()
     dataset.populate_from_folder(cf['dataset.cache_folder'])
+    split_label = cf['dataset.subset']
+    split_vids = get_daly_split_vids(dataset, split_label)
+    av_gt_tubes: AV_dict[Frametube] = \
+            convert_dgt_tubes(get_daly_gt_tubes(dataset))
+    av_gt_tubes = av_filter_split(av_gt_tubes, split_vids)
+    ftubes: Dict[DALY_wein_tube_index, Frametube] = \
+            _resolve_tubes(cf, av_gt_tubes, split_vids)
 
-    tubes_per_video = _set_tubes(cf, dataset)
-
-    # Cover demo case
-    if cf['demo_run']:
-        some_tubes = sample_some_tubes(
-                tubes_per_video, N=10, NP_SEED=0)
-        _perform_tube_demovis(dataset, some_tubes, out,
-                PIXEL_MEANS, TEST_SCALES, TEST_MAX_SIZE)
-        return
-
-    # // Computation of the parcels inside chosen chunk
-    chunk = (cf['compute.chunk'], cf['compute.total'])
-    cc, ct = chunk
-
-    key_indices = np.arange(len(tubes_per_video))
-    key_list = list(tubes_per_video.keys())
-    chunk_indices = np.array_split(key_indices, ct)[cc]
-    chunk_keys = [key_list[i] for i in chunk_indices]
-    # chunk_tubes = {k: tubes_per_video[k] for k in chunk_keys}
-    log.info('Chunk {}: {} -> {}'.format(
-        chunk, len(key_indices), len(chunk_indices)))
+    # Cover only keyframes when evaluating dwti tubes
+    frames_to_cover = get_daly_keyframes(dataset, split_vids)
+    vf_connections_dwti: Dict[DALY_vid, Dict[int, Box_connections_dwti]] = \
+            prepare_ftube_box_computations(ftubes, frames_to_cover)
 
     net = nicolas_net()
 
-    def tube_eval_func(k):
-        tube = tubes_per_video[k]
-        (vid, bunch_id, tube_id) = k
+    def isaver_eval_func(vid):
+        f_connections_dwti = vf_connections_dwti[vid]
         vmp4 = dataset.source_videos[vid]
         video_path = vmp4['video_path']
-        frame_inds = tube['frame_inds']
-        # scorefold/f'scores_{video_name}_{tube_id:04d}.pkl')(
+        finds = list(f_connections_dwti)
         with vt_cv.video_capture_open(video_path) as vcap:
             frames_u8 = vt_cv.video_sample(
-                    vcap, frame_inds, debug_filename=video_path)
-        scores_per_frame = get_scores_per_frame_RGB(
-                net, tube, frames_u8,
-                PIXEL_MEANS, TEST_SCALES, TEST_MAX_SIZE)
-        return scores_per_frame
+                    vcap, finds, debug_filename=video_path)
+        f_cls_probs = {}
+        for find, frame_BGR in zip(finds, frames_u8):
+            connections_dwti = f_connections_dwti[find]
+            boxes = connections_dwti['boxes']
+            cls_probs = get_boxscores_from_BGR_frame(
+                    net, frame_BGR, boxes,
+                    PIXEL_MEANS, TEST_SCALES, TEST_MAX_SIZE)  # N, 11
+            f_cls_probs[find] = cls_probs
+        return f_cls_probs
 
-    df_isaver = snippets.Simple_isaver(
-            small.mkdir(out/'tube_eval_isaver'),
-            chunk_keys, tube_eval_func, cf['save_period'], 120)
-    predicted_tubescores = df_isaver.run()
-    tubescores_dict = dict(zip(chunk_keys, predicted_tubescores))
-    small.save_pkl(out/'tubescores_dict.pkl', tubescores_dict)
+    isaver_keys = list(vf_connections_dwti.keys())
+    isaver = snippets.Simple_isaver(
+            small.mkdir(out/'isave_caffe_vid_eval'),
+            isaver_keys, isaver_eval_func, cf['save_period'], 120)
+
+    isaver_items = isaver.run()
+    vf_cls_probs: Dict[DALY_vid, Dict[int, np.ndarray]]
+    vf_cls_probs = dict(zip(isaver_keys, isaver_items))
+
+    # Pretty clear we'll be summing up the scores anyway
+    ftube_scores = {k: np.zeros(11) for k in ftubes}
+    for vid, f_cls_probs in vf_cls_probs.items():
+        for f, cls_probs in f_cls_probs.items():
+            dwtis = vf_connections_dwti[vid][f]['dwti_sources']
+            for dwti, prob in zip(dwtis, cls_probs):
+                ftube_scores[dwti] += prob
+
+    # Create av_stubes
+    av_stubes: AV_dict[Sframetube] = {}
+    for dwt_index, tube in ftubes.items():
+        (vid, bunch_id, tube_id) = dwt_index
+        for action_name, score in zip(
+                dataset.action_names, ftube_scores[dwt_index]):
+            stube = tube.copy()
+            stube['score'] = score
+            stube = cast(Sframetube, stube)
+            (av_stubes
+                    .setdefault(action_name, {})
+                    .setdefault(vid, []).append(stube))
+    # filter score
+    av_stubes = av_stubes_above_score(av_stubes, 0.05)
+
+    # [optionally] Apply per-class NMS
+    if cf['tube_eval.nms.enabled']:
+        tube_nms_thresh = cf['tube_eval.nms.thresh']
+        av_stubes = compute_nms_for_av_stubes(av_stubes, tube_nms_thresh)
+    iou_thresholds = cf['tube_eval.params.iou_thresholds']
+    computeprint_recall_ap_for_avtubes(
+            av_gt_tubes, av_stubes, iou_thresholds)
+
+    # # Cover demo case
+    # if cf['demo_run']:
+    #     some_tubes = sample_some_tubes(
+    #             ftubes, N=10, NP_SEED=0)
+    #     _perform_tube_demovis(dataset, some_tubes, out,
+    #             PIXEL_MEANS, TEST_SCALES, TEST_MAX_SIZE)
+    #     return
+    #
+    # # // Computation of the parcels inside chosen chunk
+    # chunk = (cf['compute.chunk'], cf['compute.total'])
+    # cc, ct = chunk
+    #
+    # key_indices = np.arange(len(tubes_per_video))
+    # key_list = list(tubes_per_video.keys())
+    # chunk_indices = np.array_split(key_indices, ct)[cc]
+    # chunk_keys = [key_list[i] for i in chunk_indices]
+    # log.info('Chunk {}: {} -> {}'.format(
+    #     chunk, len(key_indices), len(chunk_indices)))
+    # small.save_pkl(out/'tubescores_dict.pkl', tubescores_dict)
 
 
 def hacky_gather_evaluated_tubes(workfolder, cfg_dict, add_args):

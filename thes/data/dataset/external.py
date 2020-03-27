@@ -21,7 +21,6 @@ from typing import Dict, List, Tuple, cast, NewType, Any
 from vsydorov_tools import small, cv as vt_cv
 
 from thes.filesystem import get_dataset_path
-from thes.tools import snippets
 
 
 log = logging.getLogger(__name__)

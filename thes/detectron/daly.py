@@ -5,12 +5,12 @@ import numpy as np
 import pandas as pd
 import copy
 from pathlib import Path
-from typing import (List, Dict, Tuple, cast, TypedDict, Callable, Optional)
+from typing import (List, Dict, Tuple, cast, TypedDict, Callable, Optional, Literal)
 
 from detectron2.structures import BoxMode  # type: ignore
 
 from thes.data.dataset.external import (
-        DALY_vid, DALY_action_name, DALY_object_name)
+        DatasetDALY, DALY_vid, DALY_action_name, DALY_object_name)
 
 
 class Dl_anno(TypedDict):
@@ -35,15 +35,18 @@ class Dl_record(TypedDict):
 Datalist = List[Dl_record]
 
 
-def get_daly_split_vids(dataset, split_label):
-    split_vids = [vid for vid, split in dataset.split.items()
-            if split == split_label]
+def get_daly_split_vids(
+        dataset: DatasetDALY,
+        split_label: Literal['train', 'test']
+        ) -> List[DALY_vid]:
+    split_vids = [
+        vid for vid, split in dataset.split.items() if split == split_label]
     if split_label == 'train':
         split_size = 310
     elif split_label == 'test':
         split_size = 200
     else:
-        split_size = None
+        raise RuntimeError()
     assert len(split_vids) == split_size
     return split_vids
 

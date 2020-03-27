@@ -1,4 +1,5 @@
 import logging
+import warnings
 import numpy as np
 from abc import abstractmethod, ABC
 from thes.data.dataset.external import (
@@ -324,6 +325,11 @@ class AP_computer(ABC):
                 ) -> float:
         fgts = self.fgts
         fdets = self.fdets
+        if len(fgts) == 0:
+            raise RuntimeError("Can't have 0 groundtruth")
+        if len(fdets) == 0:
+            warnings.warn('No detections when computing ap')
+            return np.nan
         gt_already_matched = np.zeros(len(fgts), dtype=bool)
         nd = len(fdets)
         tp = np.zeros(nd)
@@ -438,6 +444,9 @@ class AP_tube_computer(AP_computer):
     def _prepare_computation(self):
         fgts = self.fgts
         fdets = self.fdets
+        if len(fdets) == 0:
+            self._possible_matches_per_detection = {}
+            return
         # Group fdets belonging to same vid
         ifdet_vid_groups: Dict[DALY_vid, List[int]] = {}
         for ifdet, fdet in enumerate(fdets):
