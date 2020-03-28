@@ -83,58 +83,26 @@ def model_test_get_image_blob(im, PIXEL_MEANS, TEST_SCALES, TEST_MAX_SIZE):
     return blob, np.array(im_scale_factors)
 
 
-def get_scores_per_frame_RGB(
-        net, tube, frames_u8,
-        PIXEL_MEANS, TEST_SCALES, TEST_MAX_SIZE):
-    """
-    Score per frame for NIC RGB
-    """
-    tube_scores = []
-    for i, frame_BGR in enumerate(frames_u8):
-        # Image resizing
+class Nicolas_net_helper(object):
+    def __init__(self, PIXEL_MEANS, TEST_SCALES, TEST_MAX_SIZE):
+        self.net = nicolas_net()
+        self.PIXEL_MEANS = PIXEL_MEANS
+        self.TEST_SCALES = TEST_SCALES
+        self.TEST_MAX_SIZE = TEST_MAX_SIZE
+
+    def score_boxes(self, frame_BGR, boxes) -> np.ndarray:
+        net = self.net
         blob_, im_scale_factors = model_test_get_image_blob(
-                frame_BGR, PIXEL_MEANS, TEST_SCALES, TEST_MAX_SIZE)
+            frame_BGR, self.PIXEL_MEANS, self.TEST_SCALES, self.TEST_MAX_SIZE)
         blob = blob_.transpose(0, 3, 1, 2)  # 1, H, W, 3 --> 1, 3, H, W
         im_scale_factor = im_scale_factors[0]
 
         net.blobs['data'].reshape(*blob.shape)
         net.blobs['data'].data[...] = blob
-
-        # Put in the sole ROI
-        box = tube['boxes'][i]
-        box5 = np.r_[0, box]
-        box5 = box5 * im_scale_factor
-        _, l, t_, r, d = map(int, box5)
-        net.blobs['rois'].reshape(1, 5)
-        net.blobs['rois'].data[...] = box5
+        sc_boxes = boxes * im_scale_factor
+        boxes5 = np.c_[np.zeros(len(sc_boxes)), sc_boxes]
+        net.blobs['rois'].reshape(len(boxes5), 5)
+        net.blobs['rois'].data[...] = boxes5
         cls_prob = net.forward()['cls_prob']
-        """
-        import cv2
-        imshow(np.clip(blob_[0] + PIXEL_MEANS, 1, 254)/255)
-        im2 = cv2.rectangle(im.copy(), (l, t_), (r, d), (255, 255, 0), thickness=2)
-        # printing
-        """
-        scores = cls_prob.flatten()
-        tube_scores.append(scores)
-    return tube_scores
-
-
-def get_boxscores_from_BGR_frame(
-        net, frame_BGR, boxes,
-        PIXEL_MEANS, TEST_SCALES, TEST_MAX_SIZE
-        ) -> np.ndarray:
-    """
-    """
-    blob_, im_scale_factors = model_test_get_image_blob(
-            frame_BGR, PIXEL_MEANS, TEST_SCALES, TEST_MAX_SIZE)
-    blob = blob_.transpose(0, 3, 1, 2)  # 1, H, W, 3 --> 1, 3, H, W
-    im_scale_factor = im_scale_factors[0]
-
-    net.blobs['data'].reshape(*blob.shape)
-    net.blobs['data'].data[...] = blob
-    sc_boxes = boxes * im_scale_factor
-    boxes5 = np.c_[np.zeros(len(sc_boxes)), sc_boxes]
-    net.blobs['rois'].reshape(len(boxes5), 5)
-    net.blobs['rois'].data[...] = boxes5
-    cls_prob = net.forward()['cls_prob']
-    return cls_prob
+        cls_prob_copy = cls_prob.copy()  # Very important
+        return cls_prob_copy

@@ -12,8 +12,7 @@ from vsydorov_tools import small
 from vsydorov_tools import cv as vt_cv
 
 from thes.tools import snippets
-from thes.caffe import (nicolas_net, get_scores_per_frame_RGB,
-        get_boxscores_from_BGR_frame)
+from thes.caffe import (Nicolas_net_helper)
 from thes.data.tubes.types import (
     DALY_wein_tube,
     DALY_wein_tube_index, DALY_gt_tube_index,
@@ -561,10 +560,8 @@ def apply_pncaffe_rcnn_in_frames(workfolder, cfg_dict, add_args):
             iou_thresholds: [[0.3, 0.5, 0.7], list]
     """)
     cf = cfg.parse()
-    PIXEL_MEANS = cf['rcnn.PIXEL_MEANS']
-    TEST_SCALES = cf['rcnn.TEST_SCALES']
-    TEST_MAX_SIZE = cf['rcnn.TEST_MAX_SIZE']
-
+    neth = Nicolas_net_helper(cf['rcnn.PIXEL_MEANS'],
+            cf['rcnn.TEST_SCALES'], cf['rcnn.TEST_MAX_SIZE'])
     dataset = DatasetDALY()
     dataset.populate_from_folder(cf['dataset.cache_folder'])
     split_label = cf['dataset.subset']
@@ -580,8 +577,6 @@ def apply_pncaffe_rcnn_in_frames(workfolder, cfg_dict, add_args):
     vf_connections_dwti: Dict[DALY_vid, Dict[int, Box_connections_dwti]] = \
             prepare_ftube_box_computations(ftubes, frames_to_cover)
 
-    net = nicolas_net()
-
     def isaver_eval_func(vid):
         f_connections_dwti = vf_connections_dwti[vid]
         vmp4 = dataset.source_videos[vid]
@@ -594,9 +589,7 @@ def apply_pncaffe_rcnn_in_frames(workfolder, cfg_dict, add_args):
         for find, frame_BGR in zip(finds, frames_u8):
             connections_dwti = f_connections_dwti[find]
             boxes = connections_dwti['boxes']
-            cls_probs = get_boxscores_from_BGR_frame(
-                    net, frame_BGR, boxes,
-                    PIXEL_MEANS, TEST_SCALES, TEST_MAX_SIZE)  # N, 11
+            cls_probs = neth.score_boxes(frame_BGR, boxes)  # N, 11
             f_cls_probs[find] = cls_probs
         return f_cls_probs
 
