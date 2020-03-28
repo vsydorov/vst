@@ -419,7 +419,6 @@ def _demovis_apply_pncaffe_rcnn(
         vmp4 = dataset.source_videos[vid]
         video_path = vmp4['video_path']
         finds = list(f_connections_dwti)
-
         with vt_cv.video_capture_open(video_path) as vcap:
             frames_u8 = vt_cv.video_sample(
                     vcap, finds, debug_filename=video_path)
@@ -429,30 +428,27 @@ def _demovis_apply_pncaffe_rcnn(
         for find, frame_BGR in zip(finds, frames_u8):
             connections_dwti = f_connections_dwti[find]
             boxes = connections_dwti['boxes']
-            cls_probs = neth.score_boxes(frame_BGR, boxes)  # N, (bcg+10)
+            box_cls_probs = neth.score_boxes(frame_BGR, boxes)  # N, (bcg+10)
+            # Draw and print
+            txt_output = []
+            image = frame_BGR.copy()
+            for i, cls_probs in enumerate(box_cls_probs):
+                box = boxes[i]
+                best_score_id = np.argmax(cls_probs)
+                best_score = cls_probs[best_score_id]
+                best_nicolas_label = nicolas_labels[best_score_id]
+                snippets.cv_put_box_with_text(image, box,
+                    text='{} {} {:.2f}'.format(
+                        i, best_nicolas_label, best_score))
+                line = (' '.join([f'{y}: {x:.3f}'
+                    for x, y in zip(cls_probs, nicolas_labels)])
+                    + str(box))
+                txt_output.append(line)
+            cv2.imwrite(str(
+                video_fold/'Fr{:05d}.png'.format(find)), image)
+            with (video_fold/f'Fr{find:05d}_scores.txt').open('w') as f:
+                f.write('\n'.join(txt_output))
 
-        txt_output = []
-        for i, (frame, score) in enumerate(zip(frames_u8, scores_per_frame)):
-            image = frame.copy()
-            box = tube['boxes'][i]
-            real_framenum = tube['frame_inds'][i]
-            best_score_id = np.argmax(score)
-            best_score = score[best_score_id]
-            best_nicolas_label = nicolas_labels[best_score_id]
-            snippets.cv_put_box_with_text(
-                    image, box,
-                    text='{} {} {} {:.2f}'.format(
-                        i, real_framenum,
-                        best_nicolas_label, best_score))
-            line = ' '.join([f'{y}: {x:.3f}'
-                for x, y in zip(score, nicolas_labels)])
-            txt_output.append(line)
-            cv2.imwrite(
-                    str(video_fold/'frame{:03d}_{:03d}.jpg'.format(
-                        i, real_framenum)),
-                    image)
-        with (video_fold/'scores.txt').open('w') as f:
-            f.write('\n'.join(txt_output))
 
 # Experiments
 
@@ -590,10 +586,9 @@ def apply_pncaffe_rcnn_in_frames(workfolder, cfg_dict, add_args):
 
     if cf['demo_run']:
         vf_connections_dwti = sample_dict(
-            vf_connections_dwti, N=10, NP_SEED=0)
+            vf_connections_dwti, N=5, NP_SEED=0)
         _demovis_apply_pncaffe_rcnn(
                 neth, dataset, vf_connections_dwti, out)
-        raise NotImplementedError()
         return
 
     def isaver_eval_func(vid):
