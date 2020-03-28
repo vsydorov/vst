@@ -85,37 +85,85 @@ def _set_defcfg_dataset_seed(cfg):
     """)
 
 
-def _set_defcfg_tubes_old(cfg):
-    cfg.set_deftype("""
-    tubes:
-        imported_wein_tubes: [~, ~]
-        filter_gt: [False, bool]
-    """)
+class Ncfg_tubes:
+    @staticmethod
+    def set_defcfg(cfg):
+        """
+        wein.leave_only_gt_keyframes:
+            only keyframes that overlap with gt keyframes are left
+        """
+        cfg.set_deftype("""
+        tubes:
+            source: ['wein', ['wein', 'gt']]
+            wein:
+                path: [~, ~]
+                leave_only_gt_keyframes:
+                    enabled: [False, bool]
+                    keep_temporal: [True, bool]
+        """)
+
+    @staticmethod
+    def resolve_tubes(
+            cf,
+            av_gt_tubes: AV_dict[Frametube],
+            split_vids: List[DALY_vid]
+            ) -> Dict[DALY_wein_tube_index, Frametube]:
+        ftubes: Dict[DALY_wein_tube_index, Frametube]
+        if cf['tubes.source'] == 'wein':
+            ftubes = resolve_wein_tubes(
+                    av_gt_tubes, split_vids, cf['tubes.wein.path'],
+                    cf['tubes.wein.leave_only_gt_keyframes.enabled'],
+                    cf['tubes.wein.leave_only_gt_keyframes.keep_temporal'])
+        elif cf['tubes.source'] == 'gt':
+            raise NotImplementedError()
+        else:
+            raise NotImplementedError()
+        return ftubes
 
 
-def _set_defcfg_tubes(cfg):
-    """
-    wein.leave_only_gt_keyframes:
-        only keyframes that overlap with gt keyframes are left
-    """
-    cfg.set_deftype("""
-    tubes:
-        source: ['wein', ['wein', 'gt']]
-        wein:
-            path: [~, ~]
-            leave_only_gt_keyframes:
-                enabled: [False, bool]
-                keep_temporal: [True, bool]
-    """)
+class Ncfg_nicphil_rcnn:
+    @staticmethod
+    def set_defcfg(cfg):
+        cfg.set_defaults("""
+        rcnn:
+            PIXEL_MEANS: [102.9801, 115.9465, 122.7717]
+            TEST_SCALES: [600,]
+            TEST_MAX_SIZE: 1000
+        """)
+
+    @staticmethod
+    def resolve_helper(cf):
+        neth = Nicolas_net_helper(cf['rcnn.PIXEL_MEANS'],
+                cf['rcnn.TEST_SCALES'], cf['rcnn.TEST_MAX_SIZE'])
+        return neth
 
 
-def _set_defcfg_rcnn(cfg):
-    cfg.set_defaults("""
-    rcnn:
-        PIXEL_MEANS: [102.9801, 115.9465, 122.7717]
-        TEST_SCALES: [600,]
-        TEST_MAX_SIZE: 1000
-    """)
+class Ncfg_tube_eval:
+    @staticmethod
+    def set_defcfg(cfg):
+        cfg.set_deftype("""
+        tube_eval:
+            enabled: [True, bool]
+            minscore_cutoff: [0.05, float]
+            nms:
+                enabled: [True, bool]
+                thresh: [0.5, float]
+            iou_thresholds: [[0.3, 0.5, 0.7], list]
+        """)
+
+    @staticmethod
+    def evalprint_if(cf,
+            av_stubes: AV_dict[Sframetube],
+            av_gt_tubes: AV_dict[Frametube]):
+        if not cf['tube_eval.enabled']:
+            return
+        av_stubes = av_stubes_above_score(
+                av_stubes, cf['tube_eval.minscore_cutoff'])
+        if cf['tube_eval.nms.enabled']:
+            av_stubes = compute_nms_for_av_stubes(
+                    av_stubes, cf['tube_eval.nms.thresh'])
+        computeprint_recall_ap_for_avtubes(
+                av_gt_tubes, av_stubes, cf['tube_eval.iou_thresholds'])
 
 
 def resolve_wein_tubes(
@@ -133,24 +181,6 @@ def resolve_wein_tubes(
     if l_enabled:
         ftubes = filter_tube_keyframes_only_gt_v2(
                 ftubes, av_gt_tubes, l_keeptemp)
-    return ftubes
-
-
-def _resolve_tubes(
-        cf,
-        av_gt_tubes: AV_dict[Frametube],
-        split_vids: List[DALY_vid]
-        ) -> Dict[DALY_wein_tube_index, Frametube]:
-    ftubes: Dict[DALY_wein_tube_index, Frametube]
-    if cf['tubes.source'] == 'wein':
-        ftubes = resolve_wein_tubes(
-                av_gt_tubes, split_vids, cf['tubes.wein.path'],
-                cf['tubes.wein.leave_only_gt_keyframes.enabled'],
-                cf['tubes.wein.leave_only_gt_keyframes.keep_temporal'])
-    elif cf['tubes.source'] == 'gt':
-        raise NotImplementedError()
-    else:
-        raise NotImplementedError()
     return ftubes
 
 
@@ -200,16 +230,12 @@ def _resolve_actobjects(cf, dataset, split_vids):
     return objactions_vf
 
 
-def sample_some_tubes(
-        tubes_per_video: Dict[DALY_wein_tube_index, DALY_wein_tube],
-        N=10, NP_SEED=0
-        ) -> Dict[DALY_wein_tube_index, DALY_wein_tube]:
+def sample_dict(dct: Dict, N=10, NP_SEED=0) -> Dict:
     np_rstate = np.random.RandomState(NP_SEED)
-    prm_key_indices = np_rstate.permutation(
-            np.arange(len(tubes_per_video)))
-    key_list = list(tubes_per_video.keys())
+    prm_key_indices = np_rstate.permutation(np.arange(len(dct)))
+    key_list = list(dct.keys())
     some_keys = [key_list[i] for i in prm_key_indices[:N]]
-    some_tubes = {k: tubes_per_video[k] for k in some_keys}
+    some_tubes = {k: dct[k] for k in some_keys}
     return some_tubes
 
 
@@ -223,50 +249,6 @@ def _set_tubes(cf, dataset):
     split_vids = get_daly_split_vids(dataset, split_label)
     tubes_per_video = dtindex_filter_split(split_vids, tubes_per_video)
     return tubes_per_video
-
-
-def _perform_tube_demovis(dataset, some_tubes, out,
-        PIXEL_MEANS, TEST_SCALES, TEST_MAX_SIZE):
-    net = nicolas_net()
-    nicolas_labels = ['background', ] + dataset.action_names
-    for k, tube in tqdm(some_tubes.items(), 'nicphil on tubes'):
-        (vid, bunch_id, tube_id) = k
-        vmp4 = dataset.source_videos[vid]
-        # video = dataset.video_odict[vid]
-        video_path = vmp4['video_path']
-        frame_inds = tube['frame_inds']
-
-        # scorefold/f'scores_{video_name}_{tube_id:04d}.pkl')(
-        with vt_cv.video_capture_open(video_path) as vcap:
-            frames_u8 = vt_cv.video_sample(
-                    vcap, frame_inds, debug_filename=video_path)
-        scores_per_frame = get_scores_per_frame_RGB(
-                net, tube, frames_u8,
-                PIXEL_MEANS, TEST_SCALES, TEST_MAX_SIZE)
-        txt_output = []
-        video_fold = small.mkdir(out/'{}_{}_{}'.format(
-            vid, bunch_id, tube_id))
-        for i, (frame, score) in enumerate(zip(frames_u8, scores_per_frame)):
-            image = frame.copy()
-            box = tube['boxes'][i]
-            real_framenum = tube['frame_inds'][i]
-            best_score_id = np.argmax(score)
-            best_score = score[best_score_id]
-            best_nicolas_label = nicolas_labels[best_score_id]
-            snippets.cv_put_box_with_text(
-                    image, box,
-                    text='{} {} {} {:.2f}'.format(
-                        i, real_framenum,
-                        best_nicolas_label, best_score))
-            line = ' '.join([f'{y}: {x:.3f}'
-                for x, y in zip(score, nicolas_labels)])
-            txt_output.append(line)
-            cv2.imwrite(
-                    str(video_fold/'frame{:03d}_{:03d}.jpg'.format(
-                        i, real_framenum)),
-                    image)
-        with (video_fold/'scores.txt').open('w') as f:
-            f.write('\n'.join(txt_output))
 
 
 def _get_gt_sparsetubes(dataset, split_vids, gt_tubes) -> AV_dict[Frametube]:
@@ -427,6 +409,51 @@ def prepare_ftube_box_computations(
             vf_connections_dwti.setdefault(vid, {})[find] = bcs
     return vf_connections_dwti
 
+
+def _demovis_apply_pncaffe_rcnn(
+        neth, dataset, vf_connections_dwti, out):
+    vfold = small.mkdir(out/'demovis')
+    nicolas_labels = ['background', ] + dataset.action_names
+    for vid, f_connections_dwti in tqdm(
+            vf_connections_dwti.items(), 'nicphil_demovis'):
+        vmp4 = dataset.source_videos[vid]
+        video_path = vmp4['video_path']
+        finds = list(f_connections_dwti)
+
+        with vt_cv.video_capture_open(video_path) as vcap:
+            frames_u8 = vt_cv.video_sample(
+                    vcap, finds, debug_filename=video_path)
+
+        video_fold = small.mkdir(vfold/f'vid{vid}')
+
+        for find, frame_BGR in zip(finds, frames_u8):
+            connections_dwti = f_connections_dwti[find]
+            boxes = connections_dwti['boxes']
+            cls_probs = neth.score_boxes(frame_BGR, boxes)  # N, (bcg+10)
+
+        txt_output = []
+        for i, (frame, score) in enumerate(zip(frames_u8, scores_per_frame)):
+            image = frame.copy()
+            box = tube['boxes'][i]
+            real_framenum = tube['frame_inds'][i]
+            best_score_id = np.argmax(score)
+            best_score = score[best_score_id]
+            best_nicolas_label = nicolas_labels[best_score_id]
+            snippets.cv_put_box_with_text(
+                    image, box,
+                    text='{} {} {} {:.2f}'.format(
+                        i, real_framenum,
+                        best_nicolas_label, best_score))
+            line = ' '.join([f'{y}: {x:.3f}'
+                for x, y in zip(score, nicolas_labels)])
+            txt_output.append(line)
+            cv2.imwrite(
+                    str(video_fold/'frame{:03d}_{:03d}.jpg'.format(
+                        i, real_framenum)),
+                    image)
+        with (video_fold/'scores.txt').open('w') as f:
+            f.write('\n'.join(txt_output))
+
 # Experiments
 
 
@@ -486,7 +513,7 @@ def assign_objactions_to_tubes(workfolder, cfg_dict, add_args):
     out, = snippets.get_subfolders(workfolder, ['out'])
     cfg = snippets.YConfig(cfg_dict)
     _set_defcfg_dataset_seed(cfg)
-    _set_defcfg_tubes(cfg)
+    Ncfg_tubes.set_defcfg(cfg)
     cfg.set_deftype("""
     actobjects:
         source: ['detected', ['detected', 'gt']]
@@ -497,14 +524,8 @@ def assign_objactions_to_tubes(workfolder, cfg_dict, add_args):
         overlap_type: ['inner_overlap', ['inner_overlap', 'iou']]
         overlap_cutoff: [0.2, float]
         score_cutoff: [0.2, float]
-
-    tube_eval:
-        nms:
-            enabled: [True, bool]
-            thresh: [0.5, float]
-        params:
-            iou_thresholds: [[0.3, 0.5, 0.7], list]
     """)
+    Ncfg_tube_eval.set_defcfg(cfg)
     cf = cfg.parse()
 
     dataset = DatasetDALY()
@@ -516,7 +537,7 @@ def assign_objactions_to_tubes(workfolder, cfg_dict, add_args):
     av_gt_tubes = av_filter_split(av_gt_tubes, split_vids)
     # Inputs to assignment routine
     ftubes: Dict[DALY_wein_tube_index, Frametube] = \
-            _resolve_tubes(cf, av_gt_tubes, split_vids)
+            Ncfg_tubes.resolve_tubes(cf, av_gt_tubes, split_vids)
     objactions_vf: Dict[DALY_vid, Dict[int, Objaction_dets]] = \
             _resolve_actobjects(cf, dataset, split_vids)
     # Assignment itself
@@ -526,15 +547,8 @@ def assign_objactions_to_tubes(workfolder, cfg_dict, add_args):
     av_stubes: AV_dict[Sframetube] = \
         score_ftubes_via_objaction_overlap_aggregation(
         objactions_vf, ftubes, overlap_type, overlap_cutoff, score_cutoff)
-    # Consider only tubes with score > 0.05
-    av_stubes = av_stubes_above_score(av_stubes, 0.05)
-    # [optionally] Apply per-class NMS
-    if cf['tube_eval.nms.enabled']:
-        tube_nms_thresh = cf['tube_eval.nms.thresh']
-        av_stubes = compute_nms_for_av_stubes(av_stubes, tube_nms_thresh)
-    iou_thresholds = cf['tube_eval.params.iou_thresholds']
-    computeprint_recall_ap_for_avtubes(
-            av_gt_tubes, av_stubes, iou_thresholds)
+    small.save_pkl(out/'av_stubes.pkl', av_stubes)
+    Ncfg_tube_eval.evalprint_if(cf, av_stubes, av_gt_tubes)
 
 
 def apply_pncaffe_rcnn_in_frames(workfolder, cfg_dict, add_args):
@@ -544,24 +558,19 @@ def apply_pncaffe_rcnn_in_frames(workfolder, cfg_dict, add_args):
     out, = snippets.get_subfolders(workfolder, ['out'])
     cfg = snippets.YConfig(cfg_dict)
     _set_defcfg_dataset_seed(cfg)
-    _set_defcfg_tubes(cfg)
-    _set_defcfg_rcnn(cfg)
+    Ncfg_tubes.set_defcfg(cfg)
+    Ncfg_nicphil_rcnn.set_defcfg(cfg)
+    Ncfg_tube_eval.set_defcfg(cfg)
     cfg.set_deftype("""
     demo_run: [False, bool]
     compute:
-        chunk: [0, "VALUE >= 0"]
-        total: [1, int]
-    save_period: ['::10', str]
-    tube_eval:
-        nms:
-            enabled: [True, bool]
-            thresh: [0.5, float]
-        params:
-            iou_thresholds: [[0.3, 0.5, 0.7], list]
+        save_period: ['::10', str]
+        split:
+            enabled: [False, bool]
+            chunk: [0, "VALUE >= 0"]
+            total: [1, int]
     """)
     cf = cfg.parse()
-    neth = Nicolas_net_helper(cf['rcnn.PIXEL_MEANS'],
-            cf['rcnn.TEST_SCALES'], cf['rcnn.TEST_MAX_SIZE'])
     dataset = DatasetDALY()
     dataset.populate_from_folder(cf['dataset.cache_folder'])
     split_label = cf['dataset.subset']
@@ -570,12 +579,22 @@ def apply_pncaffe_rcnn_in_frames(workfolder, cfg_dict, add_args):
             convert_dgt_tubes(get_daly_gt_tubes(dataset))
     av_gt_tubes = av_filter_split(av_gt_tubes, split_vids)
     ftubes: Dict[DALY_wein_tube_index, Frametube] = \
-            _resolve_tubes(cf, av_gt_tubes, split_vids)
+            Ncfg_tubes.resolve_tubes(cf, av_gt_tubes, split_vids)
+
+    neth: Nicolas_net_helper = Ncfg_nicphil_rcnn.resolve_helper(cf)
 
     # Cover only keyframes when evaluating dwti tubes
     frames_to_cover = get_daly_keyframes(dataset, split_vids)
     vf_connections_dwti: Dict[DALY_vid, Dict[int, Box_connections_dwti]] = \
             prepare_ftube_box_computations(ftubes, frames_to_cover)
+
+    if cf['demo_run']:
+        vf_connections_dwti = sample_dict(
+            vf_connections_dwti, N=10, NP_SEED=0)
+        _demovis_apply_pncaffe_rcnn(
+                neth, dataset, vf_connections_dwti, out)
+        raise NotImplementedError()
+        return
 
     def isaver_eval_func(vid):
         f_connections_dwti = vf_connections_dwti[vid]
@@ -589,14 +608,17 @@ def apply_pncaffe_rcnn_in_frames(workfolder, cfg_dict, add_args):
         for find, frame_BGR in zip(finds, frames_u8):
             connections_dwti = f_connections_dwti[find]
             boxes = connections_dwti['boxes']
-            cls_probs = neth.score_boxes(frame_BGR, boxes)  # N, 11
+            cls_probs = neth.score_boxes(frame_BGR, boxes)  # N, (bcg+10)
             f_cls_probs[find] = cls_probs
         return f_cls_probs
+
+    assert not cf['compute.split.enabled']
 
     isaver_keys = list(vf_connections_dwti.keys())
     isaver = snippets.Simple_isaver(
             small.mkdir(out/'isave_caffe_vid_eval'),
-            isaver_keys, isaver_eval_func, cf['save_period'], 120)
+            isaver_keys, isaver_eval_func,
+            cf['compute.save_period'], 120)
 
     isaver_items = isaver.run()
     vf_cls_probs: Dict[DALY_vid, Dict[int, np.ndarray]]
@@ -615,28 +637,19 @@ def apply_pncaffe_rcnn_in_frames(workfolder, cfg_dict, add_args):
     for dwt_index, tube in ftubes.items():
         (vid, bunch_id, tube_id) = dwt_index
         for action_name, score in zip(
-                dataset.action_names, ftube_scores[dwt_index]):
+                dataset.action_names, ftube_scores[dwt_index][1:]):
             stube = tube.copy()
             stube['score'] = score
             stube = cast(Sframetube, stube)
             (av_stubes
                     .setdefault(action_name, {})
                     .setdefault(vid, []).append(stube))
-    # filter score
-    av_stubes = av_stubes_above_score(av_stubes, 0.05)
 
-    # [optionally] Apply per-class NMS
-    if cf['tube_eval.nms.enabled']:
-        tube_nms_thresh = cf['tube_eval.nms.thresh']
-        av_stubes = compute_nms_for_av_stubes(av_stubes, tube_nms_thresh)
-    iou_thresholds = cf['tube_eval.params.iou_thresholds']
-    computeprint_recall_ap_for_avtubes(
-            av_gt_tubes, av_stubes, iou_thresholds)
+    small.save_pkl(out/'av_stubes.pkl', av_stubes)
+    Ncfg_tube_eval.evalprint_if(cf, av_stubes, av_gt_tubes)
 
     # # Cover demo case
     # if cf['demo_run']:
-    #     some_tubes = sample_some_tubes(
-    #             ftubes, N=10, NP_SEED=0)
     #     _perform_tube_demovis(dataset, some_tubes, out,
     #             PIXEL_MEANS, TEST_SCALES, TEST_MAX_SIZE)
     #     return
