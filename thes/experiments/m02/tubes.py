@@ -1,3 +1,4 @@
+import copy
 import pandas as pd
 import warnings
 import logging
@@ -6,12 +7,30 @@ import cv2
 import numpy as np
 from tqdm import tqdm
 from pathlib import Path
-from typing import (List, Tuple, Dict, List, TypeVar, cast, TypedDict, Set)  # NOQA
+from typing import (
+        List, Tuple, Dict, cast, TypedDict, Set)
+from types import MethodType
+
+import torch
+
+from detectron2.modeling import build_model
+from detectron2.checkpoint import DetectionCheckpointer
+from detectron2.engine.defaults import DefaultPredictor
+from detectron2.data import transforms as d2_transforms
+from detectron2.data import (
+        DatasetCatalog, MetadataCatalog,)
+from detectron2.structures import Boxes, Instances
 
 from vsydorov_tools import small
 from vsydorov_tools import cv as vt_cv
 
-from thes.tools import snippets
+from thes.detectron.cfg import (
+        D2DICT_GPU_SCALING_DEFAULTS,
+        d2dict_gpu_scaling,
+        set_detectron_cfg_base,
+        set_detectron_cfg_train,
+        set_detectron_cfg_test,
+        )
 from thes.caffe import (Nicolas_net_helper)
 from thes.data.tubes.types import (
     DALY_wein_tube,
@@ -38,10 +57,13 @@ from thes.detectron.daly import (
     simplest_daly_to_datalist_v2,
     get_datalist_action_object_converter,
 )
+from thes.detectron.externals import (
+    simple_d2_setup, get_frame_without_crashing)
 from thes.evaluation.routines import (
     compute_recall_for_avtubes,
     compute_ap_for_avtubes
 )
+from thes.tools import snippets
 
 
 log = logging.getLogger(__name__)
@@ -450,6 +472,139 @@ def _demovis_apply_pncaffe_rcnn(
                 f.write('\n'.join(txt_output))
 
 
+def _predict_rcnn_given_box_resized_proposals(
+        box4, frame_u8, transform_gen, model):
+
+    o_height, o_width = frame_u8.shape[:2]
+    got_transform = transform_gen.get_transform(frame_u8)
+
+    # Transform image
+    image = got_transform.apply_image(frame_u8)
+    image = torch.as_tensor(image.astype("float32").transpose(2, 0, 1))
+    imshape = tuple(image.shape[1:3])
+
+    # / Transform box
+    assert box4.shape == (4,)
+    boxes_unscaled = box4[None]
+    t_boxes = torch.as_tensor(boxes_unscaled.astype("float32"))
+    transformed_t_boxes = got_transform.apply_box(t_boxes)
+    # // Proposals w.r.t transformed imagesize
+    proposal = Instances(imshape)
+    tb_boxes = Boxes(transformed_t_boxes)
+    proposal.proposal_boxes = tb_boxes
+
+    inputs = {
+            "image": image,
+            "proposals": proposal,
+            "height": o_height,
+            "width": o_width}
+
+    with torch.no_grad():
+        predictions = model([inputs])[0]
+    return predictions
+
+
+from torch.nn import functional as F
+
+
+def genrcnn_rcnn_roiscores_forward(self, batched_inputs):
+    """
+    Replacing detectron2/detectron2/modeling/meta_arch/rcnn.py (GeneralizedRCNN.forward)
+    """
+    assert not self.training
+    images = self.preprocess_image(batched_inputs)
+    features = self.backbone(images.tensor)
+    assert "proposals" in batched_inputs[0]
+    proposals = [x["proposals"].to(self.device) for x in batched_inputs]
+    del images
+    # Borrowed from detectron2/detectron2/modeling/roi_heads/roi_heads.py (Res5ROIHeads.forward)
+    proposal_boxes = [x.proposal_boxes for x in proposals]
+    box_features = self.roi_heads._shared_roi_transform(
+        [features[f] for f in self.roi_heads.in_features], proposal_boxes
+    )
+    feature_pooled = box_features.mean(dim=[2, 3])  # pooled to 1x1
+    pred_class_logits, pred_proposal_deltas = \
+            self.roi_heads.box_predictor(feature_pooled)
+    pred_softmax = F.softmax(pred_class_logits, dim=-1)
+    return pred_softmax
+
+
+class D2_rcnn_helper(object):
+    def __init__(self, cf, cf_add_d2, dataset, out):
+        num_classes = len(dataset.action_names)
+        TEST_DATASET_NAME = 'daly_objaction_test'
+
+        # / Define d2 conf
+        d2_output_dir = str(small.mkdir(out/'d2_output'))
+        d_cfg = set_detectron_cfg_base(
+                d2_output_dir, num_classes, cf['seed'])
+        d_cfg = set_detectron_cfg_test(
+                d_cfg, TEST_DATASET_NAME,
+                cf['d2_rcnn.model'], cf['d2_rcnn.conf_thresh'], cf_add_d2,
+                freeze=False)
+        d_cfg.MODEL.PROPOSAL_GENERATOR.NAME = "PrecomputedProposals"
+        d_cfg.freeze()
+
+        # / Start d2
+        simple_d2_setup(d_cfg)
+
+        # Predictor without proposal generator
+        model = build_model(d_cfg)
+        model.eval()
+        checkpointer = DetectionCheckpointer(model)
+
+        checkpointer.load(d_cfg.MODEL.WEIGHTS)
+        MIN_SIZE_TEST = d_cfg.INPUT.MIN_SIZE_TEST
+        MAX_SIZE_TEST = d_cfg.INPUT.MAX_SIZE_TEST
+        transform_gen = d2_transforms.ResizeShortestEdge(
+            [MIN_SIZE_TEST, MIN_SIZE_TEST], MAX_SIZE_TEST)
+
+        # Instance monkeypatching
+        # https://stackoverflow.com/questions/50599045/python-replacing-a-function-within-a-class-of-a-module/50600307#50600307
+        model.forward = MethodType(genrcnn_rcnn_roiscores_forward, model)
+
+        self.d_cfg = d_cfg
+        self.rcnn_roiscores_model = model
+        self.cpu_device = torch.device("cpu")
+        self.transform_gen = transform_gen
+
+    def score_boxes(self, frame_BGR, boxes) -> np.ndarray:
+        o_height, o_width = frame_BGR.shape[:2]
+        got_transform = self.transform_gen.get_transform(frame_BGR)
+
+        # Transform image
+        image = got_transform.apply_image(frame_BGR)
+        image = torch.as_tensor(image.astype("float32").transpose(2, 0, 1))
+        imshape = tuple(image.shape[1:3])
+
+        # / Transform box
+        t_boxes = torch.as_tensor(boxes.astype("float32"))
+        transformed_t_boxes = got_transform.apply_box(t_boxes)
+        # // Proposals w.r.t transformed imagesize
+        proposal = Instances(imshape)
+        tb_boxes = Boxes(transformed_t_boxes)
+        proposal.proposal_boxes = tb_boxes
+
+        inputs = {
+                "image": image,
+                "proposals": proposal,
+                "height": o_height,
+                "width": o_width}
+
+        # with torch.no_grad():
+        #     predictions = self.model([inputs])[0]
+        # instances = predictions["instances"].to(self.cpu_device)
+
+        with torch.no_grad():
+            pred_softmax = self.rcnn_roiscores_model([inputs])
+
+        X = pred_softmax.to(self.cpu_device).numpy()
+
+        # To conform to caffe style put background cls to 0th position
+        X_caffelike = np.c_[X[:, -1:], X[:, :-1]]
+        return X_caffelike
+
+
 # Experiments
 
 
@@ -547,44 +702,26 @@ def assign_objactions_to_tubes(workfolder, cfg_dict, add_args):
     Ncfg_tube_eval.evalprint_if(cf, av_stubes, av_gt_tubes)
 
 
-def apply_pncaffe_rcnn_in_frames(workfolder, cfg_dict, add_args):
-    """
-    Run Philippes/Nicolas caffe model to extract 'rcnn scores'
-    """
-    out, = snippets.get_subfolders(workfolder, ['out'])
-    cfg = snippets.YConfig(cfg_dict)
-    _set_defcfg_dataset_seed(cfg)
-    Ncfg_tubes.set_defcfg(cfg)
-    Ncfg_nicphil_rcnn.set_defcfg(cfg)
-    Ncfg_tube_eval.set_defcfg(cfg)
-    cfg.set_deftype("""
-    demo_run: [False, bool]
-    compute:
-        save_period: ['::10', str]
-        split:
-            enabled: [False, bool]
-            chunk: [0, "VALUE >= 0"]
-            total: [1, int]
-    """)
-    cf = cfg.parse()
-    dataset = DatasetDALY()
-    dataset.populate_from_folder(cf['dataset.cache_folder'])
-    split_label = cf['dataset.subset']
-    split_vids = get_daly_split_vids(dataset, split_label)
-    av_gt_tubes: AV_dict[Frametube] = \
-            convert_dgt_tubes(get_daly_gt_tubes(dataset))
-    av_gt_tubes = av_filter_split(av_gt_tubes, split_vids)
-    ftubes: Dict[DALY_wein_tube_index, Frametube] = \
-            Ncfg_tubes.resolve_tubes(cf, av_gt_tubes, split_vids)
+# # Cover demo case
+# # // Computation of the parcels inside chosen chunk
+# chunk = (cf['compute.chunk'], cf['compute.total'])
+# cc, ct = chunk
+# key_indices = np.arange(len(tubes_per_video))
+# key_list = list(tubes_per_video.keys())
+# chunk_indices = np.array_split(key_indices, ct)[cc]
+# chunk_keys = [key_list[i] for i in chunk_indices]
+# log.info('Chunk {}: {} -> {}'.format(
+#     chunk, len(key_indices), len(chunk_indices)))
+# small.save_pkl(out/'tubescores_dict.pkl', tubescores_dict)
 
-    neth: Nicolas_net_helper = Ncfg_nicphil_rcnn.resolve_helper(cf)
 
+def _rcnn_vid_eval(cf, out, dataset, split_vids, ftubes, neth):
     # Cover only keyframes when evaluating dwti tubes
     frames_to_cover = get_daly_keyframes(dataset, split_vids)
     vf_connections_dwti: Dict[DALY_vid, Dict[int, Box_connections_dwti]] = \
             prepare_ftube_box_computations(ftubes, frames_to_cover)
 
-    if cf['demo_run']:
+    if cf['demo_run.enabled']:
         vf_connections_dwti = sample_dict(
             vf_connections_dwti, N=5, NP_SEED=0)
         _demovis_apply_pncaffe_rcnn(
@@ -611,7 +748,7 @@ def apply_pncaffe_rcnn_in_frames(workfolder, cfg_dict, add_args):
 
     isaver_keys = list(vf_connections_dwti.keys())
     isaver = snippets.Simple_isaver(
-            small.mkdir(out/'isave_caffe_vid_eval'),
+            small.mkdir(out/'isave_rcnn_vid_eval'),
             isaver_keys, isaver_eval_func,
             cf['compute.save_period'], 120)
 
@@ -641,28 +778,92 @@ def apply_pncaffe_rcnn_in_frames(workfolder, cfg_dict, add_args):
                     .setdefault(vid, []).append(stube))
 
     small.save_pkl(out/'av_stubes.pkl', av_stubes)
+    return av_stubes
+
+
+def apply_pncaffe_rcnn_in_frames(workfolder, cfg_dict, add_args):
+    """
+    Run Philippes/Nicolas caffe model to extract 'rcnn scores'
+    """
+    out, = snippets.get_subfolders(workfolder, ['out'])
+    cfg = snippets.YConfig(cfg_dict)
+    _set_defcfg_dataset_seed(cfg)
+    Ncfg_tubes.set_defcfg(cfg)
+    Ncfg_nicphil_rcnn.set_defcfg(cfg)
+    Ncfg_tube_eval.set_defcfg(cfg)
+    cfg.set_deftype("""
+    demo_run:
+        enabled: [False, bool]
+        N: [50, int]
+        seed: [0, int]
+    compute:
+        save_period: ['::10', str]
+        split:
+            enabled: [False, bool]
+            chunk: [0, "VALUE >= 0"]
+            total: [1, int]
+            equal: ['frames', ['frames', 'tubes']]
+    """)
+    cf = cfg.parse()
+    dataset = DatasetDALY()
+    dataset.populate_from_folder(cf['dataset.cache_folder'])
+    split_label = cf['dataset.subset']
+    split_vids = get_daly_split_vids(dataset, split_label)
+    av_gt_tubes: AV_dict[Frametube] = \
+            convert_dgt_tubes(get_daly_gt_tubes(dataset))
+    av_gt_tubes = av_filter_split(av_gt_tubes, split_vids)
+    ftubes: Dict[DALY_wein_tube_index, Frametube] = \
+            Ncfg_tubes.resolve_tubes(cf, av_gt_tubes, split_vids)
+
+    neth: Nicolas_net_helper = Ncfg_nicphil_rcnn.resolve_helper(cf)
+    av_stubes = _rcnn_vid_eval(cf, out, dataset, split_vids, ftubes, neth)
     Ncfg_tube_eval.evalprint_if(cf, av_stubes, av_gt_tubes)
 
-    # # Cover demo case
-    # if cf['demo_run']:
-    #     _perform_tube_demovis(dataset, some_tubes, out,
-    #             PIXEL_MEANS, TEST_SCALES, TEST_MAX_SIZE)
-    #     return
-    #
-    # # // Computation of the parcels inside chosen chunk
-    # chunk = (cf['compute.chunk'], cf['compute.total'])
-    # cc, ct = chunk
-    #
-    # key_indices = np.arange(len(tubes_per_video))
-    # key_list = list(tubes_per_video.keys())
-    # chunk_indices = np.array_split(key_indices, ct)[cc]
-    # chunk_keys = [key_list[i] for i in chunk_indices]
-    # log.info('Chunk {}: {} -> {}'.format(
-    #     chunk, len(key_indices), len(chunk_indices)))
-    # small.save_pkl(out/'tubescores_dict.pkl', tubescores_dict)
+
+def apply_pfadet_rcnn_in_frames(workfolder, cfg_dict, add_args):
+    """
+    """
+    out, = snippets.get_subfolders(workfolder, ['out'])
+    cfg = snippets.YConfig(cfg_dict)
+    _set_defcfg_dataset_seed(cfg)
+    Ncfg_tubes.set_defcfg(cfg)
+    Ncfg_tube_eval.set_defcfg(cfg)
+    cfg.set_deftype("""
+    d2_rcnn:
+        model: [~, ~]
+        conf_thresh: [0.0, float]
+    demo_run:
+        enabled: [False, bool]
+        N: [50, int]
+        seed: [0, int]
+    compute:
+        save_period: ['::10', str]
+        split:
+            enabled: [False, bool]
+            chunk: [0, "VALUE >= 0"]
+            total: [1, int]
+            equal: ['frames', ['frames', 'tubes']]
+    """)
+    cf = cfg.parse()
+    cf_add_d2 = cfg.without_prefix('d2.')
+
+    dataset = DatasetDALY()
+    dataset.populate_from_folder(cf['dataset.cache_folder'])
+    split_label = cf['dataset.subset']
+    split_vids = get_daly_split_vids(dataset, split_label)
+    av_gt_tubes: AV_dict[Frametube] = \
+            convert_dgt_tubes(get_daly_gt_tubes(dataset))
+    av_gt_tubes = av_filter_split(av_gt_tubes, split_vids)
+    ftubes: Dict[DALY_wein_tube_index, Frametube] = \
+            Ncfg_tubes.resolve_tubes(cf, av_gt_tubes, split_vids)
+
+    neth = D2_rcnn_helper(cf, cf_add_d2, dataset, out)
+    av_stubes = _rcnn_vid_eval(cf, out, dataset, split_vids, ftubes, neth)
+    Ncfg_tube_eval.evalprint_if(cf, av_stubes, av_gt_tubes)
 
 
 def hacky_gather_evaluated_tubes(workfolder, cfg_dict, add_args):
+    raise NotImplementedError()
     out, = snippets.get_subfolders(workfolder, ['out'])
     cfg = snippets.YConfig(cfg_dict)
     cfg.set_defaults_handling(raise_without_defaults=False)
@@ -695,64 +896,11 @@ def hacky_gather_evaluated_tubes(workfolder, cfg_dict, add_args):
     small.save_pkl(out/'tubescores_dict.pkl', tubescores_dict)
 
 
-def actual_eval_of_nicphil_etubes(workfolder, cfg_dict, add_args):
-    """
-    Evaluate "tubes" as if they were VOC objects
-    """
-    out, = snippets.get_subfolders(workfolder, ['out'])
-    cfg = snippets.YConfig(cfg_dict)
-    cfg.set_deftype("""
-    tubescores_dict: [~, ~]
-    dataset:
-        name: [~, ['daly']]
-        cache_folder: [~, str]
-        subset: ['train', str]
-    tubes:
-        imported_wein_tubes: [~, ~]
-        filter_gt: [False, bool]
-    tube_nms:
-        enabled: [True, bool]
-        thresh: [0.5, float]
-    eval:
-        iou_thresholds: [[0.3, 0.5, 0.7], list]
-        spatiotemporal: [False, bool]
-        use_07_metric: [False, bool]
-        use_diff: [False, bool]
-    """)
-    cf = cfg.parse()
-
-    dataset = DatasetDALY()
-    dataset.populate_from_folder(cf['dataset.cache_folder'])
-
-    # // Obtain GT tubes
-    split_label = cf['dataset.subset']
-    split_vids = get_daly_split_vids(dataset, split_label)
-    gt_tubes = get_daly_gt_tubes(dataset)
-    gttubes_va = \
-            _get_gt_sparsetubes(dataset, split_vids, gt_tubes)
-
-    # // Obtain detected tubes
-    tubes_per_video: \
-            Dict[DALY_wein_tube_index, DALY_wein_tube] = _set_tubes(cf, dataset)
-    # Refer to the originals for start_frame/end_frame
-    original_tubes_per_video: Dict[DALY_wein_tube_index, DALY_wein_tube] = \
-        small.load_pkl(cf['tubes.imported_wein_tubes'])
-    split_label = cf['dataset.subset']
-    split_vids = get_daly_split_vids(dataset, split_label)
-    original_tubes_per_video = dtindex_filter_split(
-            split_vids, original_tubes_per_video)
-
-    tubescores_dict = small.load_pkl(cf['tubescores_dict'])
-    stubes_va = nicphil_evaluations_to_tubes(
-            dataset, tubes_per_video,
-            original_tubes_per_video, tubescores_dict)
-    _daly_tube_map(cf, out, dataset, stubes_va, gttubes_va)
-
-
 def actual_eval_of_action_object_predictions(workfolder, cfg_dict, add_args):
     """
     Evaluate "tubes" as if they were VOC objects
     """
+    raise NotImplementedError()
     out, = snippets.get_subfolders(workfolder, ['out'])
     cfg = snippets.YConfig(cfg_dict)
     cfg.set_deftype("""
@@ -815,6 +963,7 @@ def actual_eval_of_action_object_predictions(workfolder, cfg_dict, add_args):
 
 def eval_daly_tubes_RGB_with_pfadet_gather_evaluated(
         workfolder, cfg_dict, add_args):
+    raise NotImplementedError()
     out, = snippets.get_subfolders(workfolder, ['out'])
     cfg = snippets.YConfig(cfg_dict)
     cfg.set_defaults_handling(raise_without_defaults=False)
@@ -848,6 +997,7 @@ def eval_daly_tubes_RGB_with_pfadet_gather_evaluated(
 
 
 def map_score_tubes_and_pfadet_rcnn_scores(workfolder, cfg_dict, add_args):
+    raise NotImplementedError()
     out, = snippets.get_subfolders(workfolder, ['out'])
     cfg = snippets.YConfig(cfg_dict)
     cfg.set_deftype("""

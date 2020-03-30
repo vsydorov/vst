@@ -103,6 +103,7 @@ class Nicolas_net_helper(object):
         boxes5 = np.c_[np.zeros(len(sc_boxes)), sc_boxes]
         net.blobs['rois'].reshape(len(boxes5), 5)
         net.blobs['rois'].data[...] = boxes5
-        cls_prob = net.forward()['cls_prob']
+        net_forwarded = net.forward()
+        cls_prob = net_forwarded['cls_prob']
         cls_prob_copy = cls_prob.copy()  # Very important
         return cls_prob_copy
