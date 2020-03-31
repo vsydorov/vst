@@ -545,6 +545,7 @@ def compute_nms_for_av_stubes(
 
 
 def score_ftubes_via_objaction_overlap_aggregation(
+        dataset: DatasetDALY,
         objactions_vf: Dict[DALY_vid, Dict[int, Objaction_dets]],
         ftubes: Dict[DALY_wein_tube_index, Frametube],
         overlap_type: Literal['inner_overlap', 'iou'],
@@ -581,13 +582,15 @@ def score_ftubes_via_objaction_overlap_aggregation(
             for score, cls in zip(sa_oa_scores, sa_oa_classes):
                 cls_scores[cls] = cls_scores.get(cls, 0.0) + score
         dwti_ascore[dwt_index] = cls_scores
+
     # Score the ftubes, convert to av_dict
     av_stubes: AV_dict[Sframetube] = {}
     for dwt_index, tube in ftubes.items():
         (vid, bunch_id, tube_id) = dwt_index
         scores: Dict[DALY_action_name, float] = dwti_ascore[dwt_index]
         # Sum the perframe scores
-        for action_name, score in scores.items():
+        for action_name in dataset.action_names:
+            score = scores.get(action_name, 0.0)
             stube = tube.copy()
             stube['score'] = score
             stube = cast(Sframetube, stube)

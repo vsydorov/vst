@@ -1,3 +1,4 @@
+import copy
 import pandas as pd
 import warnings
 import logging
@@ -71,14 +72,27 @@ def computeprint_recall_ap_for_avtubes(
     log.info('Spatiotemp AP:\n{}'.format(table_ap_st))
 
 
-def _set_defcfg_dataset_seed(cfg):
-    cfg.set_deftype("""
-    dataset:
-        name: [~, ['daly']]
-        cache_folder: [~, str]
-        subset: ['test', str]
-    seed: [42, int]
-    """)
+class Ncfg_dataset:
+    @staticmethod
+    def set_dataset_seed(cfg):
+        cfg.set_deftype("""
+        dataset:
+            name: [~, ['daly']]
+            cache_folder: [~, str]
+            subset: ['test', str]
+        seed: [42, int]
+        """)
+
+    @staticmethod
+    def resolve_dataset_tubes(cf):
+        dataset = DatasetDALY()
+        dataset.populate_from_folder(cf['dataset.cache_folder'])
+        split_label = cf['dataset.subset']
+        split_vids = get_daly_split_vids(dataset, split_label)
+        av_gt_tubes: AV_dict[Frametube] = \
+                convert_dgt_tubes(get_daly_gt_tubes(dataset))
+        av_gt_tubes = av_filter_split(av_gt_tubes, split_vids)
+        return dataset, split_vids, av_gt_tubes
 
 
 class Ncfg_tubes:
@@ -160,6 +174,22 @@ class Ncfg_tube_eval:
                     av_stubes, cf['tube_eval.nms.thresh'])
         computeprint_recall_ap_for_avtubes(
                 av_gt_tubes, av_stubes, cf['tube_eval.iou_thresholds'])
+
+
+def _set_rcnn_vid_eval_defcfg(cfg):
+    cfg.set_deftype("""
+    demo_run:
+        enabled: [False, bool]
+        N: [50, int]
+        seed: [0, int]
+    compute:
+        save_period: ['::10', str]
+        split:
+            enabled: [False, bool]
+            chunk: [0, "VALUE >= 0"]
+            total: [1, int]
+            equal: ['frames', ['frames', 'tubes']]
+    """)
 
 
 def resolve_wein_tubes(
@@ -627,8 +657,6 @@ def _rcnn_vid_eval(cf, out, dataset, split_vids, ftubes, neth):
             (av_stubes
                     .setdefault(action_name, {})
                     .setdefault(vid, []).append(stube))
-
-    small.save_pkl(out/'av_stubes.pkl', av_stubes)
     return av_stubes
 
 
@@ -690,7 +718,7 @@ def assign_objactions_to_tubes(workfolder, cfg_dict, add_args):
     """
     out, = snippets.get_subfolders(workfolder, ['out'])
     cfg = snippets.YConfig(cfg_dict)
-    _set_defcfg_dataset_seed(cfg)
+    Ncfg_dataset.set_dataset_seed(cfg)
     Ncfg_tubes.set_defcfg(cfg)
     cfg.set_deftype("""
     actobjects:
@@ -706,14 +734,8 @@ def assign_objactions_to_tubes(workfolder, cfg_dict, add_args):
     Ncfg_tube_eval.set_defcfg(cfg)
     cf = cfg.parse()
 
-    dataset = DatasetDALY()
-    dataset.populate_from_folder(cf['dataset.cache_folder'])
-    split_label = cf['dataset.subset']
-    split_vids = get_daly_split_vids(dataset, split_label)
-    av_gt_tubes: AV_dict[Frametube] = \
-            convert_dgt_tubes(get_daly_gt_tubes(dataset))
-    av_gt_tubes = av_filter_split(av_gt_tubes, split_vids)
-    # Inputs to assignment routine
+    dataset, split_vids, av_gt_tubes = Ncfg_dataset.resolve_dataset_tubes(cf)
+    # Inputs to the assignment routine
     ftubes: Dict[DALY_wein_tube_index, Frametube] = \
             Ncfg_tubes.resolve_tubes(cf, av_gt_tubes, split_vids)
     objactions_vf: Dict[DALY_vid, Dict[int, Objaction_dets]] = \
@@ -723,7 +745,7 @@ def assign_objactions_to_tubes(workfolder, cfg_dict, add_args):
     overlap_cutoff = cf['obj_to_tube.overlap_cutoff']
     score_cutoff = cf['obj_to_tube.score_cutoff']
     av_stubes: AV_dict[Sframetube] = \
-        score_ftubes_via_objaction_overlap_aggregation(
+        score_ftubes_via_objaction_overlap_aggregation(dataset,
         objactions_vf, ftubes, overlap_type, overlap_cutoff, score_cutoff)
     small.save_pkl(out/'av_stubes.pkl', av_stubes)
     Ncfg_tube_eval.evalprint_if(cf, av_stubes, av_gt_tubes)
@@ -735,36 +757,20 @@ def apply_pncaffe_rcnn_in_frames(workfolder, cfg_dict, add_args):
     """
     out, = snippets.get_subfolders(workfolder, ['out'])
     cfg = snippets.YConfig(cfg_dict)
-    _set_defcfg_dataset_seed(cfg)
+    Ncfg_dataset.set_dataset_seed(cfg)
     Ncfg_tubes.set_defcfg(cfg)
     Ncfg_nicphil_rcnn.set_defcfg(cfg)
+    _set_rcnn_vid_eval_defcfg(cfg)
     Ncfg_tube_eval.set_defcfg(cfg)
-    cfg.set_deftype("""
-    demo_run:
-        enabled: [False, bool]
-        N: [50, int]
-        seed: [0, int]
-    compute:
-        save_period: ['::10', str]
-        split:
-            enabled: [False, bool]
-            chunk: [0, "VALUE >= 0"]
-            total: [1, int]
-            equal: ['frames', ['frames', 'tubes']]
-    """)
     cf = cfg.parse()
-    dataset = DatasetDALY()
-    dataset.populate_from_folder(cf['dataset.cache_folder'])
-    split_label = cf['dataset.subset']
-    split_vids = get_daly_split_vids(dataset, split_label)
-    av_gt_tubes: AV_dict[Frametube] = \
-            convert_dgt_tubes(get_daly_gt_tubes(dataset))
-    av_gt_tubes = av_filter_split(av_gt_tubes, split_vids)
+
+    dataset, split_vids, av_gt_tubes = Ncfg_dataset.resolve_dataset_tubes(cf)
     ftubes: Dict[DALY_wein_tube_index, Frametube] = \
             Ncfg_tubes.resolve_tubes(cf, av_gt_tubes, split_vids)
-
     neth: Nicolas_net_helper = Ncfg_nicphil_rcnn.resolve_helper(cf)
+
     av_stubes = _rcnn_vid_eval(cf, out, dataset, split_vids, ftubes, neth)
+    small.save_pkl(out/'av_stubes.pkl', av_stubes)
     Ncfg_tube_eval.evalprint_if(cf, av_stubes, av_gt_tubes)
 
 
@@ -775,38 +781,52 @@ def apply_pfadet_rcnn_in_frames(workfolder, cfg_dict, add_args):
     """
     out, = snippets.get_subfolders(workfolder, ['out'])
     cfg = snippets.YConfig(cfg_dict)
-    _set_defcfg_dataset_seed(cfg)
+    Ncfg_dataset.set_dataset_seed(cfg)
     Ncfg_tubes.set_defcfg(cfg)
-    Ncfg_tube_eval.set_defcfg(cfg)
+    _set_rcnn_vid_eval_defcfg(cfg)
     cfg.set_deftype("""
     d2_rcnn:
         model: [~, ~]
         conf_thresh: [0.0, float]
-    demo_run:
-        enabled: [False, bool]
-        N: [50, int]
-        seed: [0, int]
-    compute:
-        save_period: ['::10', str]
-        split:
-            enabled: [False, bool]
-            chunk: [0, "VALUE >= 0"]
-            total: [1, int]
-            equal: ['frames', ['frames', 'tubes']]
     """)
+    Ncfg_tube_eval.set_defcfg(cfg)
     cf = cfg.parse()
     cf_add_d2 = cfg.without_prefix('d2.')
 
-    dataset = DatasetDALY()
-    dataset.populate_from_folder(cf['dataset.cache_folder'])
-    split_label = cf['dataset.subset']
-    split_vids = get_daly_split_vids(dataset, split_label)
-    av_gt_tubes: AV_dict[Frametube] = \
-            convert_dgt_tubes(get_daly_gt_tubes(dataset))
-    av_gt_tubes = av_filter_split(av_gt_tubes, split_vids)
+    dataset, split_vids, av_gt_tubes = Ncfg_dataset.resolve_dataset_tubes(cf)
     ftubes: Dict[DALY_wein_tube_index, Frametube] = \
             Ncfg_tubes.resolve_tubes(cf, av_gt_tubes, split_vids)
-
     neth = D2_rcnn_helper(cf, cf_add_d2, dataset, out)
+
     av_stubes = _rcnn_vid_eval(cf, out, dataset, split_vids, ftubes, neth)
+    small.save_pkl(out/'av_stubes.pkl', av_stubes)
+    Ncfg_tube_eval.evalprint_if(cf, av_stubes, av_gt_tubes)
+
+
+def merge_scores_avstubes(workfolder, cfg_dict, add_args):
+    out, = snippets.get_subfolders(workfolder, ['out'])
+    cfg = snippets.YConfig(cfg_dict)
+    cfg.set_defaults_handling(raise_without_defaults=False)
+    Ncfg_dataset.set_dataset_seed(cfg)
+    Ncfg_tube_eval.set_defcfg(cfg)
+    cfg.set_defaults("""
+    tubes_to_merge: ~
+    """)
+    cf = cfg.parse()
+
+    dataset, split_vids, av_gt_tubes = Ncfg_dataset.resolve_dataset_tubes(cf)
+
+    ts = [small.load_pkl(p) for p in cf['tubes_to_merge']]
+    av_stubes: AV_dict[Sframetube] = {}
+    for a, v_dict in ts[0].items():
+        for vid, stubes in v_dict.items():
+            for i, stube in enumerate(stubes):
+                scores = [t[a][vid][i]['score'] for t in ts]
+                new_stube = stube.copy()
+                new_stube['score'] = np.mean(scores)
+                (av_stubes
+                        .setdefault(a, {})
+                        .setdefault(vid, []).append(new_stube))
+
+    small.save_pkl(out/'av_stubes.pkl', av_stubes)
     Ncfg_tube_eval.evalprint_if(cf, av_stubes, av_gt_tubes)
