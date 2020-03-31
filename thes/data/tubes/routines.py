@@ -3,18 +3,14 @@ from tqdm import tqdm
 import itertools
 import numpy as np
 import pandas as pd
-from typing import (
-    Dict, List, Tuple, TypeVar, Set, Optional,
-    Callable, TypedDict, NewType, NamedTuple, Sequence,
-    Literal, cast)
+from typing import (  # NOQA
+    Dict, List, Tuple, TypeVar, Set, Optional, Callable, TypedDict, NewType,
+    NamedTuple, Sequence, Literal, cast)
 
 from thes.tools import snippets
 from thes.data.dataset.external import (
         DatasetDALY, DALY_vid,
-        DALY_action_name, DALY_object_name)
-from thes.detectron.daly import (
-        get_daly_split_vids, simplest_daly_to_datalist_v2,
-        get_similar_action_objects_DALY, make_datalist_objaction_similar_merged)
+        DALY_action_name)
 
 from thes.data.tubes.types import (
         Sframetube, Frametube, Base_frametube,
@@ -599,115 +595,3 @@ def score_ftubes_via_objaction_overlap_aggregation(
                     .setdefault(action_name, {})
                     .setdefault(vid, []).append(stube))
     return av_stubes
-
-
-def _create_objdetection_helper_structure(
-        dataset, split_label, actobjects_evaluated):
-    # Assign scores to these tubes, based on intersections
-    # with objaction detections
-    split_vids = get_daly_split_vids(dataset, split_label)
-    datalist = simplest_daly_to_datalist_v2(dataset, split_vids)
-    action_object_to_object = get_similar_action_objects_DALY()
-    object_names = sorted([x
-        for x in set(list(action_object_to_object.values())) if x])
-    # num_classes = len(object_names)
-    def datalist_converter(datalist):  # NOQA
-        datalist = make_datalist_objaction_similar_merged(
-                datalist, dataset.object_names, object_names,
-                action_object_to_object)
-        return datalist
-    datalist = datalist_converter(datalist)
-
-    # // Create a helper structure
-    preds_per_framevid: Dict[DALY_vid, Dict[int, Dict]] = {}
-    for dl_item, pred_item in zip(datalist, actobjects_evaluated):
-        pred_boxes = pred_item.pred_boxes.tensor.numpy()
-        scores = pred_item.scores.numpy()
-        pred_classes = pred_item.pred_classes.numpy()
-        detections = {
-                'pred_boxes': pred_boxes,
-                'scores': scores,
-                'pred_classes': pred_classes}
-        (preds_per_framevid
-            .setdefault(dl_item['vid'], {})
-            [dl_item['video_frame_number']]) = detections
-    return preds_per_framevid
-
-
-def _match_objectdetections_to_tubes(
-        dataset, tubes_per_video, original_tubes_per_video,
-        preds_per_framevid,
-        overlap_type, overlap_cutoff, score_cutoff):
-    # To every tube, find matching keyframes
-    n_classes = len(dataset.action_names)
-    cls_scores_per_tube: Dict[DALY_wein_tube_index, np.ndarray] = {}
-    for k, wein_tube in tqdm(tubes_per_video.items(), 'match_keyframes'):
-        (vid, bunch_id, tube_id) = k
-        cls_scores = np.zeros(n_classes)
-        for frame_ind, tube_box in zip(
-                wein_tube['frame_inds'], wein_tube['boxes']):
-            matching_keyframe = preds_per_framevid.get(vid, {}).get(frame_ind)
-            if matching_keyframe is None:
-                continue
-            # Check overlap
-            if overlap_type == 'iou':
-                overlaps = numpy_iou_N1(
-                        matching_keyframe['pred_boxes'], tube_box)
-            elif overlap_type == 'inner_overlap':
-                overlaps = numpy_inner_overlap_N1(
-                        matching_keyframe['pred_boxes'], tube_box)
-            else:
-                raise RuntimeError()
-            good_overlaps = overlaps > overlap_cutoff
-            # Check score
-            good_score = matching_keyframe['scores'] > score_cutoff
-            # Merge
-            good = good_overlaps & good_score
-
-            for score, cls in zip(
-                    matching_keyframe['scores'][good],
-                    matching_keyframe['pred_classes'][good]):
-                cls_scores[cls] += score
-        cls_scores_per_tube[k] = cls_scores
-
-    # Create scored_tubes
-    stubes_va: \
-            Dict[DALY_action_name,
-                    Dict[DALY_vid, List[Sframetube]]] = {}
-    for ckey, tube in tubes_per_video.items():
-        (vid, bunch_id, tube_id) = ckey
-        agg_tubescores = cls_scores_per_tube[ckey]
-
-        original_tube = original_tubes_per_video[ckey]
-        frame_inds = tube['frame_inds']
-        boxes = tube['boxes']
-        start_frame = original_tube['frame_inds'].min()
-        end_frame = original_tube['frame_inds'].max()
-        # Sum the perframe scores
-        for action_name, score in zip(
-                dataset.action_names, agg_tubescores):
-            sparse_scored_tube = {
-                    'frame_inds': frame_inds,
-                    'boxes': boxes,
-                    'start_frame': start_frame,
-                    'end_frame': end_frame,
-                    'score': score}
-            if score < 0.05:
-                continue
-            (stubes_va
-                    .setdefault(action_name, {})
-                    .setdefault(vid, []).append(sparse_scored_tube))
-    return stubes_va
-
-
-def av_stubes_above_score(
-        av_stubes: AV_dict[Sframetube],
-        score: float
-        ) -> AV_dict[Sframetube]:
-    av_stubes_good: AV_dict[Sframetube] = {}
-    for action_name, v_stubes in av_stubes.items():
-        for vid, tubes in v_stubes.items():
-            tubes_good = [t for t in tubes if t['score'] > score]
-            (av_stubes_good
-                    .setdefault(action_name, {})[vid]) = tubes_good
-    return av_stubes_good

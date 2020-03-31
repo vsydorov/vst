@@ -1,4 +1,3 @@
-import copy
 import pandas as pd
 import warnings
 import logging
@@ -7,62 +6,37 @@ import cv2
 import numpy as np
 from tqdm import tqdm
 from pathlib import Path
-from typing import (
-        List, Tuple, Dict, cast, TypedDict, Set)
+from typing import (List, Tuple, Dict, cast, TypedDict, Set)
 from types import MethodType
 
 import torch
+from torch.nn import functional as F
 
 from detectron2.modeling import build_model
 from detectron2.checkpoint import DetectionCheckpointer
-from detectron2.engine.defaults import DefaultPredictor
 from detectron2.data import transforms as d2_transforms
-from detectron2.data import (
-        DatasetCatalog, MetadataCatalog,)
 from detectron2.structures import Boxes, Instances
 
 from vsydorov_tools import small
 from vsydorov_tools import cv as vt_cv
 
-from thes.detectron.cfg import (
-        D2DICT_GPU_SCALING_DEFAULTS,
-        d2dict_gpu_scaling,
-        set_detectron_cfg_base,
-        set_detectron_cfg_train,
-        set_detectron_cfg_test,
-        )
+from thes.data.dataset.external import (DatasetDALY, DALY_vid)
 from thes.caffe import (Nicolas_net_helper)
-from thes.data.tubes.types import (
-    DALY_wein_tube,
-    DALY_wein_tube_index, DALY_gt_tube_index,
-    Objaction_dets, Frametube, Sframetube,
-    convert_dwein_tube, convert_dgt_tubes,
-    dtindex_filter_split, av_filter_split,
-    get_daly_gt_tubes, AV_dict
-)
-from thes.data.tubes.routines import (
-    filter_tube_keyframes_only_gt,
-    filter_tube_keyframes_only_gt_v2,
-    nicphil_evaluations_to_tubes,
-    compute_nms_for_av_stubes,
-    score_ftubes_via_objaction_overlap_aggregation,
-    _create_objdetection_helper_structure,
-    _match_objectdetections_to_tubes,
-    av_stubes_above_score
-)
-from thes.data.dataset.external import (
-    DatasetDALY, DALY_action_name, DALY_object_name, DALY_vid)
+from thes.detectron.cfg import (
+    set_detectron_cfg_base, set_detectron_cfg_test,)
+from thes.detectron.externals import (simple_d2_setup,)
 from thes.detectron.daly import (
-    get_daly_split_vids,
-    simplest_daly_to_datalist_v2,
-    get_datalist_action_object_converter,
-)
-from thes.detectron.externals import (
-    simple_d2_setup, get_frame_without_crashing)
+    get_daly_split_vids, simplest_daly_to_datalist_v2,
+    get_datalist_action_object_converter,)
+from thes.data.tubes.types import (
+    DALY_wein_tube, DALY_wein_tube_index, Objaction_dets, Frametube,
+    Sframetube, convert_dwein_tube, convert_dgt_tubes, dtindex_filter_split,
+    av_filter_split, av_stubes_above_score, get_daly_gt_tubes, AV_dict)
+from thes.data.tubes.routines import (
+    filter_tube_keyframes_only_gt, filter_tube_keyframes_only_gt_v2,
+    compute_nms_for_av_stubes, score_ftubes_via_objaction_overlap_aggregation,)
 from thes.evaluation.routines import (
-    compute_recall_for_avtubes,
-    compute_ap_for_avtubes
-)
+    compute_recall_for_avtubes, compute_ap_for_avtubes)
 from thes.tools import snippets
 
 
@@ -504,9 +478,6 @@ def _predict_rcnn_given_box_resized_proposals(
     return predictions
 
 
-from torch.nn import functional as F
-
-
 def genrcnn_rcnn_roiscores_forward(self, batched_inputs):
     """
     Replacing detectron2/detectron2/modeling/meta_arch/rcnn.py (GeneralizedRCNN.forward)
@@ -571,38 +542,94 @@ class D2_rcnn_helper(object):
     def score_boxes(self, frame_BGR, boxes) -> np.ndarray:
         o_height, o_width = frame_BGR.shape[:2]
         got_transform = self.transform_gen.get_transform(frame_BGR)
-
         # Transform image
         image = got_transform.apply_image(frame_BGR)
         image = torch.as_tensor(image.astype("float32").transpose(2, 0, 1))
         imshape = tuple(image.shape[1:3])
-
-        # / Transform box
+        # Transform box
         t_boxes = torch.as_tensor(boxes.astype("float32"))
         transformed_t_boxes = got_transform.apply_box(t_boxes)
-        # // Proposals w.r.t transformed imagesize
+        # Proposals w.r.t transformed imagesize
         proposal = Instances(imshape)
         tb_boxes = Boxes(transformed_t_boxes)
         proposal.proposal_boxes = tb_boxes
-
         inputs = {
                 "image": image,
                 "proposals": proposal,
                 "height": o_height,
                 "width": o_width}
-
-        # with torch.no_grad():
-        #     predictions = self.model([inputs])[0]
-        # instances = predictions["instances"].to(self.cpu_device)
-
         with torch.no_grad():
             pred_softmax = self.rcnn_roiscores_model([inputs])
-
         X = pred_softmax.to(self.cpu_device).numpy()
-
-        # To conform to caffe style put background cls to 0th position
+        # To conform to caffe style put background cls at 0th position
         X_caffelike = np.c_[X[:, -1:], X[:, :-1]]
         return X_caffelike
+
+
+def _rcnn_vid_eval(cf, out, dataset, split_vids, ftubes, neth):
+    # Cover only keyframes when evaluating dwti tubes
+    frames_to_cover = get_daly_keyframes(dataset, split_vids)
+    vf_connections_dwti: Dict[DALY_vid, Dict[int, Box_connections_dwti]] = \
+            prepare_ftube_box_computations(ftubes, frames_to_cover)
+
+    if cf['demo_run.enabled']:
+        vf_connections_dwti = sample_dict(
+            vf_connections_dwti, N=5, NP_SEED=0)
+        _demovis_apply_pncaffe_rcnn(
+                neth, dataset, vf_connections_dwti, out)
+        return
+
+    def isaver_eval_func(vid):
+        f_connections_dwti = vf_connections_dwti[vid]
+        vmp4 = dataset.source_videos[vid]
+        video_path = vmp4['video_path']
+        finds = list(f_connections_dwti)
+        with vt_cv.video_capture_open(video_path) as vcap:
+            frames_u8 = vt_cv.video_sample(
+                    vcap, finds, debug_filename=video_path)
+        f_cls_probs = {}
+        for find, frame_BGR in zip(finds, frames_u8):
+            connections_dwti = f_connections_dwti[find]
+            boxes = connections_dwti['boxes']
+            cls_probs = neth.score_boxes(frame_BGR, boxes)  # N, (bcg+10)
+            f_cls_probs[find] = cls_probs
+        return f_cls_probs
+
+    assert not cf['compute.split.enabled']
+
+    isaver_keys = list(vf_connections_dwti.keys())
+    isaver = snippets.Simple_isaver(
+            small.mkdir(out/'isave_rcnn_vid_eval'),
+            isaver_keys, isaver_eval_func,
+            cf['compute.save_period'], 120)
+
+    isaver_items = isaver.run()
+    vf_cls_probs: Dict[DALY_vid, Dict[int, np.ndarray]]
+    vf_cls_probs = dict(zip(isaver_keys, isaver_items))
+
+    # Pretty clear we'll be summing up the scores anyway
+    ftube_scores = {k: np.zeros(11) for k in ftubes}
+    for vid, f_cls_probs in vf_cls_probs.items():
+        for f, cls_probs in f_cls_probs.items():
+            dwtis = vf_connections_dwti[vid][f]['dwti_sources']
+            for dwti, prob in zip(dwtis, cls_probs):
+                ftube_scores[dwti] += prob
+
+    # Create av_stubes
+    av_stubes: AV_dict[Sframetube] = {}
+    for dwt_index, tube in ftubes.items():
+        (vid, bunch_id, tube_id) = dwt_index
+        for action_name, score in zip(
+                dataset.action_names, ftube_scores[dwt_index][1:]):
+            stube = tube.copy()
+            stube['score'] = score
+            stube = cast(Sframetube, stube)
+            (av_stubes
+                    .setdefault(action_name, {})
+                    .setdefault(vid, []).append(stube))
+
+    small.save_pkl(out/'av_stubes.pkl', av_stubes)
+    return av_stubes
 
 
 # Experiments
@@ -702,88 +729,9 @@ def assign_objactions_to_tubes(workfolder, cfg_dict, add_args):
     Ncfg_tube_eval.evalprint_if(cf, av_stubes, av_gt_tubes)
 
 
-# # Cover demo case
-# # // Computation of the parcels inside chosen chunk
-# chunk = (cf['compute.chunk'], cf['compute.total'])
-# cc, ct = chunk
-# key_indices = np.arange(len(tubes_per_video))
-# key_list = list(tubes_per_video.keys())
-# chunk_indices = np.array_split(key_indices, ct)[cc]
-# chunk_keys = [key_list[i] for i in chunk_indices]
-# log.info('Chunk {}: {} -> {}'.format(
-#     chunk, len(key_indices), len(chunk_indices)))
-# small.save_pkl(out/'tubescores_dict.pkl', tubescores_dict)
-
-
-def _rcnn_vid_eval(cf, out, dataset, split_vids, ftubes, neth):
-    # Cover only keyframes when evaluating dwti tubes
-    frames_to_cover = get_daly_keyframes(dataset, split_vids)
-    vf_connections_dwti: Dict[DALY_vid, Dict[int, Box_connections_dwti]] = \
-            prepare_ftube_box_computations(ftubes, frames_to_cover)
-
-    if cf['demo_run.enabled']:
-        vf_connections_dwti = sample_dict(
-            vf_connections_dwti, N=5, NP_SEED=0)
-        _demovis_apply_pncaffe_rcnn(
-                neth, dataset, vf_connections_dwti, out)
-        return
-
-    def isaver_eval_func(vid):
-        f_connections_dwti = vf_connections_dwti[vid]
-        vmp4 = dataset.source_videos[vid]
-        video_path = vmp4['video_path']
-        finds = list(f_connections_dwti)
-        with vt_cv.video_capture_open(video_path) as vcap:
-            frames_u8 = vt_cv.video_sample(
-                    vcap, finds, debug_filename=video_path)
-        f_cls_probs = {}
-        for find, frame_BGR in zip(finds, frames_u8):
-            connections_dwti = f_connections_dwti[find]
-            boxes = connections_dwti['boxes']
-            cls_probs = neth.score_boxes(frame_BGR, boxes)  # N, (bcg+10)
-            f_cls_probs[find] = cls_probs
-        return f_cls_probs
-
-    assert not cf['compute.split.enabled']
-
-    isaver_keys = list(vf_connections_dwti.keys())
-    isaver = snippets.Simple_isaver(
-            small.mkdir(out/'isave_rcnn_vid_eval'),
-            isaver_keys, isaver_eval_func,
-            cf['compute.save_period'], 120)
-
-    isaver_items = isaver.run()
-    vf_cls_probs: Dict[DALY_vid, Dict[int, np.ndarray]]
-    vf_cls_probs = dict(zip(isaver_keys, isaver_items))
-
-    # Pretty clear we'll be summing up the scores anyway
-    ftube_scores = {k: np.zeros(11) for k in ftubes}
-    for vid, f_cls_probs in vf_cls_probs.items():
-        for f, cls_probs in f_cls_probs.items():
-            dwtis = vf_connections_dwti[vid][f]['dwti_sources']
-            for dwti, prob in zip(dwtis, cls_probs):
-                ftube_scores[dwti] += prob
-
-    # Create av_stubes
-    av_stubes: AV_dict[Sframetube] = {}
-    for dwt_index, tube in ftubes.items():
-        (vid, bunch_id, tube_id) = dwt_index
-        for action_name, score in zip(
-                dataset.action_names, ftube_scores[dwt_index][1:]):
-            stube = tube.copy()
-            stube['score'] = score
-            stube = cast(Sframetube, stube)
-            (av_stubes
-                    .setdefault(action_name, {})
-                    .setdefault(vid, []).append(stube))
-
-    small.save_pkl(out/'av_stubes.pkl', av_stubes)
-    return av_stubes
-
-
 def apply_pncaffe_rcnn_in_frames(workfolder, cfg_dict, add_args):
     """
-    Run Philippes/Nicolas caffe model to extract 'rcnn scores'
+    Apply Phil-Nic rcnn model on tube boxes to extract per-action scores
     """
     out, = snippets.get_subfolders(workfolder, ['out'])
     cfg = snippets.YConfig(cfg_dict)
@@ -822,6 +770,8 @@ def apply_pncaffe_rcnn_in_frames(workfolder, cfg_dict, add_args):
 
 def apply_pfadet_rcnn_in_frames(workfolder, cfg_dict, add_args):
     """
+    Apply trained d2 frcnn model on tube boxes to extract per-action scores
+      - We dispense with the frcnn box predictions and only use per-roi scores
     """
     out, = snippets.get_subfolders(workfolder, ['out'])
     cfg = snippets.YConfig(cfg_dict)
@@ -860,217 +810,3 @@ def apply_pfadet_rcnn_in_frames(workfolder, cfg_dict, add_args):
     neth = D2_rcnn_helper(cf, cf_add_d2, dataset, out)
     av_stubes = _rcnn_vid_eval(cf, out, dataset, split_vids, ftubes, neth)
     Ncfg_tube_eval.evalprint_if(cf, av_stubes, av_gt_tubes)
-
-
-def hacky_gather_evaluated_tubes(workfolder, cfg_dict, add_args):
-    raise NotImplementedError()
-    out, = snippets.get_subfolders(workfolder, ['out'])
-    cfg = snippets.YConfig(cfg_dict)
-    cfg.set_defaults_handling(raise_without_defaults=False)
-    cfg.set_deftype("""
-    etubes: [~, ~]
-    dataset:
-        name: [~, ['daly']]
-        cache_folder: [~, str]
-        subset: ['train', str]
-    tubes:
-        imported_wein_tubes: [~, ~]
-        filter_gt: [False, bool]
-    """)
-    cf = cfg.parse()
-
-    # Read tubes, merge dicts
-    tubescores_dict = {}
-    for tubepath in cf['etubes']:
-        tubes = small.load_pkl(tubepath)
-        tubescores_dict.update(tubes)
-
-    # Confirm that keys match
-    dataset = DatasetDALY()
-    dataset.populate_from_folder(cf['dataset.cache_folder'])
-    tubes_per_video = _set_tubes(cf, dataset)
-
-    assert tubes_per_video.keys() == tubescores_dict.keys(), \
-            "Keys should match"
-
-    small.save_pkl(out/'tubescores_dict.pkl', tubescores_dict)
-
-
-def actual_eval_of_action_object_predictions(workfolder, cfg_dict, add_args):
-    """
-    Evaluate "tubes" as if they were VOC objects
-    """
-    raise NotImplementedError()
-    out, = snippets.get_subfolders(workfolder, ['out'])
-    cfg = snippets.YConfig(cfg_dict)
-    cfg.set_deftype("""
-    dataset:
-        name: [~, ['daly']]
-        cache_folder: [~, str]
-        subset: ['train', str]
-    tubes:
-        imported_wein_tubes: [~, ~]
-        filter_gt: [False, bool]
-    tube_nms:
-        enabled: [True, bool]
-        thresh: [0.5, float]
-    eval:
-        iou_thresholds: [[0.3, 0.5, 0.7], list]
-        spatiotemporal: [False, bool]
-        use_07_metric: [False, bool]
-        use_diff: [False, bool]
-    actobjects_evaluated: [~, ~]
-    obj_to_tube:
-        overlap_type: ['inner_overlap', ['inner_overlap', 'iou']]
-        overlap_cutoff: [0.2, float]
-        score_cutoff: [0.2, float]
-    """)
-    cf = cfg.parse()
-
-    dataset = DatasetDALY()
-    dataset.populate_from_folder(cf['dataset.cache_folder'])
-
-    # // Obtain GT tubes
-    split_label = cf['dataset.subset']
-    split_vids = get_daly_split_vids(dataset, split_label)
-    gt_tubes = get_daly_gt_tubes(dataset)
-    gttubes_va = \
-            _get_gt_sparsetubes(dataset, split_vids, gt_tubes)
-
-    # // Obtain detected tubes
-    tubes_per_video: \
-            Dict[DALY_wein_tube_index, DALY_wein_tube] = _set_tubes(cf, dataset)
-    # Refer to the originals for start_frame/end_frame
-    original_tubes_per_video: Dict[DALY_wein_tube_index, DALY_wein_tube] = \
-        small.load_pkl(cf['tubes.imported_wein_tubes'])
-    split_label = cf['dataset.subset']
-    split_vids = get_daly_split_vids(dataset, split_label)
-    original_tubes_per_video = \
-            dtindex_filter_split(split_vids, original_tubes_per_video)
-
-    actobjects_evaluated = small.load_pkl(cf['actobjects_evaluated'])
-
-    preds_per_framevid = _create_objdetection_helper_structure(
-        dataset, split_label, actobjects_evaluated)
-    overlap_type = cf['obj_to_tube.overlap_type']
-    overlap_cutoff = cf['obj_to_tube.overlap_cutoff']
-    score_cutoff = cf['obj_to_tube.score_cutoff']
-    stubes_va = _match_objectdetections_to_tubes(
-        dataset, tubes_per_video, original_tubes_per_video,
-        preds_per_framevid, overlap_type, overlap_cutoff, score_cutoff)
-    _daly_tube_map(cf, out, dataset, stubes_va, gttubes_va)
-
-
-def eval_daly_tubes_RGB_with_pfadet_gather_evaluated(
-        workfolder, cfg_dict, add_args):
-    raise NotImplementedError()
-    out, = snippets.get_subfolders(workfolder, ['out'])
-    cfg = snippets.YConfig(cfg_dict)
-    cfg.set_defaults_handling(raise_without_defaults=False)
-    cfg.set_deftype("""
-    etubes: [~, ~]
-    dataset:
-        name: [~, ['daly']]
-        cache_folder: [~, str]
-        subset: ['train', str]
-    tubes:
-        imported_wein_tubes: [~, ~]
-        filter_gt: [False, bool]
-    """)
-    cf = cfg.parse()
-
-    # Read tubes, merge dicts
-    tubescores_dict = {}
-    for tubepath in tqdm(cf['etubes'], 'loading etubes'):
-        tubes = small.load_pkl(tubepath)
-        tubescores_dict.update(tubes)
-
-    # Confirm that keys match
-    dataset = DatasetDALY()
-    dataset.populate_from_folder(cf['dataset.cache_folder'])
-    tubes_per_video = _set_tubes(cf, dataset)
-
-    assert tubes_per_video.keys() == tubescores_dict.keys(), \
-            "Keys should match"
-
-    small.save_pkl(out/'tube_instances_dict.pkl', tubescores_dict)
-
-
-def map_score_tubes_and_pfadet_rcnn_scores(workfolder, cfg_dict, add_args):
-    raise NotImplementedError()
-    out, = snippets.get_subfolders(workfolder, ['out'])
-    cfg = snippets.YConfig(cfg_dict)
-    cfg.set_deftype("""
-    tube_instances_dict: [~, ~]
-    dataset:
-        name: [~, ['daly']]
-        cache_folder: [~, str]
-        subset: ['train', str]
-    tubes:
-        imported_wein_tubes: [~, ~]
-        filter_gt: [False, bool]
-    rcnn_assignment:
-        use_boxes: [False, bool]
-    tube_nms:
-        enabled: [True, bool]
-        thresh: [0.5, float]
-    eval:
-        iou_thresholds: [[0.3, 0.5, 0.7], list]
-        spatiotemporal: [False, bool]
-        use_07_metric: [False, bool]
-        use_diff: [False, bool]
-    """)
-    cf = cfg.parse()
-
-    dataset = DatasetDALY()
-    dataset.populate_from_folder(cf['dataset.cache_folder'])
-
-    # // Obtain GT tubes
-    split_label = cf['dataset.subset']
-    split_vids = get_daly_split_vids(dataset, split_label)
-    gt_tubes = get_daly_gt_tubes(dataset)
-    gttubes_va = \
-            _get_gt_sparsetubes(dataset, split_vids, gt_tubes)
-
-    # // Obtain detected tubes
-    tubes_per_video: \
-            Dict[DALY_wein_tube_index, DALY_wein_tube] = _set_tubes(cf, dataset)
-    # Refer to the originals for start_frame/end_frame
-    original_tubes_per_video: Dict[DALY_wein_tube_index, DALY_wein_tube] = \
-        small.load_pkl(cf['tubes.imported_wein_tubes'])
-    split_label = cf['dataset.subset']
-    split_vids = get_daly_split_vids(dataset, split_label)
-    original_tubes_per_video = \
-            dtindex_filter_split(split_vids, original_tubes_per_video)
-
-    tube_instances_dict = small.load_pkl(cf['tube_instances_dict'])
-    stubes_va: \
-            Dict[DALY_action_name,
-                    Dict[DALY_vid, List[Sframetube]]] = {}
-
-    assert cf['rcnn_assignment.use_boxes'] is False
-    # # Only record scores > 0.01
-    # score_record_thresh = 0.01
-    for ckey, tube in tubes_per_video.items():
-        (vid, bunch_id, tube_id) = ckey
-        original_tube = original_tubes_per_video[ckey]
-        tube_instances = tube_instances_dict[ckey]
-        # Ignore boxes in tube instances
-        scores_per_actid = np.zeros(len(dataset.action_names))
-        for i, ins in enumerate(tube_instances):
-            for pred_cls, score in zip(ins.pred_classes, ins.scores):
-                scores_per_actid[pred_cls] += score
-        start_frame = original_tube['frame_inds'].min()
-        end_frame = original_tube['frame_inds'].max()
-        for action_name, score in zip(
-                dataset.action_names, scores_per_actid):
-            sparse_scored_tube = {
-                    'frame_inds': tube['frame_inds'],
-                    'boxes': tube['boxes'],
-                    'start_frame': start_frame,
-                    'end_frame': end_frame,
-                    'score': score}
-            (stubes_va
-                    .setdefault(action_name, {})
-                    .setdefault(vid, []).append(sparse_scored_tube))
-    _daly_tube_map(cf, out, dataset, stubes_va, gttubes_va)

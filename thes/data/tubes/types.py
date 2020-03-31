@@ -142,3 +142,16 @@ def dtindex_filter_split(
         if vid in split_vids:
             dwt_index_fdict[dwt_index] = v
     return dwt_index_fdict
+
+
+def av_stubes_above_score(
+        av_stubes: AV_dict[Sframetube],
+        score: float
+        ) -> AV_dict[Sframetube]:
+    av_stubes_good: AV_dict[Sframetube] = {}
+    for action_name, v_stubes in av_stubes.items():
+        for vid, tubes in v_stubes.items():
+            tubes_good = [t for t in tubes if t['score'] > score]
+            (av_stubes_good
+                    .setdefault(action_name, {})[vid]) = tubes_good
+    return av_stubes_good

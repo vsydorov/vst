@@ -8,33 +8,24 @@ from typing import (List, Tuple, Callable)
 
 import torch
 
-from detectron2.data import (
-        DatasetCatalog, MetadataCatalog,)
+from detectron2.data import (DatasetCatalog, MetadataCatalog,)
 from detectron2.engine.defaults import DefaultPredictor
 from detectron2.layers.nms import nms, batched_nms
 from detectron2.utils.visualizer import Visualizer
-from detectron2.structures import Boxes, Instances
 
 from vsydorov_tools import small
 
+from thes.data.dataset.external import (DatasetDALY)
 from thes.detectron.cfg import (
-        D2DICT_GPU_SCALING_DEFAULTS,
-        d2dict_gpu_scaling,
-        set_detectron_cfg_base,
-        set_detectron_cfg_train,
-        set_detectron_cfg_test,
-        )
+    D2DICT_GPU_SCALING_DEFAULTS, d2dict_gpu_scaling, set_detectron_cfg_base,
+    set_detectron_cfg_train, set_detectron_cfg_test,)
 from thes.detectron.internals import launch_w_logging
 from thes.detectron.externals import (
-        simple_d2_setup, DalyVideoDatasetTrainer,
-        get_frame_without_crashing)
+    simple_d2_setup, DalyVideoDatasetTrainer, get_frame_without_crashing)
 from thes.detectron.daly import (
-        Datalist, Dl_record,
-        get_daly_split_vids, simplest_daly_to_datalist_v2,
-        daly_to_datalist_pfadet, get_category_map_o100, make_datalist_o100,
-        get_datalist_action_object_converter
-        )
-from thes.data.dataset.external import (DatasetDALY)
+    Datalist, Dl_record, get_daly_split_vids, simplest_daly_to_datalist_v2,
+    daly_to_datalist_pfadet, get_category_map_o100, make_datalist_o100,
+    get_datalist_action_object_converter)
 from thes.evaluation.routines import (compute_ap_for_video_datalist)
 from thes.tools import snippets
 
