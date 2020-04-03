@@ -5,12 +5,13 @@ import numpy as np
 import pandas as pd
 import copy
 from pathlib import Path
-from typing import (List, Dict, Tuple, cast, TypedDict, Callable, Optional, Literal)
+from typing import (  # NOQA
+    List, Dict, Tuple, cast, TypedDict, Callable, Optional, Literal, Union)
 
 from detectron2.structures import BoxMode  # type: ignore
 
 from thes.data.dataset.external import (
-        DatasetDALY, DALY_vid, DALY_action_name, DALY_object_name)
+        Dataset_daly, Dataset_daly_ocv, Vid_daly, Action_name_daly, Object_name_daly)
 
 
 class Dl_anno(TypedDict):
@@ -21,11 +22,11 @@ class Dl_anno(TypedDict):
 
 
 class Dl_record(TypedDict):
-    vid: DALY_vid
+    vid: Vid_daly
     video_path: Path
     video_frame_number: int
     video_frame_time: float
-    action_name: DALY_action_name
+    action_name: Action_name_daly
     image_id: str
     height: int
     width: int
@@ -36,9 +37,9 @@ Datalist = List[Dl_record]
 
 
 def get_daly_split_vids(
-        dataset: DatasetDALY,
+        dataset: Dataset_daly_ocv,
         split_label: Literal['train', 'test']
-        ) -> List[DALY_vid]:
+        ) -> List[Vid_daly]:
     split_vids = [
         vid for vid, split in dataset.split.items() if split == split_label]
     if split_label == 'train':
@@ -52,76 +53,63 @@ def get_daly_split_vids(
 
 
 def daly_to_datalist_pfadet(
-        dataset, split_vids) -> Datalist:
+        dataset: Dataset_daly_ocv, split_vids) -> Datalist:
     d2_datalist = []
     for vid in split_vids:
-        v = dataset.video_odict[vid]
-        vmp4 = dataset.source_videos[vid]
-        video_path = vmp4['video_path']
-        height = vmp4['height']
-        width = vmp4['width']
-        for action_name, instances in v['instances'].items():
+        ovideo = dataset.videos_ocv[vid]
+        for action_name, instances in ovideo['instances'].items():
             for ins_ind, instance in enumerate(instances):
                 for keyframe in instance['keyframes']:
-                    frame_number = keyframe['frameNumber']
+                    frame0 = keyframe['frame']
                     frame_time = keyframe['time']
                     image_id = '{}_A{}_FN{}_FT{:.3f}'.format(
-                            vid, action_name, frame_number, frame_time)
-                    box_unscaled = keyframe['boundingBox'].squeeze()
-                    bbox = box_unscaled * np.tile([width, height], 2)
-                    bbox_mode = BoxMode.XYXY_ABS
+                            vid, action_name, frame0, frame_time)
                     action_id = dataset.action_names.index(action_name)
                     act_obj: Dl_anno = {
-                            'bbox': bbox,
-                            'bbox_mode': bbox_mode,
+                            'bbox': keyframe['bbox_abs'],
+                            'bbox_mode': BoxMode.XYXY_ABS,
                             'category_id': action_id,
                             'is_occluded': False}
                     annotations = [act_obj]
                     record: Dl_record = {
                             'vid': vid,
-                            'video_path': video_path,
-                            'video_frame_number': frame_number,
+                            'video_path': ovideo['path'],
+                            'video_frame_number': frame0,
                             'video_frame_time': frame_time,
                             'action_name': action_name,
                             'image_id': image_id,
-                            'height': height,
-                            'width': width,
+                            'height': ovideo['height'],
+                            'width': ovideo['width'],
                             'annotations': annotations}
                     d2_datalist.append(record)
     return d2_datalist
 
 
 def simplest_daly_to_datalist_v2(
-        dataset, split_vids) -> Datalist:
+        dataset: Dataset_daly_ocv, split_vids) -> Datalist:
     d2_datalist = []
     for vid in split_vids:
-        v = dataset.video_odict[vid]
-        vmp4 = dataset.source_videos[vid]
-        video_path = vmp4['video_path']
-        height = vmp4['height']
-        width = vmp4['width']
-        for action_name, instances in v['instances'].items():
+        ovideo = dataset.videos_ocv[vid]
+        for action_name, instances in ovideo['instances'].items():
             for ins_ind, instance in enumerate(instances):
                 for keyframe in instance['keyframes']:
-                    frame_number = keyframe['frameNumber']
+                    frame0 = keyframe['frame']
                     frame_time = keyframe['time']
                     image_id = '{}_A{}_FN{}_FT{:.3f}'.format(
-                            vid, action_name, frame_number, frame_time)
-                    kf_objects = keyframe['objects']
+                            vid, action_name, frame0, frame_time)
+                    kf_objects_abs = keyframe['objects_abs']
                     annotations = []
-                    for kfo in kf_objects:
+                    for kfo in kf_objects_abs:
                         [xmin, ymin, xmax, ymax,
                             objectID, isOccluded, isHallucinate] = kfo
                         isOccluded = bool(isOccluded)
                         isHallucinate = bool(isHallucinate)
                         if isHallucinate:
                             continue
-                        box_unscaled = np.array([xmin, ymin, xmax, ymax])
-                        bbox = box_unscaled * np.tile([width, height], 2)
-                        bbox_mode = BoxMode.XYXY_ABS
+                        bbox = np.array([xmin, ymin, xmax, ymax])
                         obj: Dl_anno = {
                                 'bbox': bbox,
-                                'bbox_mode': bbox_mode,
+                                'bbox_mode': BoxMode.XYXY_ABS,
                                 'category_id': int(objectID),
                                 'is_occluded': isOccluded}
                         annotations.append(obj)
@@ -129,25 +117,22 @@ def simplest_daly_to_datalist_v2(
                         continue
                     record: Dl_record = {
                             'vid': vid,
-                            'video_path': video_path,
-                            'video_frame_number': frame_number,
+                            'video_path': ovideo['path'],
+                            'video_frame_number': frame0,
                             'video_frame_time': frame_time,
                             'action_name': action_name,
                             'image_id': image_id,
-                            'height': height,
-                            'width': width,
+                            'height': ovideo['height'],
+                            'width': ovideo['width'],
                             'annotations': annotations}
                     d2_datalist.append(record)
     return d2_datalist
 
 
-def get_daly_odf(dataset):
+def get_daly_odf(dataset: Dataset_daly_ocv):
     gt_objects = []
-    for vid, v in dataset.video_odict.items():
-        vmp4 = dataset.source_videos[vid]
-        height = vmp4['height']
-        width = vmp4['width']
-        for action_name, instances in v['instances'].items():
+    for vid, ovideo in dataset.videos_ocv.items():
+        for action_name, instances in ovideo['instances'].items():
             for ins_ind, instance in enumerate(instances):
                 for keyframe in instance['keyframes']:
                     kf_objects = keyframe['objects']
@@ -155,8 +140,7 @@ def get_daly_odf(dataset):
                     for kfo in kf_objects:
                         [xmin, ymin, xmax, ymax,
                             objectID, isOccluded, isHallucinate] = kfo
-                        box_unscaled = np.array([xmin, ymin, xmax, ymax])
-                        bbox = box_unscaled * np.tile([width, height], 2)
+                        bbox = np.array([xmin, ymin, xmax, ymax])
                         objectID = int(objectID)
                         object_name = dataset.object_names[objectID]
                         obj = {
@@ -173,13 +157,14 @@ def get_daly_odf(dataset):
     return odf
 
 
-def get_category_map_o100(dataset):
+def get_category_map_o100(dataset: Dataset_daly_ocv):
     # o100 computations
     odf = get_daly_odf(dataset)
     ocounts = odf.object_name.value_counts()
     o100_objects = sorted(ocounts[ocounts>100].index)
     category_map = []
     for obj_name in dataset.object_names:
+        mapped: Union[int, None]
         if obj_name in o100_objects:
             mapped = o100_objects.index(obj_name)
         else:
@@ -232,7 +217,7 @@ def make_datalist_objaction_similar_merged(
     return filtered_datalist
 
 
-def get_similar_action_objects_DALY() -> Dict[Tuple[DALY_action_name, DALY_object_name], str]:
+def get_similar_action_objects_DALY() -> Dict[Tuple[Action_name_daly, Object_name_daly], str]:
     """ Group similar looking objects, ignore other ones """
     action_object_to_object = \
         {('ApplyingMakeUpOnLips', 'balm'): 'ApplyingMakeUpOnLips_stick_like',
@@ -282,11 +267,11 @@ def get_similar_action_objects_DALY() -> Dict[Tuple[DALY_action_name, DALY_objec
          ('TakingPhotosOrVideos', 'camera'): 'TakingPhotosOrVideos_camera_like',
          ('TakingPhotosOrVideos', 'smartphone'): 'TakingPhotosOrVideos_camera_like',
          ('TakingPhotosOrVideos', 'videocamera'): 'TakingPhotosOrVideos_camera_like'}
-    return cast(Dict[Tuple[DALY_action_name, DALY_object_name], str], action_object_to_object)
+    return cast(Dict[Tuple[Action_name_daly, Object_name_daly], str], action_object_to_object)
 
 
 def get_datalist_action_object_converter(
-        dataset
+        dataset: Dataset_daly,
         ) -> Tuple[List[str], Callable[[Datalist], Datalist]]:
     action_object_to_object = get_similar_action_objects_DALY()
     object_names = sorted([x
@@ -301,7 +286,7 @@ def get_datalist_action_object_converter(
     return object_names, datalist_converter
 
 
-def get_biggest_objects_DALY() -> Tuple[DALY_action_name, DALY_object_name]:
+def get_biggest_objects_DALY() -> Tuple[Action_name_daly, Object_name_daly]:
     """ Biggest object category per action class """
     primal_configurations = [
             ('ApplyingMakeUpOnLips', 'stick'),
@@ -314,4 +299,4 @@ def get_biggest_objects_DALY() -> Tuple[DALY_action_name, DALY_object_name]:
             ('Phoning', 'phone'),
             ('PlayingHarmonica', 'harmonica'),
             ('TakingPhotosOrVideos', 'camera')]
-    return cast(Tuple[DALY_action_name, DALY_object_name], primal_configurations)
+    return cast(Tuple[Action_name_daly, Object_name_daly], primal_configurations)

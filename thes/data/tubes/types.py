@@ -1,23 +1,21 @@
 import logging
 import math
 import numpy as np
-from typing import (
+from typing import (  # NOQA
         Tuple, TypedDict, NewType, Dict, List, TypeVar)
 
 from thes.data.dataset.external import (
-        DatasetDALY, DALY_vid, DALY_action_name)
+        Dataset_daly_ocv, Vid_daly, Action_name_daly, F0)
 
 log = logging.getLogger(__name__)
 
 T = TypeVar('T')
-DALY_wein_tube_index = Tuple[DALY_vid, int, int]
-DALY_gt_tube_index = Tuple[DALY_vid, DALY_action_name, int]
-FrameNumber0 = NewType('FrameNumber0', int)  # 0-based frame number
-Scores_per_frame = Dict[FrameNumber0, np.ndarray]
+DALY_wein_tube_index = Tuple[Vid_daly, int, int]
+DALY_gt_tube_index = Tuple[Vid_daly, Action_name_daly, int]
 
 
 class Base_frametube(TypedDict):
-    frame_inds: np.ndarray
+    frame_inds: np.ndarray  # 0-based ocv indices
     boxes: np.ndarray  # LTRD, absolute scale
 
 
@@ -30,15 +28,15 @@ class DALY_gt_tube(Base_frametube):
     times: np.ndarray
     start_time: float
     end_time: float
-    start_frame: int
-    end_frame: int
+    start_frame: F0
+    end_frame: F0
 
 
 class Frametube(Base_frametube):
     # frame_inds not guaranteed to include
     # all frames in [start_frame, end_frame]
-    start_frame: int
-    end_frame: int
+    start_frame: F0
+    end_frame: F0
 
 
 class Sframetube(Frametube):
@@ -46,8 +44,8 @@ class Sframetube(Frametube):
 
 
 T_tube = TypeVar('T_tube', Frametube, Sframetube)
-V_dict = Dict[DALY_vid, List[T_tube]]
-AV_dict = Dict[DALY_action_name, Dict[DALY_vid, List[T_tube]]]
+V_dict = Dict[Vid_daly, List[T_tube]]
+AV_dict = Dict[Action_name_daly, Dict[Vid_daly, List[T_tube]]]
 
 
 Objaction_dets = TypedDict('Objaction_dets', {
@@ -68,38 +66,27 @@ def convert_dwein_tube(tube: DALY_wein_tube) -> Frametube:
 
 
 def get_daly_gt_tubes(
-        dataset: DatasetDALY
+        dataset: Dataset_daly_ocv
             ) -> Dict[DALY_gt_tube_index, DALY_gt_tube]:
-    # Daly GT tubes
     dgt_tubes: Dict[DALY_gt_tube_index, DALY_gt_tube] = {}
-    for vid, v in dataset.video_odict.items():
-        vmp4 = dataset.source_videos[vid]
-        height = vmp4['height']
-        width = vmp4['width']
-        ocv_video_fps = vmp4['frames_reached']/vmp4['length_reached']
-        box_scale = np.tile([width, height], 2)
+    for vid, v in dataset.videos_ocv.items():
         for action_name, instances in v['instances'].items():
             for ins_ind, instance in enumerate(instances):
-                # Read keyframes
                 frame_inds = []
                 times = []
-                uboxes = []
+                boxes = []
                 for keyframe in instance['keyframes']:
-                    frame_inds.append(keyframe['frameNumber'])
+                    frame_inds.append(keyframe['frame'])
                     times.append(keyframe['time'])
-                    uboxes.append(keyframe['boundingBox'].squeeze())
-                start_time = instance['beginTime']
-                end_time = instance['endTime']
-                start_frame = math.floor(start_time * ocv_video_fps)
-                end_frame = math.floor(end_time * ocv_video_fps)
+                    boxes.append(keyframe['bbox_abs'])
                 tube: DALY_gt_tube = {
-                    'start_time': start_time,
-                    'end_time': end_time,
-                    'start_frame': start_frame,
-                    'end_frame': end_frame,
+                    'start_time': instance['beginTime'],
+                    'end_time': instance['endTime'],
+                    'start_frame': instance['start_frame'],
+                    'end_frame': instance['end_frame'],
                     'frame_inds': np.array(frame_inds),
                     'times': np.array(times),
-                    'boxes': np.array(uboxes)* box_scale}
+                    'boxes': np.array(boxes)}
                 dgt_tubes[(vid, action_name, ins_ind)] = tube
     return dgt_tubes
 
@@ -125,7 +112,7 @@ def convert_dgt_tubes(
 
 def av_filter_split(
         avx: AV_dict[T],
-        split_vids: List[DALY_vid]) -> AV_dict[T]:
+        split_vids: List[Vid_daly]) -> AV_dict[T]:
     favx = {}
     for a, vx in avx.items():
         favx[a] = {v: x for v, x in vx.items() if v in split_vids}
@@ -134,7 +121,7 @@ def av_filter_split(
 
 def dtindex_filter_split(
         dtindex_dict: Dict[DALY_wein_tube_index, T],
-        split_vids: List[DALY_vid]
+        split_vids: List[Vid_daly]
         ) -> Dict[DALY_wein_tube_index, T]:
     dwt_index_fdict = {}
     for dwt_index, v in dtindex_dict.items():

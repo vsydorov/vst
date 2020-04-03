@@ -2,8 +2,7 @@ import logging
 import warnings
 import numpy as np
 from abc import abstractmethod, ABC
-from thes.data.dataset.external import (
-        DALY_vid)
+from thes.data.dataset.external import (Vid)
 from typing import (
     Any, Dict, List, Tuple, TypedDict)
 from thes.data.tubes.routines import (
@@ -40,13 +39,13 @@ class AP_fdet_tube(TypedDict):
 
 
 class AP_fgt_framebox(TypedDict):
-    ind: Tuple[DALY_vid, int, int]  # vid, frame, anno_id
+    ind: Tuple[Vid, int, int]  # vid, frame, anno_id
     obj: np.ndarray  # LTRD box
     diff: bool
 
 
 class AP_fdet_framebox(TypedDict):
-    ind: Tuple[DALY_vid, int, int]  # vid, frame, det_id
+    ind: Tuple[Vid, int, int]  # vid, frame, det_id
     obj: np.ndarray  # LTRD box
     score: float
 
@@ -101,197 +100,6 @@ def voc_ap(rec, prec, use_07_metric=False):
         # and sum (\Delta recall) * prec
         ap = np.sum((mrec[i + 1] - mrec[i]) * mpre[i + 1])
     return ap
-
-
-# def _compute_framebox_ap_old(
-#         fgts: List[AP_fgt_framebox],
-#         fdets: List[AP_fdet_framebox],
-#         iou_thresh: float,
-#         use_07_metric: bool,
-#         use_diff: bool,
-#             ) -> float:
-#     raise Warning('To be removed')
-#     # Group fdets belonging to same frame, assign to fgts
-#     ifdet_groups: Dict[Tuple[DALY_vid, int], List[int]] = {}
-#     for ifdet, fdet in enumerate(fdets):
-#         vf_id = (fdet['ind'][0], fdet['ind'][1])
-#         ifdet_groups.setdefault(vf_id, []).append(ifdet)
-#     ifgt_to_ifdets: Dict[int, List[int]] = {}
-#     for ifgt, fgt in enumerate(fgts):
-#         vf_id = (fgt['ind'][0], fgt['ind'][1])
-#         ifgt_to_ifdets[ifgt] = ifdet_groups.get(vf_id, [])
-#     ifdet_to_ifgts: Dict[int, List[int]] = {}
-#     for ifgt, ifdets in ifgt_to_ifdets.items():
-#         for ifdet in ifdets:
-#             ifdet_to_ifgts.setdefault(ifdet, []).append(ifgt)
-#     # Preparation
-#     detection_matched = np.zeros(len(fdets), dtype=bool)
-#     gt_already_matched = np.zeros(len(fgts), dtype=bool)
-#     # Provenance
-#     detection_matched_to_which_gt = np.ones(len(fdets), dtype=int)*-1
-#     iou_coverages_per_detection_ind: Dict[int, List[float]] = {}
-#
-#     # VOC2007 preparation
-#     nd = len(fdets)
-#     tp = np.zeros(nd)
-#     fp = np.zeros(nd)
-#     if use_diff:
-#         npos = len(fgts)
-#     else:
-#         npos = len([x for x in fgts if not x['diff']])
-#
-#     # Go through ordered detections
-#     detection_scores = np.array([x['score'] for x in fdets])
-#     detection_scores = detection_scores.round(3)
-#     sorted_inds = np.argsort(-detection_scores)
-#     for d, ifdet in enumerate(sorted_inds):
-#         # Check available GTs
-#         share_image_ifgts: List[int] = ifdet_to_ifgts.get(ifdet, [])
-#         if not len(share_image_ifgts):
-#             fp[d] = 1
-#             continue
-#
-#         detection: AP_fdet_framebox = fdets[ifdet]
-#         detection_box = detection['obj']
-#
-#         # Compute IOUs
-#         iou_coverages: List[float] = []
-#         for ifgt in share_image_ifgts:
-#             gt_box_anno: AP_fgt_framebox = fgts[ifgt]
-#             gt_box = gt_box_anno['obj']
-#             iou = numpy_iou(gt_box, detection_box)
-#             iou_coverages.append(iou)
-#         # Provenance
-#         iou_coverages_per_detection_ind[ifdet] = iou_coverages
-#
-#         max_coverage_local_id = np.argmax(iou_coverages)
-#         max_coverage = iou_coverages[max_coverage_local_id]
-#         max_coverage_ifgt = share_image_ifgts[max_coverage_local_id]
-#
-#         # Mirroring voc_eval
-#         if max_coverage > iou_thresh:
-#             if (not use_diff) and fgts[max_coverage_ifgt]['diff']:
-#                 continue
-#             if not gt_already_matched[max_coverage_ifgt]:
-#                 tp[d] = 1
-#                 detection_matched[ifdet] = True
-#                 gt_already_matched[max_coverage_ifgt] = True
-#                 detection_matched_to_which_gt[ifdet] = max_coverage_ifgt
-#             else:
-#                 fp[d] = 1
-#         else:
-#             fp[d] = 1
-#     fp = np.cumsum(fp)
-#     tp = np.cumsum(tp)
-#     rec = tp / float(npos)
-#     prec = tp / np.maximum(tp + fp, np.finfo(np.float64).eps)
-#     ap = voc_ap(rec, prec, use_07_metric)
-#     return ap
-#
-#
-# def _compute_tube_ap_old(
-#         fgts: List[AP_fgt_tube],
-#         fdets: List[AP_fdet_tube],
-#         iou_thresh: float,
-#         use_07_metric: bool,
-#         use_diff: bool,
-#         spatiotemporal: bool,
-#             ) -> float:
-#     raise Warning('To be removed')
-#     # Precompute 'temporal iou' and indices of tubes
-#     possible_matches_per_detection: List[Dict[int, float]] = []
-#     for fdet in fdets:
-#         ind_to_iou: Dict[int, float] = {}
-#         det_bf = fdet['obj']['start_frame']
-#         det_ef = fdet['obj']['end_frame']
-#         for i_fgt, fgt in enumerate(fgts):
-#             if fgt['ind'][0] == fdet['ind'][0]:
-#                 gt_bf = fgt['obj']['start_frame']
-#                 gt_ef = fgt['obj']['end_frame']
-#                 temp_iou = temporal_IOU(
-#                         gt_bf, gt_ef, det_bf, det_ef)
-#                 if temp_iou > 0.0:
-#                     ind_to_iou[i_fgt] = temp_iou
-#         possible_matches_per_detection.append(ind_to_iou)
-#     # Preparation
-#     detection_matched = np.zeros(len(fdets), dtype=bool)
-#     gt_already_matched = np.zeros(len(fgts), dtype=bool)
-#     # Provenance
-#     detection_matched_to_which_gt = np.ones(len(fdets), dtype=int)*-1
-#     iou_coverages_per_detection_ind: Dict[int, List[float]] = {}
-#
-#     # VOC2007 preparation
-#     nd = len(fdets)
-#     tp = np.zeros(nd)
-#     fp = np.zeros(nd)
-#     if use_diff:
-#         npos = len(fgts)
-#     else:
-#         npos = len([x for x in fgts if not x['diff']])
-#
-#     # Go through ordered detections
-#     detection_scores = np.array([x['score'] for x in fdets])
-#     detection_scores = detection_scores.round(3)
-#     sorted_inds = np.argsort(-detection_scores)
-#     for d, detection_ind in enumerate(sorted_inds):
-#         # Check available GTs
-#         gt_ids_that_overlap = possible_matches_per_detection[detection_ind]
-#         if len(gt_ids_that_overlap) == 0:
-#             fp[d] = 1
-#             continue
-#
-#         detection: AP_fdet_tube = fdets[detection_ind]
-#         detection_tube: Frametube = detection['obj']
-#
-#         # Compute IOUs
-#         iou_coverages: List[float] = []
-#         for gt_id, temp_iou in gt_ids_that_overlap.items():
-#             gt_tube_anno: AP_fgt_tube = fgts[gt_id]
-#             gt_tube = gt_tube_anno['obj']
-#             spatial_miou = \
-#                 spatial_tube_iou_v3(gt_tube, detection_tube)
-#             if spatiotemporal:
-#                 iou = temp_iou * spatial_miou
-#             else:
-#                 iou = spatial_miou
-#             iou_coverages.append(iou)
-#         # Provenance
-#         iou_coverages_per_detection_ind[detection_ind] = iou_coverages
-#
-#         max_coverage_id = np.argmax(iou_coverages)
-#         max_coverage = iou_coverages[max_coverage_id]
-#         max_coverage_gt_id = list(gt_ids_that_overlap.keys())[max_coverage_id]
-#
-#         # Mirror VOC eval
-#         if max_coverage > iou_thresh:
-#             if (not use_diff) and fgts[max_coverage_gt_id]['diff']:
-#                 continue
-#             if not gt_already_matched[max_coverage_gt_id]:
-#                 tp[d] = 1
-#                 detection_matched[detection_ind] = True
-#                 gt_already_matched[max_coverage_gt_id] = True
-#                 detection_matched_to_which_gt[detection_ind] = max_coverage_gt_id
-#             else:
-#                 fp[d] = 1
-#         else:
-#             fp[d] = 1
-#     fp = np.cumsum(fp)
-#     tp = np.cumsum(tp)
-#     rec = tp / float(npos)
-#     prec = tp / np.maximum(tp + fp, np.finfo(np.float64).eps)
-#     ap = voc_ap(rec, prec, use_07_metric)
-#
-#     # All kinds of stats gathered together
-#     stats = Stats_daly_ap(flat_annotations=fgts,
-#             flat_detections=fdets,
-#             detection_matched=detection_matched,
-#             gt_already_matched=gt_already_matched,
-#             possible_matches=possible_matches_per_detection,
-#             iou_coverages_per_detection_ind=iou_coverages_per_detection_ind,
-#             detection_matched_to_which_gt=detection_matched_to_which_gt,
-#             sorted_inds=sorted_inds, fp=fp, tp=tp, npos=npos, rec=rec,
-#             prec=prec, ap=ap)
-#     return stats
 
 
 class AP_computer(ABC):
@@ -388,7 +196,7 @@ class AP_framebox_computer(AP_computer):
         fgts = self.fgts
         fdets = self.fdets
         # Group fdets belonging to same frame, assign to fgts
-        ifdet_groups: Dict[Tuple[DALY_vid, int], List[int]] = {}
+        ifdet_groups: Dict[Tuple[Vid, int], List[int]] = {}
         for ifdet, fdet in enumerate(fdets):
             vf_id = (fdet['ind'][0], fdet['ind'][1])
             ifdet_groups.setdefault(vf_id, []).append(ifdet)
@@ -448,7 +256,7 @@ class AP_tube_computer(AP_computer):
             self._possible_matches_per_detection = {}
             return
         # Group fdets belonging to same vid
-        ifdet_vid_groups: Dict[DALY_vid, List[int]] = {}
+        ifdet_vid_groups: Dict[Vid, List[int]] = {}
         for ifdet, fdet in enumerate(fdets):
             vid = fdet['ind'][0]
             ifdet_vid_groups.setdefault(vid, []).append(ifdet)

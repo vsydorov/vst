@@ -10,12 +10,13 @@ import re
 import itertools
 import platform
 import subprocess
+import concurrent.futures
 from abc import ABC
 from tqdm import tqdm
 from datetime import datetime
 from pathlib import Path
 
-from typing import Iterable, List, Dict
+from typing import (Iterable, List, Dict, Any)
 
 from vsydorov_tools import small
 
@@ -473,6 +474,16 @@ class YConfig(object):
         return cfg_without_prefix(self.cf, prefix, keys)
 
 
+def _tqdm_str(pbar, ninc=0):
+    if pbar is None:
+        tqdm_str = ''
+    else:
+        tqdm_str = 'TQDM[' + pbar.format_meter(
+                pbar.n + ninc, pbar.total,
+                pbar._time()-pbar.start_t) + ']'
+    return tqdm_str
+
+
 class Base_isaver(ABC):
     def __init__(self, folder, total):
         self._re_finished = (
@@ -521,31 +532,7 @@ class Base_isaver(ABC):
             len(inds_to_purge), files_purged))
 
 
-def _tqdm_str(pbar, ninc=0):
-    if pbar is None:
-        tqdm_str = ''
-    else:
-        tqdm_str = 'TQDM[' + pbar.format_meter(
-                pbar.n + ninc, pbar.total,
-                pbar._time()-pbar.start_t) + ']'
-    return tqdm_str
-
-
-class Simple_isaver(Base_isaver):
-    """
-    Will process a list with a func
-    """
-    def __init__(self, folder, in_list, func,
-            save_period='::25',
-            log_interval_seconds=-1):
-        # assert sys.version_info >= (3, 6), 'Dicts must keep insertion order'
-        super().__init__(folder, len(in_list))
-        self.in_list = in_list
-        self.result = []
-        self.func = func
-        self._save_period = save_period
-        self._log_interval_seconds = log_interval_seconds
-
+class Mixin_restore_save(object):
     def _restore(self):
         intermediate_files: Dict[int, Dict[str, Path]] = \
                 self._get_intermediate_files()
@@ -563,13 +550,28 @@ class Simple_isaver(Base_isaver):
         small.save_pkl(savepath, self.result)
         ifiles['finished'].touch()
 
+
+class Simple_isaver(Mixin_restore_save, Base_isaver):
+    """
+    Will process a list with a func
+    """
+    def __init__(self, folder, arg_list, func,
+            save_period='::25',
+            log_interval_seconds=-1):
+        super().__init__(folder, len(arg_list))
+        self.arg_list = arg_list
+        self.result = []
+        self.func = func
+        self._save_period = save_period
+        self._log_interval_seconds = log_interval_seconds
+
     def run(self):
         start_i = self._restore()
         run_range = np.arange(start_i+1, self._total)
         self._last_time = time.perf_counter()
         pbar = tqdm(run_range)
         for i in pbar:
-            self.result.append(self.func(self.in_list[i]))
+            self.result.append(self.func(self.arg_list[i]))
             if check_step_v2(i, self._save_period) or \
                     (i+1 == self._total):
                 self._save(i)
@@ -579,3 +581,51 @@ class Simple_isaver(Base_isaver):
                         self._log_interval_seconds:
                     log.info(_tqdm_str(pbar))
         return self.result
+
+
+class Threading_isaver(Mixin_restore_save, Base_isaver):
+    """
+    Will process a list with a func, in async manner
+    """
+    def __init__(self, folder, in_list, func,
+            save_every=25, max_workers=5):
+        super().__init__(folder, len(in_list))
+        self.in_list = in_list
+        self.result: Dict[int, Any] = {}
+        self.func = func
+        self._save_every = save_every
+        self._max_workers = max_workers
+
+    def run(self):
+        self._restore()
+        all_ii = set(range(len(self.in_list)))
+        remaining_ii = all_ii - set(self.result.keys())
+
+        io_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=self._max_workers)
+        io_futures = []
+        for i in remaining_ii:
+            args = self.in_list[i]
+            submitted = io_executor.submit(self.func, args)
+            submitted.i = i
+            io_futures.append(submitted)
+
+        flush_dict = {}
+
+        def flush_purge():
+            self.result.update(flush_dict)
+            flush_dict.clear()
+            self._save(len(self.result))
+            self._purge_intermediate_files()
+
+        for io_future in tqdm(concurrent.futures.as_completed(io_futures),
+                total=len(io_futures)):
+            result = io_future.result()
+            i = io_future.i
+            flush_dict[i] = result
+            if len(flush_dict) >= self._save_every:
+                flush_purge()
+        flush_purge()
+        assert len(self.result) == len(self.in_list)
+        result_list = [self.result[i] for i in all_ii]
+        return result_list

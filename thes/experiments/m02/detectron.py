@@ -15,7 +15,7 @@ from detectron2.utils.visualizer import Visualizer
 
 from vsydorov_tools import small
 
-from thes.data.dataset.external import (DatasetDALY)
+from thes.data.dataset.external import (Dataset_daly_ocv)
 from thes.detectron.cfg import (
     D2DICT_GPU_SCALING_DEFAULTS, d2dict_gpu_scaling, set_detectron_cfg_base,
     set_detectron_cfg_train, set_detectron_cfg_test,)
@@ -165,7 +165,7 @@ def train_daly_action(workfolder, cfg_dict, add_args):
     cf_add_d2 = cfg.without_prefix('d2.')
     cf_add_d2 = d2dict_gpu_scaling(cf, cf_add_d2, cf['num_gpus'])
 
-    dataset = DatasetDALY()
+    dataset = Dataset_daly_ocv()
     dataset.populate_from_folder(cf['dataset.cache_folder'])
     split_label = cf['dataset.subset']
     split_vids = get_daly_split_vids(dataset, split_label)
@@ -188,7 +188,7 @@ def train_daly_object(workfolder, cfg_dict, add_args):
     cf_add_d2 = cfg.without_prefix('d2.')
     cf_add_d2 = d2dict_gpu_scaling(cf, cf_add_d2, cf['num_gpus'])
 
-    dataset = DatasetDALY()
+    dataset = Dataset_daly_ocv()
     dataset.populate_from_folder(cf['dataset.cache_folder'])
     o100_objects, category_map = get_category_map_o100(dataset)
     assert len(o100_objects) == 16
@@ -303,7 +303,7 @@ def eval_daly_action(workfolder, cfg_dict, add_args):
     cf_add_d2 = cfg.without_prefix('d2.')
 
     # DALY Dataset
-    dataset = DatasetDALY()
+    dataset = Dataset_daly_ocv()
     dataset.populate_from_folder(cf['dataset.cache_folder'])
     split_label = cf['dataset.subset']
     split_vids = get_daly_split_vids(dataset, split_label)
@@ -335,7 +335,7 @@ def eval_daly_object(workfolder, cfg_dict, add_args):
     cf_add_d2 = cfg.without_prefix('d2.')
 
     # DALY Dataset
-    dataset = DatasetDALY()
+    dataset = Dataset_daly_ocv()
     dataset.populate_from_folder(cf['dataset.cache_folder'])
     split_label = cf['dataset.subset']
     split_vids = get_daly_split_vids(dataset, split_label)

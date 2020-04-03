@@ -3,8 +3,7 @@ import pandas as pd
 from typing import (Dict, List, Literal, Tuple)
 
 from thes.tools import snippets
-from thes.data.dataset.external import (
-        DALY_action_name,)
+from thes.data.dataset.external import (Action_name_daly,)
 from thes.data.tubes.types import (Frametube, Sframetube, V_dict, AV_dict)
 from thes.detectron.daly import (Datalist, Dl_record)
 from thes.evaluation.ap import (
@@ -75,7 +74,7 @@ def _tube_daly_ap_av(
     av_stubes: AV_dict[Sframetube],
     iou_thresholds: List[float],
     spatiotemporal: bool,
-        ) -> Dict[DALY_action_name, Dict[float, float]]:
+        ) -> Dict[Action_name_daly, Dict[float, float]]:
     cls_thresh_ap = {}
     for action_cls in av_gt_tubes.keys():
         thresh_ap = _tube_daly_ap_v(
@@ -120,7 +119,7 @@ def compute_ap_for_avtubes(
     Compute ap table
     """
     cls_thresh_ap: \
-        Dict[DALY_action_name, Dict[float, float]] = _tube_daly_ap_av(
+        Dict[Action_name_daly, Dict[float, float]] = _tube_daly_ap_av(
             av_gt_tubes, av_stubes, iou_thresholds, spatiotemporal)
     dft_ap = pd.DataFrame(cls_thresh_ap).T
     dft_ap = dft_ap.sort_index()
