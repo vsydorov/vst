@@ -28,7 +28,8 @@ def tube_daly_recall_as_df(
         good = df_rcovs[column] > thresh
         recall = good.groupby(level=0).mean()
         recall['all'] = good.mean()
-        recall.name = f'{thresh:.2f}'
+        # recall.name = f'{thresh:.2f}'
+        recall.name = thresh
         lst.append(recall)
     df = pd.concat(lst, axis=1)
     return df
@@ -84,7 +85,7 @@ def _tube_daly_ap_av(
     return cls_thresh_ap
 
 
-def compute_recall_for_avtubes(
+def compute_recall_for_avtubes_as_dfs(
         av_gt_tubes: AV_dict[Frametube],
         av_stubes: AV_dict[Sframetube],
         iou_thresholds: List[float],
@@ -104,12 +105,10 @@ def compute_recall_for_avtubes(
             df_rcovs, iou_thresholds, 'max_spatial')
     dft_recall_st = tube_daly_recall_as_df(
             df_rcovs, iou_thresholds, 'max_spatiotemp')
-    table_recall_s = snippets.df_to_table_v2((dft_recall_s*100).round(2))
-    table_recall_st = snippets.df_to_table_v2((dft_recall_st*100).round(2))
-    return table_recall_s, table_recall_st
+    return dft_recall_s, dft_recall_st
 
 
-def compute_ap_for_avtubes(
+def compute_ap_for_avtubes_as_df(
     av_gt_tubes: AV_dict[Frametube],
     av_stubes: AV_dict[Sframetube],
     iou_thresholds: List[float],
@@ -124,8 +123,7 @@ def compute_ap_for_avtubes(
     dft_ap = pd.DataFrame(cls_thresh_ap).T
     dft_ap = dft_ap.sort_index()
     dft_ap.loc['all'] = dft_ap.mean()
-    table_ap = snippets.df_to_table_v2((dft_ap*100).round(2))
-    return table_ap
+    return dft_ap
 
 
 def compute_ap_for_video_datalist(

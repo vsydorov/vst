@@ -233,9 +233,11 @@ def spatiotemp_tube_iou_1N(
 
 def compute_nms_for_v_stubes(
         v_stubes: V_dict[Sframetube],
-        thresh: float) -> V_dict[Sframetube]:
+        thresh: float,
+        verbose_nms: bool) -> V_dict[Sframetube]:
     v_stubes_nms = {}
-    for vid, tubes in tqdm(v_stubes.items(), desc='nms'):
+    for vid, tubes in tqdm(v_stubes.items(),
+            desc='nms', disable=not verbose_nms):
         nmsed_tubes = nms_over_custom_elements(
             tubes, spatiotemp_tube_iou_1N, lambda x: x['score'], thresh)
         v_stubes_nms[vid] = nmsed_tubes
@@ -259,10 +261,12 @@ def computecache_nms_for_av_stubes(
 def compute_nms_for_av_stubes(
         av_stubes: AV_dict[Sframetube],
         thresh: float,
+        verbose_nms: bool = False,
         ) -> AV_dict[Sframetube]:
     av_stubes_nms = {}
     for a, v_stubes in av_stubes.items():
-        av_stubes_nms[a] = compute_nms_for_v_stubes(v_stubes, thresh)
+        av_stubes_nms[a] = compute_nms_for_v_stubes(
+                v_stubes, thresh, verbose_nms)
     return av_stubes_nms
 
 

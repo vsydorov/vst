@@ -132,11 +132,11 @@ def compute_or_load_pkl(
             pkl = pickle.loads(pkl_bytes)
         log.info(f'Unpickled {filepath} in {timer() - start:.2f}s')
     except (EOFError, FileNotFoundError) as e:
-        log.info(f'Caught "{e}" error, Computing {function}(*args, **kwargs)')
+        log.debug(f'Caught "{e}" error, Computing {function}')
         pkl = function(*args, **kwargs)
         with filepath.open('wb') as f:
             pickle.dump(pkl, f, pickle.HIGHEST_PROTOCOL)
-        log.info(f'Computed and pickled to {filepath} in {timer() - start:.2f}s')
+        log.info(f'Computed and pickled {function} to {filepath} in {timer() - start:.2f}s')
     return pkl
 
 

@@ -1,4 +1,5 @@
 import copy
+import itertools
 import pandas as pd
 import warnings
 import logging
@@ -6,7 +7,7 @@ import cv2
 import numpy as np
 from tqdm import tqdm
 from pathlib import Path
-from typing import (List, Tuple, Dict, cast, TypedDict, Set)
+from typing import (List, Tuple, Dict, cast, TypedDict, Set, Sequence)
 from types import MethodType
 
 import torch
@@ -36,7 +37,7 @@ from thes.data.tubes.routines import (
     filter_tube_keyframes_only_gt_v2,
     compute_nms_for_av_stubes, score_ftubes_via_objaction_overlap_aggregation,)
 from thes.evaluation.routines import (
-    compute_recall_for_avtubes, compute_ap_for_avtubes)
+    compute_recall_for_avtubes_as_dfs, compute_ap_for_avtubes_as_df)
 from thes.tools import snippets
 
 
@@ -50,6 +51,21 @@ class Box_connections_dwti(TypedDict):
     boxes: List[np.ndarray]  # N, 4
 
 
+def compute_recall_ap_for_avtubes_as_dfdict(
+        av_gt_tubes: AV_dict[Frametube],
+        av_stubes: AV_dict[Sframetube],
+        iou_thresholds: List[float]
+        ) -> Dict[str, pd.DataFrame]:
+    df_recall_s, df_recall_st = compute_recall_for_avtubes_as_dfs(
+            av_gt_tubes, av_stubes, iou_thresholds)
+    df_ap_s = compute_ap_for_avtubes_as_df(
+            av_gt_tubes, av_stubes, iou_thresholds, False)
+    df_ap_st = compute_ap_for_avtubes_as_df(
+            av_gt_tubes, av_stubes, iou_thresholds, True)
+    dfdict = {'recall_s': df_recall_s, 'recall_st': df_recall_st,
+            'ap_s': df_ap_s, 'ap_st': df_ap_st}
+    return dfdict
+
 def computeprint_recall_ap_for_avtubes(
         av_gt_tubes: AV_dict[Frametube],
         av_stubes: AV_dict[Sframetube],
@@ -58,17 +74,17 @@ def computeprint_recall_ap_for_avtubes(
     Will compute tube ap per threshold, print table per thresh,
     print aggregate table
     """
-    table_recall_s, table_recall_st = compute_recall_for_avtubes(
+    # Get in DF form
+    dfdict = compute_recall_ap_for_avtubes_as_dfdict(
             av_gt_tubes, av_stubes, iou_thresholds)
-    table_ap_s = compute_ap_for_avtubes(
-            av_gt_tubes, av_stubes, iou_thresholds, False)
-    table_ap_st = compute_ap_for_avtubes(
-            av_gt_tubes, av_stubes, iou_thresholds, True)
-    # // Print
-    log.info('Spatial Recall:\n{}'.format(table_recall_s))
-    log.info('Spatiotemp Recall:\n{}'.format(table_recall_st))
-    log.info('Spatial AP:\n{}'.format(table_ap_s))
-    log.info('Spatiotemp AP:\n{}'.format(table_ap_st))
+    # Convert to str_tables
+    tables = {k: snippets.df_to_table_v2((v*100).round(2))
+            for k, v in dfdict.items()}
+    # Print
+    log.info('Spatial Recall:\n{}'.format(tables['recall_s']))
+    log.info('Spatiotemp Recall:\n{}'.format(tables['recall_st']))
+    log.info('Spatial AP:\n{}'.format(tables['ap_s']))
+    log.info('Spatiotemp AP:\n{}'.format(tables['ap_st']))
 
 
 class Ncfg_dataset:
@@ -173,6 +189,20 @@ class Ncfg_tube_eval:
                     av_stubes, cf['tube_eval.nms.thresh'])
         computeprint_recall_ap_for_avtubes(
                 av_gt_tubes, av_stubes, cf['tube_eval.iou_thresholds'])
+
+    @staticmethod
+    def eval_as_df(cf,
+            av_stubes: AV_dict[Sframetube],
+            av_gt_tubes: AV_dict[Frametube]):
+        assert cf['tube_eval.enabled']
+        av_stubes = av_stubes_above_score(
+                av_stubes, cf['tube_eval.minscore_cutoff'])
+        if cf['tube_eval.nms.enabled']:
+            av_stubes = compute_nms_for_av_stubes(
+                    av_stubes, cf['tube_eval.nms.thresh'])
+        dfdict = compute_recall_ap_for_avtubes_as_dfdict(
+                av_gt_tubes, av_stubes, cf['tube_eval.iou_thresholds'])
+        return dfdict
 
 
 def _set_rcnn_vid_eval_defcfg(cfg):
@@ -704,6 +734,20 @@ def apply_pfadet_rcnn_in_frames(workfolder, cfg_dict, add_args):
     Ncfg_tube_eval.evalprint_if(cf, av_stubes, av_gt_tubes)
 
 
+def _meanpool_avstubes(abstubes_to_merge: Sequence[AV_dict[Sframetube]]):
+    av_stubes: AV_dict[Sframetube] = {}
+    for a, v_dict in abstubes_to_merge[0].items():
+        for vid, stubes in v_dict.items():
+            for i, stube in enumerate(stubes):
+                scores = [t[a][vid][i]['score'] for t in abstubes_to_merge]
+                new_stube = stube.copy()
+                new_stube['score'] = np.mean(scores)
+                (av_stubes
+                        .setdefault(a, {})
+                        .setdefault(vid, []).append(new_stube))
+    return av_stubes
+
+
 def merge_scores_avstubes(workfolder, cfg_dict, add_args):
     out, = snippets.get_subfolders(workfolder, ['out'])
     cfg = snippets.YConfig(cfg_dict)
@@ -711,23 +755,63 @@ def merge_scores_avstubes(workfolder, cfg_dict, add_args):
     Ncfg_dataset.set_dataset_seed(cfg)
     Ncfg_tube_eval.set_defcfg(cfg)
     cfg.set_defaults("""
-    tubes_to_merge: ~
+    tube_dict: ~
+    combinations:
+        enabled: False
+        sizes: ~
+
     """)
     cf = cfg.parse()
 
     dataset, split_vids, av_gt_tubes = Ncfg_dataset.resolve_dataset_tubes(cf)
+    ts = {k: small.load_pkl(v) for k, v in cfg_dict['tube_dict'].items()}
+    if not cf['combinations.enabled']:
+        av_stubes = _meanpool_avstubes(list(ts.values()))
+        small.save_pkl(out/'merged_av_stubes.pkl', av_stubes)
+        log.info('All combined score:')
+        Ncfg_tube_eval.evalprint_if(cf, av_stubes, av_gt_tubes)
+        return
 
-    ts = [small.load_pkl(p) for p in cf['tubes_to_merge']]
-    av_stubes: AV_dict[Sframetube] = {}
-    for a, v_dict in ts[0].items():
-        for vid, stubes in v_dict.items():
-            for i, stube in enumerate(stubes):
-                scores = [t[a][vid][i]['score'] for t in ts]
-                new_stube = stube.copy()
-                new_stube['score'] = np.mean(scores)
-                (av_stubes
-                        .setdefault(a, {})
-                        .setdefault(vid, []).append(new_stube))
+    sizes = cf['combinations.sizes']
+    combinations = [list(itertools.combinations(ts.keys(), r)) for r in sizes]
+    combinations = list(itertools.chain(*combinations))
+    log.info('Combinations: {}'.format(combinations))
 
-    small.save_pkl(out/'av_stubes.pkl', av_stubes)
-    Ncfg_tube_eval.evalprint_if(cf, av_stubes, av_gt_tubes)
+    comb_dfdicts = {}
+    for comb in combinations:
+        comb_name = '+'.join(comb)
+        comb_fold = small.mkdir(out/comb_name)
+
+        def compute():
+            to_merge = [ts[k] for k in comb]
+            av_stubes = _meanpool_avstubes(to_merge)
+            small.save_pkl(comb_fold/'av_stubes.pkl', av_stubes)
+            dfdict = Ncfg_tube_eval.eval_as_df(cf, av_stubes, av_gt_tubes)
+            return dfdict
+
+        dfdict = small.stash2(comb_fold/'stashed_dfdict.pkl')(compute)
+        comb_dfdicts[comb_name] = dfdict
+
+    log.info('Individual results:')
+    for comb, dfdict in comb_dfdicts.items():
+        log.info(f'Results for {comb_name}:')
+        tables = {k: snippets.df_to_table_v2((v*100).round(2))
+                for k, v in dfdict.items()}
+        log.info('Spatial Recall:\n{}'.format(tables['recall_s']))
+        log.info('Spatiotemp Recall:\n{}'.format(tables['recall_st']))
+        log.info('Spatial AP:\n{}'.format(tables['ap_s']))
+        log.info('Spatiotemp AP:\n{}'.format(tables['ap_st']))
+
+    log.info('Combined tables:')
+    big_= {comb: pd.concat(dfdict)
+            for comb, dfdict in comb_dfdicts.items()}
+    big = pd.concat(big_, axis=1)
+    for stat in big.index.levels[0]:
+        log.info(f'=== {stat} ===')
+        for thresh in big.columns.levels[1]:
+            X = (big.loc['ap_st']
+                .loc[:, pd.IndexSlice[:, thresh]]
+                .droplevel(1, axis=1))
+            table = snippets.df_to_table_v2((X*100).round(2))
+            log.info(f'{stat} for IOU {thresh}:\n{table}')
+        log.info('\n')
