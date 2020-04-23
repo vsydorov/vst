@@ -4,18 +4,18 @@ import itertools
 import numpy as np
 import pandas as pd
 from typing import (  # NOQA
-    Dict, List, Tuple, TypeVar, Set, Optional, Callable, TypedDict, NewType,
-    NamedTuple, Sequence, Literal, cast)
-
+    Dict, List, Tuple, TypeVar, Set, Optional, Callable,
+    TypedDict, NewType, NamedTuple, Sequence, Literal, cast)
 from thes.tools import snippets
 from thes.data.dataset.external import (
         Dataset_daly_ocv, Vid_daly,
         Action_name_daly)
 
 from thes.data.tubes.types import (
-        Sframetube, Frametube, Base_frametube,
-        DALY_wein_tube_index, Objaction_dets,
-        get_daly_gt_tubes, V_dict, AV_dict)
+    Sframetube, Frametube, Base_frametube,
+    DALY_wein_tube_index, Objaction_dets,
+    V_dict, AV_dict, DALY_wein_tube, DALY_gt_tube,
+    DALY_gt_tube_index, I_weingroup)
 
 from vsydorov_tools import small
 
@@ -59,6 +59,7 @@ def filter_tube_keyframes_only_gt_v2(
                 start_frame = np.min(frame_inds)
                 end_frame = np.max(frame_inds)
             v_intersect: Frametube = {
+                'index': v['index'],
                 'frame_inds': frame_inds,
                 'boxes': boxes,
                 'start_frame': start_frame,
@@ -215,6 +216,17 @@ def temporal_ious_where_positive(x_bf, x_ef, y_frange):
     return ptious, pids
 
 
+def temporal_ious_NN(x_frange, y_frange):
+    begin = np.maximum(x_frange[..., 0], y_frange[..., 0])
+    end = np.minimum(x_frange[..., 1], y_frange[..., 1])
+    inter = end - begin + 1
+    inter[inter<0] = 0
+    union = ((x_frange[..., 1] - x_frange[..., 0] + 1)
+        + (y_frange[..., 1] - y_frange[..., 0] + 1)
+        - inter)
+    return inter/union
+
+
 def spatiotemp_tube_iou_1N(
         x: Sframetube, ys: Sequence[Sframetube]) -> np.ndarray:
     """
@@ -231,16 +243,20 @@ def spatiotemp_tube_iou_1N(
     return st_overlaps
 
 
+def compute_nms_for_stubes(stubes: List[Sframetube], thresh: float):
+    return nms_over_custom_elements(
+            stubes, spatiotemp_tube_iou_1N, lambda x: x['score'], thresh)
+
+
 def compute_nms_for_v_stubes(
         v_stubes: V_dict[Sframetube],
         thresh: float,
         verbose_nms: bool) -> V_dict[Sframetube]:
     v_stubes_nms = {}
-    for vid, tubes in tqdm(v_stubes.items(),
+    for vid, stubes in tqdm(v_stubes.items(),
             desc='nms', disable=not verbose_nms):
-        nmsed_tubes = nms_over_custom_elements(
-            tubes, spatiotemp_tube_iou_1N, lambda x: x['score'], thresh)
-        v_stubes_nms[vid] = nmsed_tubes
+        nmsed_stubes = compute_nms_for_stubes(stubes, thresh)
+        v_stubes_nms[vid] = nmsed_stubes
     return v_stubes_nms
 
 
@@ -253,7 +269,7 @@ def computecache_nms_for_av_stubes(
         nmsed_stubes_v = small.stash2(
             nms_folder/f'scored_tubes_nms_{thresh:.2f}_at_{a}_v2.pkl')(
             compute_nms_for_v_stubes,
-            v_stubes, thresh)
+            v_stubes, thresh, True)
         av_stubes_nms[a] = nmsed_stubes_v
     return av_stubes_nms
 
@@ -324,3 +340,88 @@ def score_ftubes_via_objaction_overlap_aggregation(
                     .setdefault(action_name, {})
                     .setdefault(vid, []).append(stube))
     return av_stubes
+
+def _get_df_daly_groundtruth(gt_tubes):
+    dgt_frange_ = np.array([
+        (gt_tube['start_frame'], gt_tube['end_frame'])
+        for gt_tube in gt_tubes.values()])
+    df_dgt = pd.DataFrame(dgt_frange_,
+            pd.MultiIndex.from_tuples(
+                list(gt_tubes.keys()), names=['vid', 'act', 'id']),
+            columns=['start', 'end'],)
+    return df_dgt
+
+def _get_df_weingroup_range(dwein_tubes):
+    dwt_frange_ = [
+        (tube['frame_inds'].min(), tube['frame_inds'].max())
+        for tube in dwein_tubes.values()]
+    dwt_df = pd.DataFrame(dwt_frange_, pd.MultiIndex.from_tuples(
+        dwein_tubes.keys(), names=['vid', 'gid', 'tid']),
+        columns=['start', 'end'])
+
+    dwt_df_grouped_ = dwt_df.groupby(level=[0, 1]).agg(lambda x: set(x))
+    assert dwt_df_grouped_.applymap(
+            lambda x: len(x) == 1).all().all(), \
+            'All groups must have equal size'
+    weingroup_range = dwt_df_grouped_.applymap(lambda x: list(x)[0])
+    return weingroup_range
+
+
+def get_weingroup_assignment(
+        gt_tubes: Dict[DALY_gt_tube_index, Frametube],
+        dwein_tubes: Dict[DALY_wein_tube_index, DALY_wein_tube],
+        ) -> Tuple[
+                List[Tuple[Vid_daly, int]],
+                List[DALY_gt_tube_index]]:
+
+    df_gt = _get_df_daly_groundtruth(gt_tubes)
+    df_weingroup_range = _get_df_weingroup_range(dwein_tubes)
+
+    wgi = []
+    gti = []
+    all_vids = df_gt.index.levels[0]
+    for vid in all_vids:
+        wg = df_weingroup_range.loc[vid].sort_values('start')
+        gt = df_gt.loc[vid].sort_values('start')
+        assert len(wg) == len(gt)
+        ious = temporal_ious_NN(wg.to_numpy(), gt.to_numpy())
+        assert (ious >= 0.75).all()
+        for gid in wg.index:
+            wgi.append((vid, gid))
+        for (act, ind) in gt.index:
+            gti.append((vid, act, ind))
+    assert len(set(wgi)) == len(wgi) == len(set(gti)) == len(gti)
+    return wgi, gti
+
+def wein_coverage_stats(
+        gt_tubes: Dict[DALY_gt_tube_index, DALY_gt_tube],
+        dwein_tubes: Dict[DALY_wein_tube_index, DALY_wein_tube],
+        ) -> Dict[Tuple[Vid_daly, int], DALY_gt_tube_index]:
+    raise NotImplementedError()
+    pass
+
+# wgi_to_dgti = {}
+# for (vid, gid), row in weingroup_range.iterrows():
+#     dgt_vmask = dgt_indexes[:, 0] == vid
+#     dgt_indexes_vmasked = dgt_indexes[dgt_vmask]
+#     dgt_frange_vmasked = dgt_frange[dgt_vmask]
+#     ptious, pids = temporal_ious_where_positive(
+#             row['start'], row['end'], dgt_frange_vmasked)
+#     assert len(ptious), 'must match something'
+#     best_match_i_vmasked = pids[np.argmax(ptious)]
+#     I = dgt_indexes_vmasked[best_match_i_vmasked].tolist()
+#     dgt_index = (I[0], I[1], int(I[2]))
+#     wgi_to_dgti[(vid, gid)] = dgt_index
+# dgti_to_wgi: Dict[DALY_gt_tube_index, I_weingroup] = \
+#         dict(zip(wgi_to_dgti.values(), wgi_to_dgti.keys()))
+
+# # Experiment, of whether any windows intersect
+# frame_counter = {}
+# max_per_vid = df_dgt.groupby('vid').end.max()
+# for vid, row in max_per_vid.iteritems():
+#     frame_counter[vid] = np.zeros(int(row))
+# for idx, row in df_dgt.iterrows():
+#     b = int(row.start)
+#     e = int(row.end)
+#     frame_counter[idx[0]][b: e] += 1
+# intersecting = {k: v.max() for k, v in frame_counter.items() if v.max() > 1}

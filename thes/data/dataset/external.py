@@ -113,8 +113,8 @@ class Dataset_daly(object):
     root_path: Path
     action_names = cast(List[Action_name_daly], [
         'ApplyingMakeUpOnLips', 'BrushingTeeth', 'CleaningFloor',
-        'CleaningWindows', 'Drinking', 'FoldingTextile', 'Ironing', 'Phoning',
-        'PlayingHarmonica', 'TakingPhotosOrVideos'])
+        'CleaningWindows', 'Drinking', 'FoldingTextile', 'Ironing',
+        'Phoning', 'PlayingHarmonica', 'TakingPhotosOrVideos'])
     object_names = cast(List[Object_name_daly], [
         'balm', 'bedsheet', 'bottle', 'bowl', 'broom', 'brush', 'camera',
         'cloth', 'cup', 'electricToothbrush', 'finger', 'glass', 'glass+straw',
@@ -232,8 +232,12 @@ class Dataset_daly_ocv(Dataset_daly):
                         kf_ocv = cast(Keyframe_daly_ocv, kf_ocv)
                         keyframes.append(kf_ocv)
                     instance_ocv = copy.deepcopy(instance)
-                    start_frame = np.ceil(instance['beginTime'] * est_fps) - 1
-                    end_frame = np.ceil(instance['endTime'] * est_fps) - 1
+                    # Edges are controlled for corner cases
+                    start_frame = max(0, np.ceil(instance['beginTime'] * est_fps) - 1)
+                    end_frame = np.ceil(instance['endTime'] * est_fps)
+                    if end_frame > rs['max_pos_frames']:
+                        end_frame = rs['max_pos_frames']
+                    end_frame -= 1
                     instance_ocv.update({
                         'keyframes': keyframes,
                         'start_frame': start_frame,

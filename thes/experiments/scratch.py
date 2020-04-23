@@ -59,6 +59,55 @@ def _examine_stats(self, rstats):
     d_kf['x'] = (d_kf['time']*d_kf['meta_fps']).apply(np.ceil)
     d_kf[d_kf['x'] != d_kf['frameNumber']]
 
+def _examine_kframes(self, rstats):
+    vids = list(self.videos.keys())
+    d_rstats = pd.DataFrame(rstats).T.loc[vids]
+    d_rstats['est_fps'] = (d_rstats['max_pos_frames']-1)*1000/d_rstats['max_pos_msec']
+
+    action_list = []
+    for vid, video in self.videos.items():
+        for action_name, ains in video['instances'].items():
+            for ins_ind, instance in enumerate(ains):
+                actitem = {}
+                actitem['beginTime'] = instance['beginTime']
+                actitem['endTime'] = instance['endTime']
+                actitem.update({
+                    'vid': vid,
+                    'action_name': action_name,
+                    'ins_ind': ins_ind})
+                action_list.append(actitem)
+    dact = pd.DataFrame(action_list)
+    dact['est_fps'] = d_rstats.loc[dact['vid']].reset_index()['est_fps']
+    dact['total_frames'] = d_rstats.loc[
+            dact['vid']].reset_index()['max_pos_frames']
+    dact['xbegin'] = (dact['beginTime']*dact['est_fps']
+                      ).apply(lambda x: max(1, np.ceil(x)))
+    dact['xend'] = (dact['endTime']*dact['est_fps']).apply(np.ceil)
+    dact.loc[dact['xend']>dact['total_frames'], 'xend'] = dact['total_frames']
+
+    kflist = []
+    for vid, video in self.videos.items():
+        for action_name, ains in video['instances'].items():
+            for ins_ind, instance in enumerate(ains):
+                for kf_ind, kf in enumerate(instance['keyframes']):
+                    kfitem = {}
+                    kfitem['time'] = kf['time']
+                    kfitem['frameNumber'] = kf['frameNumber']
+                    kfitem.update({
+                        'vid': vid,
+                        'action_name': action_name,
+                        'ins_ind': ins_ind,
+                        'kf_ind': kf_ind})
+                    kflist.append(kfitem)
+    dkf = pd.DataFrame(kflist)
+    dkf['est_fps'] = d_rstats.loc[dkf['vid']].reset_index()['est_fps']
+    dkf['orig_fps'] = d_rstats.loc[dkf['vid']].reset_index()['fps']
+    # eps = np.finfo(np.float32).eps
+    dkf['x_orig'] = (dkf['time']*dkf['orig_fps']).apply(np.ceil)
+    dkf[dkf['x_orig'] != dkf['frameNumber']]
+    dkf['x_est'] = (dkf['time']*dkf['est_fps']).apply(np.ceil)
+    dkf[dkf['x_est'] != dkf['frameNumber']]
+
 
 def compare_data(workfolder, cfg_dict, add_args):
     out, = snippets.get_subfolders(workfolder, ['out'])
