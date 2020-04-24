@@ -836,7 +836,7 @@ def merge_scores_avstubes(workfolder, cfg_dict, add_args):
     log.info('Individual results:')
     for comb, dfdict in comb_dfdicts.items():
         log.info(f'Results for {comb_name}:')
-        _print_exhaustive_evaluation_stats(dfdict)
+        _print_quick_evaluation_stats(dfdict)
 
     log.info('Combined tables:')
     big_= {comb: pd.concat(dfdict)
