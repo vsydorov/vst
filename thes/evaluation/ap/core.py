@@ -4,7 +4,7 @@ import numpy as np
 from abc import abstractmethod, ABC
 from thes.data.dataset.external import (Vid)
 from typing import (
-    Any, Dict, List, Tuple, TypedDict)
+    Any, Dict, List, Tuple, TypedDict, NewType)
 from thes.data.tubes.routines import (
         numpy_iou_11, spatial_tube_iou_v3,
         temporal_ious_where_positive)
@@ -12,6 +12,10 @@ from thes.data.tubes.types import (Frametube,)
 
 
 log = logging.getLogger(__name__)
+
+
+IFDET = NewType('IFDET', int)
+IFGT = NewType('IFGT', int)
 
 
 class AP_fgt(TypedDict):
@@ -116,13 +120,13 @@ class AP_computer(ABC):
         pass
 
     @abstractmethod
-    def _get_matchable_ifgts(self, ifdet: int) -> List[int]:
+    def _get_matchable_ifgts(self, ifdet: IFDET) -> List[IFGT]:
         pass
 
     @abstractmethod
     def _compute_iou_coverages(self,
-            matchable_ifgts: List[int],
-            ifdet: int) -> List[float]:
+            matchable_ifgts: List[IFGT],
+            ifdet: IFDET) -> List[float]:
         pass
 
     def _compute_ap(
@@ -152,7 +156,8 @@ class AP_computer(ABC):
         sorted_inds = np.argsort(-detection_scores)
 
         for d, ifdet in enumerate(sorted_inds):
-            matchable_ifgts: List[int] = self._get_matchable_ifgts(ifdet)
+            matchable_ifgts: List[IFGT] = \
+                    self._get_matchable_ifgts(ifdet)
             if not len(matchable_ifgts):
                 fp[d] = 1
                 continue
@@ -160,7 +165,8 @@ class AP_computer(ABC):
                 self._compute_iou_coverages(matchable_ifgts, ifdet)
             max_coverage_local_id: int = np.argmax(iou_coverages)
             max_coverage: float = iou_coverages[max_coverage_local_id]
-            max_coverage_ifgt: int = matchable_ifgts[max_coverage_local_id]
+            max_coverage_ifgt: IFGT = \
+                    matchable_ifgts[max_coverage_local_id]
             if max_coverage > iou_thresh:
                 if (not use_diff) and fgts[max_coverage_ifgt]['diff']:
                     continue
@@ -183,7 +189,7 @@ class AP_framebox_computer(AP_computer):
     # ifgts that are in the same frame as ifdets
     fgts: List[AP_fgt_framebox]
     fdets: List[AP_fdet_framebox]
-    ifdet_to_ifgts: Dict[int, List[int]]
+    ifdet_to_ifgts: Dict[IFDET, List[IFGT]]
 
     def __init__(self,
             fgts: List[AP_fgt_framebox],
@@ -210,14 +216,15 @@ class AP_framebox_computer(AP_computer):
                 ifdet_to_ifgts.setdefault(ifdet, []).append(ifgt)
         self.ifdet_to_ifgts = ifdet_to_ifgts
 
-    def _get_matchable_ifgts(self, ifdet: int) -> List[int]:
+    def _get_matchable_ifgts(self, ifdet: IFDET) -> List[IFGT]:
         # Check available GTs
-        share_image_ifgts: List[int] = self.ifdet_to_ifgts.get(ifdet, [])
+        share_image_ifgts: List[IFGT] = \
+                self.ifdet_to_ifgts.get(ifdet, [])
         return share_image_ifgts
 
     def _compute_iou_coverages(self,
-            matchable_ifgts: List[int],
-            ifdet: int) -> List[float]:
+            matchable_ifgts: List[IFGT],
+            ifdet: IFDET) -> List[float]:
         fgts = self.fgts
         fdets = self.fdets
         fdet = fdets[ifdet]
@@ -241,29 +248,29 @@ class AP_tube_computer(AP_computer):
     fgts: List[AP_fgt_tube]
     fdets: List[AP_fdet_tube]
     _spatiotemporal: bool
-    _det_to_eligible_gt: Dict[int, Dict[int, float]]
+    _det_to_eligible_gt: Dict[IFDET, Dict[IFGT, float]]
 
     def __init__(self,
             fgts: List[AP_fgt_tube],
             fdets: List[AP_fdet_tube],
-            det_to_eligible_gt: Dict[int, Dict[int, float]]):
+            det_to_eligible_gt: Dict[IFDET, Dict[IFGT, float]]):
         self.fgts = fgts
         self.fdets = fdets
         self._det_to_eligible_gt = det_to_eligible_gt
 
-    def _get_matchable_ifgts(self, ifdet: int) -> List[int]:
+    def _get_matchable_ifgts(self, ifdet: IFDET) -> List[IFGT]:
         # Check available GTs
-        gt_ids_that_overlap: Dict[int, float] = \
+        gt_ids_that_overlap: Dict[IFGT, float] = \
                 self._det_to_eligible_gt.get(ifdet, {})
         return list(gt_ids_that_overlap.keys())
 
     def _compute_iou_coverages(self,
-            matchable_ifgts: List[int],
-            ifdet: int) -> List[float]:
+            matchable_ifgts: List[IFGT],
+            ifdet: IFDET) -> List[float]:
         fgts = self.fgts
         fdets = self.fdets
         fdet = fdets[ifdet]
-        gt_ids_that_overlap: Dict[int, float] = \
+        gt_ids_that_overlap: Dict[IFGT, float] = \
                 self._det_to_eligible_gt.get(ifdet, {})
         # Compute IOUs
         iou_coverages: List[float] = []

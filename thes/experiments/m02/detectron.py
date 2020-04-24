@@ -26,7 +26,7 @@ from thes.detectron.daly import (
     Datalist, Dl_record, get_daly_split_vids, simplest_daly_to_datalist_v2,
     daly_to_datalist_pfadet, get_category_map_o100, make_datalist_o100,
     get_datalist_action_object_converter)
-from thes.evaluation.routines import (compute_ap_for_video_datalist)
+from thes.evaluation.ap.convert import (compute_ap_for_video_datalist)
 from thes.tools import snippets
 
 

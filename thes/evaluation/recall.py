@@ -2,19 +2,25 @@ import logging
 import warnings
 import numpy as np
 import pandas as pd
-from typing import (TypedDict, List, Literal)
-from thes.data.tubes.types import (Frametube, Sframetube, V_dict, AV_dict)
+from typing import (  # NOQA
+    TypedDict, List, Literal, Tuple,
+    Dict, cast, Set, Sequence, Optional,
+    TypeVar)
+
+from thes.data.tubes.types import (
+        Frametube, Frametube_scored,
+        V_dict, AV_dict, T_dgt)
 from thes.data.tubes.routines import (
         spatial_tube_iou_v3,
         temporal_ious_where_positive)
 
-from typing import (Tuple, Dict, cast, Set, Sequence, Optional)
-from thes.data.tubes.types import (
-    DALY_gt_tube_index, Vid_daly, I_weingroup)
-from thes.data.dataset.external import (Action_name_daly, )
-
 
 log = logging.getLogger(__name__)
+
+
+TV_frametube_co = TypeVar('TV_frametube_co', bound=Frametube)
+TV_frametube_scored_co = \
+    TypeVar('TV_frametube_scored_co', bound=Frametube_scored)
 
 
 class Recall_coverage(TypedDict):
@@ -24,7 +30,7 @@ class Recall_coverage(TypedDict):
 
 def _compute_daly_recall_coverage(
         gt_tube: Frametube,
-        proposals: List[Sframetube],
+        proposals: List[TV_frametube_scored_co],
         proposals_frange: np.ndarray,) -> Recall_coverage:
     if len(proposals) == 0:
         return {'max_spatial': np.nan,
@@ -51,41 +57,21 @@ def _compute_daly_recall_coverage(
 
 
 def _compute_daly_recall_coverage_v(
-        v_gt_tubes: V_dict[Frametube],
-        v_stubes: V_dict[Sframetube]
+        v_gt_tubes: V_dict[T_dgt],
+        v_stubes: V_dict[TV_frametube_scored_co],
+        use_diff: bool,
             ) -> V_dict[Recall_coverage]:
     v_rcovs: V_dict[Recall_coverage] = {}
     for vid, gt_tubes in v_gt_tubes.items():
-        proposals: List[Sframetube] = v_stubes.get(vid, [])
+        proposals: List[TV_frametube_scored_co] = v_stubes.get(vid, [])
         proposals_frange = np.array([
             (x['start_frame'], x['end_frame']) for x in proposals])
         rcovs = []
         for gt_tube in gt_tubes:
-            rcoverage = _compute_daly_recall_coverage(
-                    gt_tube, proposals, proposals_frange)
-            rcovs.append(rcoverage)
-        v_rcovs[vid] = rcovs
-    return v_rcovs
-
-
-def _compute_daly_recall_coverage_v_weingroup(
-      v_gt_tubes: V_dict[Frametube],
-      wg_stubes: Dict[I_weingroup, List[Sframetube]],
-      gti_to_wgi: Dict[DALY_gt_tube_index, Tuple[Vid_daly, int]]
-        ) -> V_dict[Recall_coverage]:
-    v_rcovs: V_dict[Recall_coverage] = {}
-    for vid, gt_tubes in v_gt_tubes.items():
-        rcovs = []
-        for gt_tube in gt_tubes:
-            gti = cast(DALY_gt_tube_index, gt_tube['index'])
-            wgi = gti_to_wgi.get(gti)
-            proposals: List[Sframetube] = wg_stubes.get(wgi, [])  # type: ignore
-            if proposals is None:
-                rcoverage = {'max_spatial': np.nan,
-                        'max_spatiotemp': np.nan}
+            fl = gt_tube['flags']
+            diff = fl['isReflection'] or fl['isAmbiguous']
+            if diff and not use_diff:
                 continue
-            proposals_frange = np.array([
-                (x['start_frame'], x['end_frame']) for x in proposals])
             rcoverage = _compute_daly_recall_coverage(
                     gt_tube, proposals, proposals_frange)
             rcovs.append(rcoverage)
@@ -94,8 +80,9 @@ def _compute_daly_recall_coverage_v_weingroup(
 
 
 def compute_daly_recall_coverage_av(
-        av_gt_tubes: AV_dict[Frametube],
-        av_stubes: AV_dict[Sframetube],
+        av_gt_tubes: AV_dict[T_dgt],
+        av_stubes: AV_dict[TV_frametube_scored_co],
+        use_diff: bool,
             ) -> AV_dict[Recall_coverage]:
     """
     For each GT tube, compute best possible IOU over proposals
@@ -103,23 +90,7 @@ def compute_daly_recall_coverage_av(
     av_rcovs: AV_dict[Recall_coverage] = {}
     for action_cls in av_gt_tubes.keys():
         av_rcovs[action_cls] = _compute_daly_recall_coverage_v(
-                    av_gt_tubes[action_cls], av_stubes[action_cls])
-    return av_rcovs
-
-
-def compute_daly_recall_coverage_av_weingroup(
-        av_gt_tubes: AV_dict[Frametube],
-        awg_stubes: Dict[Action_name_daly,
-            Dict[I_weingroup, List[Sframetube]]],
-        gti_to_wgi: Dict[DALY_gt_tube_index, Tuple[Vid_daly, int]],
-            ) -> AV_dict[Recall_coverage]:
-    """
-    For each GT tube, compute best possible IOU over proposals
-    """
-    av_rcovs: AV_dict[Recall_coverage] = {}
-    for action_cls in av_gt_tubes.keys():
-        av_rcovs[action_cls] = _compute_daly_recall_coverage_v_weingroup(
-            av_gt_tubes[action_cls], awg_stubes[action_cls], gti_to_wgi)
+            av_gt_tubes[action_cls], av_stubes[action_cls], use_diff)
     return av_rcovs
 
 
@@ -142,15 +113,17 @@ def tube_daly_recall_as_df(
 
 
 def compute_recall_for_avtubes_as_dfs(
-        av_gt_tubes: AV_dict[Frametube],
-        av_stubes: AV_dict[Sframetube],
+        av_gt_tubes: AV_dict[T_dgt],
+        av_stubes: AV_dict[TV_frametube_scored_co],
         iou_thresholds: List[float],
+        use_diff: bool,
             ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Compute recall tables
     """
     av_rcovs: AV_dict[Recall_coverage] = \
-            compute_daly_recall_coverage_av(av_gt_tubes, av_stubes)
+            compute_daly_recall_coverage_av(
+                    av_gt_tubes, av_stubes, use_diff)
     df_rcovs_ = {}
     for action_cls, v_rcovs in av_rcovs.items():
         for vid, rcovs in v_rcovs.items():

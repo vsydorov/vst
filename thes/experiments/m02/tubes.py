@@ -7,7 +7,8 @@ import cv2
 import numpy as np
 from tqdm import tqdm
 from pathlib import Path
-from typing import (List, Tuple, Dict, cast, TypedDict, Set, Sequence)
+from typing import (
+        List, Tuple, Dict, cast, TypedDict, Set, Sequence, Optional)
 from types import MethodType
 
 import torch
@@ -22,7 +23,7 @@ from vsydorov_tools import small
 from vsydorov_tools import cv as vt_cv
 
 from thes.data.dataset.external import (
-        Dataset_daly_ocv, Vid_daly, Action_name_daly)
+    Dataset_daly_ocv, Vid_daly)
 from thes.caffe import (Nicolas_net_helper)
 from thes.detectron.cfg import (
     set_detectron_cfg_base, set_detectron_cfg_test,)
@@ -31,27 +32,21 @@ from thes.detectron.daly import (
     get_daly_split_vids, simplest_daly_to_datalist_v2,
     get_datalist_action_object_converter,)
 from thes.data.tubes.types import (
-    DALY_wein_tube, DALY_wein_tube_index, Objaction_dets, Frametube,
-    Sframetube, convert_dwein_tube, dtindex_filter_split,
-    av_filter_split, av_stubes_above_score, get_daly_gt_tubes,
-    AV_dict, push_into_avdict, I_weingroup)
+    I_dwein, T_dwein, T_dwein_scored, I_dgt, T_dgt,
+    loadconvert_tubes_dwein, get_daly_gt_tubes,
+    push_into_avdict, dtindex_filter_split,
+    Objaction_dets, Frametube,
+    av_filter_split, av_stubes_above_score,
+    AV_dict,)
 from thes.data.tubes.routines import (
-    filter_tube_keyframes_only_gt_v2,
-    compute_nms_for_av_stubes,
-    score_ftubes_via_objaction_overlap_aggregation,
-    compute_nms_for_stubes, get_weingroup_assignment
-    )
-from thes.evaluation.routines import (
-        compute_ap_for_avtubes_as_df,
-        _tube_daly_ap_v_weingroup)
+    score_ftubes_via_objaction_overlap_aggregation,)
+from thes.data.tubes.nms import (
+    compute_nms_for_av_stubes,)
+from thes.evaluation.ap.convert import (
+    compute_ap_for_avtubes_as_df,)
 from thes.evaluation.recall import (
-        compute_recall_for_avtubes_as_dfs,
-        compute_daly_recall_coverage_av_weingroup,
-        tube_daly_recall_as_df)
+    compute_recall_for_avtubes_as_dfs,)
 from thes.tools import snippets
-
-
-from thes.data.tubes.types import (DALY_gt_tube_index, V_dict)
 
 
 log = logging.getLogger(__name__)
@@ -60,45 +55,74 @@ log = logging.getLogger(__name__)
 class Box_connections_dwti(TypedDict):
     vid: Vid_daly
     frame_ind: int
-    dwti_sources: List[DALY_wein_tube_index]  # N
+    dwti_sources: List[I_dwein]  # N
     boxes: List[np.ndarray]  # N, 4
 
 
-def compute_recall_ap_for_avtubes_as_dfdict(
-        av_gt_tubes: AV_dict[Frametube],
-        av_stubes: AV_dict[Sframetube],
+def _compute_quick_stats(
+        av_gt_tubes: AV_dict[T_dgt],
+        av_stubes: AV_dict[T_dwein_scored],
         iou_thresholds: List[float]
         ) -> Dict[str, pd.DataFrame]:
-    df_recall_s, df_recall_st = compute_recall_for_avtubes_as_dfs(
-            av_gt_tubes, av_stubes, iou_thresholds)
-    df_ap_s = compute_ap_for_avtubes_as_df(
-            av_gt_tubes, av_stubes, iou_thresholds, False)
-    df_ap_st = compute_ap_for_avtubes_as_df(
+    df_recall_s_nodiff = compute_recall_for_avtubes_as_dfs(
+            av_gt_tubes, av_stubes, iou_thresholds, False)[0]
+    df_ap_s_nodiff = compute_ap_for_avtubes_as_df(
+            av_gt_tubes, av_stubes, iou_thresholds, False, False)
+    return {'recall': df_recall_s_nodiff, 'ap': df_ap_s_nodiff}
+
+
+def _compute_exhaustive_evaluation_stats(
+        av_gt_tubes: AV_dict[T_dgt],
+        av_stubes: AV_dict[T_dwein_scored],
+        iou_thresholds: List[float]
+        ) -> Dict[str, pd.DataFrame]:
+    df_recall_s_diff, df_recall_st_diff = compute_recall_for_avtubes_as_dfs(
             av_gt_tubes, av_stubes, iou_thresholds, True)
-    dfdict = {'recall_s': df_recall_s, 'recall_st': df_recall_st,
-            'ap_s': df_ap_s, 'ap_st': df_ap_st}
+    df_recall_s_nodiff, df_recall_st_nodiff = compute_recall_for_avtubes_as_dfs(
+            av_gt_tubes, av_stubes, iou_thresholds, False)
+    df_ap_s_diff = compute_ap_for_avtubes_as_df(
+            av_gt_tubes, av_stubes, iou_thresholds, False, True)
+    df_ap_s_nodiff = compute_ap_for_avtubes_as_df(
+            av_gt_tubes, av_stubes, iou_thresholds, False, False)
+    df_ap_st_diff = compute_ap_for_avtubes_as_df(
+            av_gt_tubes, av_stubes, iou_thresholds, True, True)
+    df_ap_st_nodiff = compute_ap_for_avtubes_as_df(
+            av_gt_tubes, av_stubes, iou_thresholds, True, False)
+    dfdict = {
+            'recall_s_diff': df_recall_s_diff,
+            'recall_st_diff': df_recall_st_diff,
+            'recall_s_nodiff': df_recall_s_nodiff,
+            'recall_st_nodiff': df_recall_st_nodiff,
+            'ap_s_diff': df_ap_s_diff,
+            'ap_s_nodiff': df_ap_s_nodiff,
+            'ap_st_diff': df_ap_st_diff,
+            'ap_st_nodiff': df_ap_st_nodiff,
+            }
     return dfdict
 
 
-def computeprint_recall_ap_for_avtubes(
-        av_gt_tubes: AV_dict[Frametube],
-        av_stubes: AV_dict[Sframetube],
-        iou_thresholds: List[float]):
-    """
-    Will compute tube ap per threshold, print table per thresh,
-    print aggregate table
-    """
-    # Get in DF form
-    dfdict = compute_recall_ap_for_avtubes_as_dfdict(
-            av_gt_tubes, av_stubes, iou_thresholds)
+def _print_quick_evaluation_stats(dfdict):
     # Convert to str_tables
     tables = {k: snippets.df_to_table_v2((v*100).round(2))
             for k, v in dfdict.items()}
     # Print
-    log.info('Spatial Recall:\n{}'.format(tables['recall_s']))
-    log.info('Spatiotemp Recall:\n{}'.format(tables['recall_st']))
-    log.info('Spatial AP:\n{}'.format(tables['ap_s']))
-    log.info('Spatiotemp AP:\n{}'.format(tables['ap_st']))
+    log.info('Recall:\n{}'.format(tables['recall']))
+    log.info('Video AP:\n{}'.format(tables['ap']))
+
+
+def _print_exhaustive_evaluation_stats(dfdict):
+    # Convert to str_tables
+    tables = {k: snippets.df_to_table_v2((v*100).round(2))
+            for k, v in dfdict.items()}
+    # Print
+    log.info('Spatial Recall (diff):\n{}'.format(tables['recall_s_diff']))
+    log.info('Spatial Recall (nodiff):\n{}'.format(tables['recall_s_nodiff']))
+    log.info('Spatiotemp Recall (diff):\n{}'.format(tables['recall_st_diff']))
+    log.info('Spatiotemp Recall (nodiff):\n{}'.format(tables['recall_st_nodiff']))
+    log.info('Spatial AP (diff):\n{}'.format(tables['ap_s_diff']))
+    log.info('Spatial AP (nodiff):\n{}'.format(tables['ap_s_nodiff']))
+    log.info('Spatiotemp AP (diff):\n{}'.format(tables['ap_st_diff']))
+    log.info('Spatiotemp AP (nodiff):\n{}'.format(tables['ap_s_nodiff']))
 
 
 class Ncfg_dataset:
@@ -117,12 +141,12 @@ class Ncfg_dataset:
         dataset = Dataset_daly_ocv()
         dataset.populate_from_folder(cf['dataset.cache_folder'])
         split_label = cf['dataset.subset']
-        split_vids = get_daly_split_vids(dataset, split_label)
-        dgt_tubes: Dict[DALY_gt_tube_index, Frametube] = \
+        split_vids: List[Vid_daly] = \
+                get_daly_split_vids(dataset, split_label)
+        dgt_tubes: Dict[I_dgt, T_dgt] = \
                 get_daly_gt_tubes(dataset)
         dgt_tubes = dtindex_filter_split(dgt_tubes, split_vids)
-        av_gt_tubes: AV_dict[Frametube] = \
-                push_into_avdict(dgt_tubes)
+        av_gt_tubes: AV_dict[T_dgt] = push_into_avdict(dgt_tubes)
         return dataset, split_vids, av_gt_tubes
 
 
@@ -138,9 +162,6 @@ class Ncfg_tubes:
             source: ['wein', ['wein', 'gt']]
             wein:
                 path: [~, ~]
-                leave_only_gt_keyframes:
-                    enabled: [False, bool]
-                    keep_temporal: [True, bool]
         """)
 
     @staticmethod
@@ -148,18 +169,23 @@ class Ncfg_tubes:
             cf,
             av_gt_tubes: AV_dict[Frametube],
             split_vids: List[Vid_daly]
-            ) -> Dict[DALY_wein_tube_index, Frametube]:
-        ftubes: Dict[DALY_wein_tube_index, Frametube]
+            ) -> Dict[I_dwein, T_dwein]:
         if cf['tubes.source'] == 'wein':
-            ftubes = resolve_wein_tubes(
-                    av_gt_tubes, split_vids, cf['tubes.wein.path'],
-                    cf['tubes.wein.leave_only_gt_keyframes.enabled'],
-                    cf['tubes.wein.leave_only_gt_keyframes.keep_temporal'])
+            raise NotImplementedError()
         elif cf['tubes.source'] == 'gt':
             raise NotImplementedError()
         else:
             raise NotImplementedError()
-        return ftubes
+
+    @staticmethod
+    def resolve_tubes_dwein(
+            cf, split_vids: List[Vid_daly]
+            ) -> Dict[I_dwein, T_dwein]:
+        assert cf['tubes.source'] == 'wein'
+        tubes_dwein: Dict[I_dwein, T_dwein] = \
+                loadconvert_tubes_dwein(cf['tubes.wein.path'])
+        tubes_dwein = dtindex_filter_split(tubes_dwein, split_vids)
+        return tubes_dwein
 
 
 class Ncfg_nicphil_rcnn:
@@ -185,7 +211,7 @@ class Ncfg_tube_eval:
         cfg.set_deftype("""
         tube_eval:
             enabled: [True, bool]
-            minscore_cutoff: [0.05, float]
+            minscore_cutoff: [0.00, float]
             nms:
                 enabled: [True, bool]
                 thresh: [0.5, float]
@@ -194,8 +220,8 @@ class Ncfg_tube_eval:
 
     @staticmethod
     def evalprint_if(cf,
-            av_stubes: AV_dict[Sframetube],
-            av_gt_tubes: AV_dict[Frametube]):
+            av_stubes: AV_dict[T_dwein_scored],
+            av_gt_tubes: AV_dict[T_dgt]):
         if not cf['tube_eval.enabled']:
             return
         av_stubes = av_stubes_above_score(
@@ -203,20 +229,21 @@ class Ncfg_tube_eval:
         if cf['tube_eval.nms.enabled']:
             av_stubes = compute_nms_for_av_stubes(
                     av_stubes, cf['tube_eval.nms.thresh'])
-        computeprint_recall_ap_for_avtubes(
+        dfdict = _compute_quick_stats(
                 av_gt_tubes, av_stubes, cf['tube_eval.iou_thresholds'])
+        _print_quick_evaluation_stats(dfdict)
 
     @staticmethod
     def eval_as_df(cf,
-            av_stubes: AV_dict[Sframetube],
-            av_gt_tubes: AV_dict[Frametube]):
+            av_stubes: AV_dict[T_dwein_scored],
+            av_gt_tubes: AV_dict[T_dgt]):
         assert cf['tube_eval.enabled']
         av_stubes = av_stubes_above_score(
                 av_stubes, cf['tube_eval.minscore_cutoff'])
         if cf['tube_eval.nms.enabled']:
             av_stubes = compute_nms_for_av_stubes(
                     av_stubes, cf['tube_eval.nms.thresh'])
-        dfdict = compute_recall_ap_for_avtubes_as_dfdict(
+        dfdict = _compute_quick_stats(
                 av_gt_tubes, av_stubes, cf['tube_eval.iou_thresholds'])
         return dfdict
 
@@ -235,25 +262,6 @@ def _set_rcnn_vid_eval_defcfg(cfg):
             total: [1, int]
             equal: ['frames', ['frames', 'tubes']]
     """)
-
-
-def resolve_wein_tubes(
-        av_gt_tubes: AV_dict[Frametube],
-        split_vids: List[Vid_daly],
-        wein_path: Path,
-        l_enabled: bool,
-        l_keeptemp: bool)-> Dict[DALY_wein_tube_index, Frametube]:
-    dwein_tubes: Dict[DALY_wein_tube_index, DALY_wein_tube] = \
-            small.load_pkl(wein_path)
-    dwein_tubes = dtindex_filter_split(dwein_tubes, split_vids)
-    # Convert dwein_tubes to sparse tubes
-    ftubes = {k: convert_dwein_tube(k, t)
-            for k, t in dwein_tubes.items()}
-    # Filter tubes optionally
-    if l_enabled:
-        ftubes = filter_tube_keyframes_only_gt_v2(
-                ftubes, av_gt_tubes, l_keeptemp)
-    return ftubes
 
 
 def _resolve_actobjects(cf, dataset, split_vids):
@@ -380,32 +388,35 @@ def _parcel_management(cf, tubes_per_video):
 
 
 def get_daly_keyframes(
-        dataset: Dataset_daly_ocv, split_vids) -> Dict[Vid_daly, np.ndarray]:
+        dataset: Dataset_daly_ocv, split_vids
+        ) -> Dict[Vid_daly, np.ndarray]:
     to_cover_: Dict[Vid_daly, Set] = {}
     for vid in split_vids:
         v = dataset.videos_ocv[vid]
         for action_name, instances in v['instances'].items():
             for ins_ind, instance in enumerate(instances):
                 frames = [kf['frame'] for kf in instance['keyframes']]
-                to_cover_[vid] = to_cover_.get(vid, set()) | set(list(frames))
+                to_cover_[vid] = \
+                        to_cover_.get(vid, set()) | set(list(frames))
     frames_to_cover = \
             {k: np.array(sorted(v)) for k, v in to_cover_.items()}
     return frames_to_cover
 
 
 def prepare_ftube_box_computations(
-        ftubes: Dict[DALY_wein_tube_index, Frametube],
+        tubes_dwein: Dict[I_dwein, T_dwein],
         frames_to_cover: Dict[Vid_daly, np.ndarray]
         ) -> Dict[Vid_daly, Dict[int, Box_connections_dwti]]:
     # Assign boxes (and keep connections to original ftubes)
     vf_connections_dwti_list: Dict[Vid_daly, Dict[int,
-        List[Tuple[DALY_wein_tube_index, np.ndarray]]]] = {}
-    for dwt_index, tube in ftubes.items():
+        List[Tuple[I_dwein, np.ndarray]]]] = {}
+    for dwt_index, tube in tubes_dwein.items():
         (vid, bunch_id, tube_id) = dwt_index
         tube_finds = tube['frame_inds']
         good_finds = frames_to_cover[vid]
         common_finds, comm1, comm2 = np.intersect1d(
-            tube_finds, good_finds, assume_unique=True, return_indices=True)
+            tube_finds, good_finds,
+            assume_unique=True, return_indices=True)
         if len(common_finds) == 0:
             continue
         good_tube_boxes = tube['boxes'][comm1]
@@ -591,19 +602,20 @@ class D2_rcnn_helper(object):
 def _rcnn_vid_eval(
         cf, out, dataset: Dataset_daly_ocv,
         split_vids,
-        ftubes: Dict[DALY_wein_tube_index, Frametube],
-        neth):
+        tubes_dwein: Dict[I_dwein, T_dwein],
+        neth) -> Optional[AV_dict[T_dwein_scored]]:
     # Cover only keyframes when evaluating dwti tubes
     frames_to_cover = get_daly_keyframes(dataset, split_vids)
-    vf_connections_dwti: Dict[Vid_daly, Dict[int, Box_connections_dwti]] = \
-            prepare_ftube_box_computations(ftubes, frames_to_cover)
+    vf_connections_dwti: Dict[Vid_daly, Dict[int, Box_connections_dwti]]
+    vf_connections_dwti = \
+            prepare_ftube_box_computations(tubes_dwein, frames_to_cover)
 
     if cf['demo_run.enabled']:
         vf_connections_dwti = sample_dict(
             vf_connections_dwti, N=5, NP_SEED=0)
         _demovis_apply_pncaffe_rcnn(
                 neth, dataset, vf_connections_dwti, out)
-        return
+        return None
 
     def isaver_eval_func(vid):
         f_connections_dwti = vf_connections_dwti[vid]
@@ -633,7 +645,7 @@ def _rcnn_vid_eval(
     vf_cls_probs = dict(zip(isaver_keys, isaver_items))
 
     # Pretty clear we'll be summing up the scores anyway
-    ftube_scores = {k: np.zeros(11) for k in ftubes}
+    ftube_scores = {k: np.zeros(11) for k in tubes_dwein}
     for vid, f_cls_probs in vf_cls_probs.items():
         for f, cls_probs in f_cls_probs.items():
             dwtis = vf_connections_dwti[vid][f]['dwti_sources']
@@ -641,31 +653,34 @@ def _rcnn_vid_eval(
                 ftube_scores[dwti] += prob
 
     # Create av_stubes
-    av_stubes: AV_dict[Sframetube] = {}
-    for dwt_index, tube in ftubes.items():
+    av_stubes: AV_dict[T_dwein_scored] = {}
+    for dwt_index, tube in tubes_dwein.items():
         (vid, bunch_id, tube_id) = dwt_index
         for action_name, score in zip(
                 dataset.action_names, ftube_scores[dwt_index][1:]):
             stube = tube.copy()
-            stube['score'] = score  # type: ignore
-            stube = cast(Sframetube, stube)
+            stube = cast(T_dwein_scored, stube)
+            stube['score'] = score
             (av_stubes
                     .setdefault(action_name, {})
                     .setdefault(vid, []).append(stube))
     return av_stubes
 
-
-def _meanpool_avstubes(abstubes_to_merge: Sequence[AV_dict[Sframetube]]):
-    av_stubes: AV_dict[Sframetube] = {}
+def _meanpool_avstubes(
+        abstubes_to_merge: Sequence[AV_dict[T_dwein_scored]]
+        ) -> AV_dict[T_dwein_scored]:
+    av_stubes: AV_dict[T_dwein_scored] = {}
     for a, v_dict in abstubes_to_merge[0].items():
         for vid, stubes in v_dict.items():
             for i, stube in enumerate(stubes):
-                scores = [t[a][vid][i]['score'] for t in abstubes_to_merge]
+                scores = [t[a][vid][i]['score']
+                        for t in abstubes_to_merge]
                 new_stube = stube.copy()
                 new_stube['score'] = np.mean(scores)
                 (av_stubes
-                        .setdefault(a, {})
-                        .setdefault(vid, []).append(new_stube))
+                    .setdefault(a, {})
+                    .setdefault(vid, [])
+                    .append(new_stube))
     return av_stubes
 
 
@@ -698,19 +713,21 @@ def assign_objactions_to_tubes(workfolder, cfg_dict, add_args):
     Ncfg_tube_eval.set_defcfg(cfg)
     cf = cfg.parse()
 
-    dataset, split_vids, av_gt_tubes = Ncfg_dataset.resolve_dataset_tubes(cf)
+    dataset, split_vids, av_gt_tubes = \
+            Ncfg_dataset.resolve_dataset_tubes(cf)
     # Inputs to the assignment routine
-    ftubes: Dict[DALY_wein_tube_index, Frametube] = \
-            Ncfg_tubes.resolve_tubes(cf, av_gt_tubes, split_vids)
+    ftubes: Dict[I_dwein, T_dwein] = \
+            Ncfg_tubes.resolve_tubes_dwein(cf, split_vids)
     objactions_vf: Dict[Vid_daly, Dict[int, Objaction_dets]] = \
             _resolve_actobjects(cf, dataset, split_vids)
     # Assignment itself
     overlap_type = cf['obj_to_tube.overlap_type']
     overlap_cutoff = cf['obj_to_tube.overlap_cutoff']
     score_cutoff = cf['obj_to_tube.score_cutoff']
-    av_stubes: AV_dict[Sframetube] = \
-        score_ftubes_via_objaction_overlap_aggregation(dataset,
-        objactions_vf, ftubes, overlap_type, overlap_cutoff, score_cutoff)
+    av_stubes: AV_dict[T_dwein_scored] = \
+        score_ftubes_via_objaction_overlap_aggregation(
+            dataset, objactions_vf, ftubes, overlap_type,
+            overlap_cutoff, score_cutoff)
     small.save_pkl(out/'av_stubes.pkl', av_stubes)
     Ncfg_tube_eval.evalprint_if(cf, av_stubes, av_gt_tubes)
 
@@ -728,9 +745,10 @@ def apply_pncaffe_rcnn_in_frames(workfolder, cfg_dict, add_args):
     Ncfg_tube_eval.set_defcfg(cfg)
     cf = cfg.parse()
 
-    dataset, split_vids, av_gt_tubes = Ncfg_dataset.resolve_dataset_tubes(cf)
-    ftubes: Dict[DALY_wein_tube_index, Frametube] = \
-            Ncfg_tubes.resolve_tubes(cf, av_gt_tubes, split_vids)
+    dataset, split_vids, av_gt_tubes = \
+            Ncfg_dataset.resolve_dataset_tubes(cf)
+    ftubes: Dict[I_dwein, T_dwein] = \
+            Frametube.resolve_tubes_dwein(cf, split_vids)
     neth: Nicolas_net_helper = Ncfg_nicphil_rcnn.resolve_helper(cf)
 
     av_stubes = _rcnn_vid_eval(cf, out, dataset, split_vids, ftubes, neth)
@@ -757,12 +775,14 @@ def apply_pfadet_rcnn_in_frames(workfolder, cfg_dict, add_args):
     cf = cfg.parse()
     cf_add_d2 = cfg.without_prefix('d2.')
 
-    dataset, split_vids, av_gt_tubes = Ncfg_dataset.resolve_dataset_tubes(cf)
-    ftubes: Dict[DALY_wein_tube_index, Frametube] = \
-            Ncfg_tubes.resolve_tubes(cf, av_gt_tubes, split_vids)
+    dataset, split_vids, av_gt_tubes = \
+            Ncfg_dataset.resolve_dataset_tubes(cf)
+    tubes_dwein: Dict[I_dwein, T_dwein] = \
+            Ncfg_tubes.resolve_tubes_dwein(cf, split_vids)
     neth = D2_rcnn_helper(cf, cf_add_d2, dataset, out)
 
-    av_stubes = _rcnn_vid_eval(cf, out, dataset, split_vids, ftubes, neth)
+    av_stubes = _rcnn_vid_eval(
+            cf, out, dataset, split_vids, tubes_dwein, neth)
     small.save_pkl(out/'av_stubes.pkl', av_stubes)
     Ncfg_tube_eval.evalprint_if(cf, av_stubes, av_gt_tubes)
 
@@ -781,7 +801,8 @@ def merge_scores_avstubes(workfolder, cfg_dict, add_args):
     """)
     cf = cfg.parse()
 
-    dataset, split_vids, av_gt_tubes = Ncfg_dataset.resolve_dataset_tubes(cf)
+    dataset, split_vids, av_gt_tubes = \
+            Ncfg_dataset.resolve_dataset_tubes(cf)
     ts = {k: small.load_pkl(v) for k, v in cfg_dict['tube_dict'].items()}
     if not cf['combinations.enabled']:
         av_stubes = _meanpool_avstubes(list(ts.values()))
@@ -791,7 +812,8 @@ def merge_scores_avstubes(workfolder, cfg_dict, add_args):
         return
 
     sizes = cf['combinations.sizes']
-    combinations = [list(itertools.combinations(ts.keys(), r)) for r in sizes]
+    combinations = [list(itertools.combinations(
+        ts.keys(), r)) for r in sizes]
     combinations = list(itertools.chain(*combinations))
     log.info('Combinations: {}'.format(combinations))
 
@@ -804,7 +826,8 @@ def merge_scores_avstubes(workfolder, cfg_dict, add_args):
             to_merge = [ts[k] for k in comb]
             av_stubes = _meanpool_avstubes(to_merge)
             small.save_pkl(comb_fold/'av_stubes.pkl', av_stubes)
-            dfdict = Ncfg_tube_eval.eval_as_df(cf, av_stubes, av_gt_tubes)
+            dfdict = Ncfg_tube_eval.eval_as_df(
+                    cf, av_stubes, av_gt_tubes)
             return dfdict
 
         dfdict = small.stash2(comb_fold/'stashed_dfdict.pkl')(compute)
@@ -813,12 +836,7 @@ def merge_scores_avstubes(workfolder, cfg_dict, add_args):
     log.info('Individual results:')
     for comb, dfdict in comb_dfdicts.items():
         log.info(f'Results for {comb_name}:')
-        tables = {k: snippets.df_to_table_v2((v*100).round(2))
-                for k, v in dfdict.items()}
-        log.info('Spatial Recall:\n{}'.format(tables['recall_s']))
-        log.info('Spatiotemp Recall:\n{}'.format(tables['recall_st']))
-        log.info('Spatial AP:\n{}'.format(tables['ap_s']))
-        log.info('Spatiotemp AP:\n{}'.format(tables['ap_st']))
+        _print_exhaustive_evaluation_stats(dfdict)
 
     log.info('Combined tables:')
     big_= {comb: pd.concat(dfdict)
@@ -827,77 +845,12 @@ def merge_scores_avstubes(workfolder, cfg_dict, add_args):
     for stat in big.index.levels[0]:
         log.info(f'=== {stat} ===')
         for thresh in big.columns.levels[1]:
-            X = (big.loc['ap_st']
+            X = (big.loc['ap']
                 .loc[:, pd.IndexSlice[:, thresh]]
                 .droplevel(1, axis=1))
             table = snippets.df_to_table_v2((X*100).round(2))
             log.info(f'{stat} for IOU {thresh}:\n{table}')
         log.info('\n')
-
-
-def _set_hacky_indices(av_stubes, ftubes):
-    # (hacky) I assume old struct does not have index set,
-    # therefore I copy one it from ftubes (same per all actions)
-    dwt_indices: V_dict[int] = {}
-    for dwt_index, tube in ftubes.items():
-        (vid, bunch_id, tube_id) = dwt_index
-        dwt_indices.setdefault(vid, []).append(dwt_index)
-    for a, v_stubes in av_stubes.items():
-        for vid, stubes in v_stubes.items():
-            for i, stube in enumerate(stubes):
-                stube['index'] = dwt_indices[vid][i]
-    return av_stubes
-
-
-def _weingroup_nms(
-        av_stubes: AV_dict[Sframetube],
-        nms_thresh):
-    # Break-up detections into weingroups
-    awg_stubes: Dict[Action_name_daly,
-            Dict[I_weingroup, List[Sframetube]]] = {}
-    for a, v_stubes in av_stubes.items():
-        for vid, stubes in v_stubes.items():
-            for i, stube in enumerate(stubes):
-                (vid, bunch_id, tube_id) = stube['index']
-                (awg_stubes.setdefault(a, {})
-                    .setdefault((vid, bunch_id), []).append(stube))
-
-    # Perform NMS within each weingroup
-    awg_stubes_nmsed: Dict[Action_name_daly,
-            Dict[I_weingroup, List[Sframetube]]] = {}
-    for a, wg_stubes in awg_stubes.items():
-        for iwg, stubes in wg_stubes.items():
-            nmsed_stubes = compute_nms_for_stubes(
-                    stubes, nms_thresh)
-            awg_stubes_nmsed.setdefault(a, {})[iwg] = nmsed_stubes
-
-    # Ungroup back
-    av_stubes_nmsed: AV_dict[Sframetube] = {}
-    for a, wg_stubes in awg_stubes_nmsed.items():
-        for iwg, stubes in wg_stubes.items():
-            vid, bunch_id = iwg
-            for stube in stubes:
-                (av_stubes_nmsed
-                    .setdefault(a, {})
-                    .setdefault(vid, [])
-                    .append(stube))
-    return av_stubes_nmsed
-
-
-def _compute_ap_for_avtubes_as_df_wein(
-        av_gt_tubes, av_stubes, wgi_to_gti,
-        iou_thresholds, spatiotemporal):
-    cls_thresh_ap = {}
-    for action_cls in av_gt_tubes.keys():
-        thresh_ap = _tube_daly_ap_v_weingroup(
-            av_gt_tubes[action_cls], av_stubes[action_cls],
-            iou_thresholds, spatiotemporal, wgi_to_gti)
-        cls_thresh_ap[action_cls] = thresh_ap
-    log.info(cls_thresh_ap)
-    dft_ap = pd.DataFrame(cls_thresh_ap).T
-    dft_ap = dft_ap.sort_index()
-    dft_ap.loc['all'] = dft_ap.mean()
-    return dft_ap
 
 def eval_avstubes(workfolder, cfg_dict, add_args):
     out, = snippets.get_subfolders(workfolder, ['out'])
@@ -911,81 +864,19 @@ def eval_avstubes(workfolder, cfg_dict, add_args):
     Ncfg_tube_eval.set_defcfg(cfg)
     cf = cfg.parse()
 
-    # Ncfg_dataset.resolve_dataset_tubes(
-    dataset = Dataset_daly_ocv()
-    dataset.populate_from_folder(cf['dataset.cache_folder'])
-    split_label = cf['dataset.subset']
-    split_vids = get_daly_split_vids(dataset, split_label)
-    dgt_tubes: Dict[DALY_gt_tube_index, Frametube] = \
-            get_daly_gt_tubes(dataset)
-    dgt_tubes = dtindex_filter_split(dgt_tubes, split_vids)
-    av_gt_tubes: AV_dict[Frametube] = \
-            push_into_avdict(dgt_tubes)
-
-    # ftubes: Dict[DALY_wein_tube_index, Frametube] = \
-    #         Ncfg_tubes.resolve_tubes(cf, av_gt_tubes, split_vids)
-    dwein_tubes: Dict[DALY_wein_tube_index, DALY_wein_tube] = \
-            small.load_pkl(cf['tubes.wein.path'])
-    ftubes = {k: convert_dwein_tube(k, t)
-            for k, t in dwein_tubes.items()}
-    dwein_tubes = dtindex_filter_split(dwein_tubes, split_vids)
-
-    wgi: List[Tuple[Vid_daly, int]]
-    gti: List[DALY_gt_tube_index]
-    wgi, gti = get_weingroup_assignment(dgt_tubes, ftubes)
-    wgi_to_gti = dict(zip(wgi, gti))
-
-    av_stubes: AV_dict[Sframetube] = small.load_pkl(cf['tubes_path'])
-    av_stubes = _set_hacky_indices(av_stubes, ftubes)
+    dataset, split_vids, av_gt_tubes = \
+            Ncfg_dataset.resolve_dataset_tubes(cf)
+    tubes_to_eval: AV_dict[T_dwein_scored] = \
+            small.load_pkl(cf['tubes_path'])
 
     nms_thresh = cf['tube_eval.nms.thresh']
     iou_thresholds: List[float] = cf['tube_eval.iou_thresholds']
+    minscore_cutoff = 0.00
 
-    av_stubes_nmsOrig = \
-            compute_nms_for_av_stubes(av_stubes, nms_thresh)
-    av_stubes_nmsWein = \
-            _weingroup_nms(av_stubes, nms_thresh)
-
-    # Compute AP (original tubes)
-    df_ap_s_nmsOrig_apOrig = compute_ap_for_avtubes_as_df(
-            av_gt_tubes, av_stubes_nmsOrig,
-            iou_thresholds, False)
-    df_ap_s_nmsOrig_apWein = _compute_ap_for_avtubes_as_df_wein(
-            av_gt_tubes, av_stubes_nmsOrig,
-            wgi_to_gti, iou_thresholds, False)
-
-    # Compute AP (wein tubes)
-    df_ap_s_nmsWein_apOrig = compute_ap_for_avtubes_as_df(
-            av_gt_tubes, av_stubes_nmsWein,
-            iou_thresholds, False)
-    df_ap_s_nmsWein_apWein = _compute_ap_for_avtubes_as_df_wein(
-            av_gt_tubes, av_stubes_nmsWein,
-            wgi_to_gti, iou_thresholds, False)
-
-    import pudb; pudb.set_trace()  # XXX BREAKPOINT
-    pass
-
-    tables = {k: snippets.df_to_table_v2((v*100).round(2))
-            for k, v in dfdict.items()}
-    log.info('Spatial Recall:\n{}'.format(tables['recall_s']))
-    log.info('Spatiotemp Recall:\n{}'.format(tables['recall_st']))
-    log.info('Spatial AP:\n{}'.format(tables['ap_s']))
-    log.info('Spatiotemp AP:\n{}'.format(tables['ap_st']))
-
-    df_recall_s, df_recall_st = compute_recall_for_avtubes_as_dfs(
-            av_gt_tubes, av_stubes, iou_thresholds)
-
-# gti_to_wgi = dict(zip(gti, wgi))
-# iou_thresholds: List[float] = cf['tube_eval.iou_thresholds']
-# av_rcovs = compute_daly_recall_coverage_av_weingroup(
-#     av_gt_tubes, awg_stubes, gti_to_wgi)
-# df_rcovs_ = {}
-# for action_cls, v_rcovs in av_rcovs.items():
-#     for vid, rcovs in v_rcovs.items():
-#         for i, rcov in enumerate(rcovs):
-#             df_rcovs_[(action_cls, vid, i)] = rcov
-# df_rcovs = pd.DataFrame(df_rcovs_).T
-# dft_recall_s = tube_daly_recall_as_df(
-#         df_rcovs, iou_thresholds, 'max_spatial')
-# dft_recall_st = tube_daly_recall_as_df(
-#         df_rcovs, iou_thresholds, 'max_spatiotemp')
+    tubes_to_eval = av_stubes_above_score(
+            tubes_to_eval, minscore_cutoff)
+    tubes_to_eval = \
+            compute_nms_for_av_stubes(tubes_to_eval, nms_thresh)
+    dfdict = _compute_exhaustive_evaluation_stats(
+            av_gt_tubes, tubes_to_eval, iou_thresholds)
+    _print_exhaustive_evaluation_stats(dfdict)

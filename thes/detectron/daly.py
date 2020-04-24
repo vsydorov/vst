@@ -1,17 +1,19 @@
 """
-Detectron intractions with DALY dataset
+Detectron interactions with the DALY dataset
 """
 import numpy as np
 import pandas as pd
 import copy
 from pathlib import Path
 from typing import (  # NOQA
-    List, Dict, Tuple, cast, TypedDict, Callable, Optional, Literal, Union)
+    List, Dict, Tuple, cast, TypedDict, Callable,
+    Optional, Literal, Union)
 
 from detectron2.structures import BoxMode  # type: ignore
 
 from thes.data.dataset.external import (
-        Dataset_daly, Dataset_daly_ocv, Vid_daly, Action_name_daly, Object_name_daly)
+        Dataset_daly, Dataset_daly_ocv, Vid_daly,
+        Action_name_daly, Object_name_daly)
 
 
 class Dl_anno(TypedDict):
@@ -41,7 +43,8 @@ def get_daly_split_vids(
         split_label: Literal['train', 'test']
         ) -> List[Vid_daly]:
     split_vids = [
-        vid for vid, split in dataset.split.items() if split == split_label]
+        vid for vid, split in dataset.split.items()
+        if split == split_label]
     if split_label == 'train':
         split_size = 310
     elif split_label == 'test':

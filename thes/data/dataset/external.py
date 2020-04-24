@@ -116,17 +116,18 @@ class Dataset_daly(object):
         'CleaningWindows', 'Drinking', 'FoldingTextile', 'Ironing',
         'Phoning', 'PlayingHarmonica', 'TakingPhotosOrVideos'])
     object_names = cast(List[Object_name_daly], [
-        'balm', 'bedsheet', 'bottle', 'bowl', 'broom', 'brush', 'camera',
-        'cloth', 'cup', 'electricToothbrush', 'finger', 'glass', 'glass+straw',
-        'gourd', 'hand', 'harmonica', 'hat', 'iron', 'mobilePhone', 'mop',
-        'moppingMachine', 'newspaper', 'other', 'pencil', 'phone',
-        'plasticBag', 'q-tip', 'satellitePhone', 'scrubber', 'shirt',
-        'smartphone', 'soap', 'sponge', 'spoon', 'squeegee', 'steamCleaner',
-        'stick', 't-shirt', 'toothbrush', 'towel', 'trousers', 'vase',
-        'videocamera'])
+        'balm', 'bedsheet', 'bottle', 'bowl', 'broom', 'brush',
+        'camera', 'cloth', 'cup', 'electricToothbrush', 'finger',
+        'glass', 'glass+straw', 'gourd', 'hand', 'harmonica', 'hat',
+        'iron', 'mobilePhone', 'mop', 'moppingMachine', 'newspaper',
+        'other', 'pencil', 'phone', 'plasticBag', 'q-tip',
+        'satellitePhone', 'scrubber', 'shirt', 'smartphone',
+        'soap', 'sponge', 'spoon', 'squeegee', 'steamCleaner',
+        'stick', 't-shirt', 'toothbrush', 'towel', 'trousers',
+        'vase', 'videocamera'])
     joint_names = cast(List[Joint_name_daly], [
-        'head', 'shoulderLeft', 'elbowLeft', 'wristLeft', 'shoulderRight',
-        'elbowRight', 'wristRight'])
+        'head', 'shoulderLeft', 'elbowLeft', 'wristLeft',
+        'shoulderRight', 'elbowRight', 'wristRight'])
     split: Dict[Vid_daly, Dataset_subset]
     provided_metas: Dict[Vid_daly, ProvidedMetadata_daly]
     videos: Dict[Vid_daly, Video_daly]
