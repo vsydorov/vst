@@ -166,20 +166,21 @@ def weighted_array_split(X, weights, N):
     return X_split
 
 
-def check_step_v2(
+def check_step_sslice(
         step: int,
-        period_spec: str):
+        period_sslice: str) -> bool:
     """
-    Check whether step matches SPEC (simplified)
-    - SPEC: '(more_runs):(run_limit):(period)'
-        - more_runs: (csv list of runs when we should fire)
-        - run_limit: [MIN],[MAX] (inclusive, don't fire beyond)
-        - period: (fire at period intervals)
+    Check whether step matches SSLICE spec
+
+    SSLICE spec: '(more_runs):(run_limit):(period)'
+      - more_runs: (csv list of runs when we should fire)
+      - run_limit: [MIN],[MAX] (inclusive, don't fire beyond)
+      - period: (fire at period intervals)
     """
     spec_re = r'^([\d,]*):((?:\d*,\d*)?):([\d]*)$'
-    match = re.fullmatch(spec_re, period_spec)
+    match = re.fullmatch(spec_re, period_sslice)
     if match is None:
-        raise ValueError(f'Invalid spec {period_spec}')
+        raise ValueError(f'Invalid spec {period_sslice}')
     _more_runs, run_limit, _period = match.groups()
 
     if len(run_limit):
@@ -188,18 +189,17 @@ def check_step_v2(
             return False
         if lmax and step > int(lmax):
             return False
-
     if _more_runs and step in map(int, _more_runs.split(',')):
         return True
-
     if _period and step and (step % int(_period) == 0):
         return True
+    return False
 
 
 def get_period_actions(step: int, period_specs: Dict[str, str]):
     period_actions = {}
     for action, period_spec in period_specs.items():
-        period_actions[action] = check_step_v2(step, period_spec)
+        period_actions[action] = check_step_sslice(step, period_spec)
     return period_actions
 
 
@@ -563,32 +563,46 @@ class Mixin_restore_save(object):
 class Simple_isaver(Mixin_restore_save, Base_isaver):
     """
     Will process a list with a func
+
+    - save_perid: SSLICE spec
+    - log_interval, save_inverval: in seconds
     """
     def __init__(self, folder, arg_list, func,
-            save_period='::25',
-            log_interval_seconds=-1):
+            save_period='::',
+            save_interval=120,  # every 2 minutes by default
+            log_interval=None,):
         super().__init__(folder, len(arg_list))
         self.arg_list = arg_list
         self.result = []
         self.func = func
         self._save_period = save_period
-        self._log_interval_seconds = log_interval_seconds
+        self._save_interval = save_interval
+        self._log_interval = log_interval
 
     def run(self):
         start_i = self._restore()
         run_range = np.arange(start_i+1, self._total)
-        self._last_time = time.perf_counter()
+        self._time_last_save = time.perf_counter()
+        self._time_last_log = time.perf_counter()
         pbar = tqdm(run_range)
         for i in pbar:
             self.result.append(self.func(self.arg_list[i]))
-            if check_step_v2(i, self._save_period) or \
-                    (i+1 == self._total):
+            # Save check
+            SAVE = check_step_sslice(i, self._save_period)
+            if self._save_interval:
+                since_last_save = time.perf_counter() - self._time_last_save
+                SAVE |= since_last_save > self._save_interval
+            SAVE |= (i+1 == self._total)
+            if SAVE:
                 self._save(i)
                 self._purge_intermediate_files()
-            if self._log_interval_seconds != -1:
-                if (time.perf_counter() - self._last_time) > \
-                        self._log_interval_seconds:
+                self._time_last_save = time.perf_counter()
+            # Log check
+            if self._log_interval:
+                since_last_log = time.perf_counter() - self._time_last_log
+                if since_last_log > self._log_interval:
                     log.info(_tqdm_str(pbar))
+                    self._time_last_log = time.perf_counter()
         return self.result
 
 

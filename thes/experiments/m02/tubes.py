@@ -381,33 +381,11 @@ class Ncfg_generic_rcnn_eval:
         return av_stubes
 
     @classmethod
-    def demo_run(cls, cf, out, dataset, split_vids, tubes_dwein, neth):
-        vf_connections_dwti = cls._define_boxes_to_evaluate(
-                cf, dataset, split_vids, tubes_dwein)
-        vf_connections_dwti = sample_dict(
-            vf_connections_dwti, N=5, NP_SEED=0)
-        vfold = small.mkdir(out/'demovis')
-        cls._demovis_apply(vfold, neth, dataset, vf_connections_dwti)
-
-    @classmethod
-    def score_tubes(
-            cls, cf, out,
-            dataset: Dataset_daly_ocv,
-            split_vids,
-            tubes_dwein: Dict[I_dwein, T_dwein],
-            neth) -> Optional[AV_dict[T_dwein_scored]]:
-        """
-        Logic behind simple "evaluate boxes" experiment
-        """
-        vf_connections_dwti = cls._define_boxes_to_evaluate(
-                cf, dataset, split_vids, tubes_dwein)
-
-        vids_to_eval = list(vf_connections_dwti.keys())
-        if cf['compute.split.enabled']:
-            vids_to_eval = cls._perform_split(
-                    cf, vf_connections_dwti, vids_to_eval)
-
-        # GPU utilized here
+    def _simple_gpu_compute(
+            cls, out, dataset, neth,
+            vf_connections_dwti, vids_to_eval
+            ) -> Dict[Vid_daly, Dict[int, np.ndarray]]:
+        """Progress saved on video-level scale"""
         def isaver_eval_func(vid):
             f_connections_dwti = vf_connections_dwti[vid]
             video_path = dataset.videos[vid]['path']
@@ -425,15 +403,94 @@ class Ncfg_generic_rcnn_eval:
         isaver = snippets.Simple_isaver(
                 small.mkdir(out/'isave_rcnn_vid_eval'),
                 vids_to_eval, isaver_eval_func,
-                cf['compute.save_period'], 120)
+                '::10', 120)
         isaver_items = isaver.run()
         vf_cls_probs: Dict[Vid_daly, Dict[int, np.ndarray]]
         vf_cls_probs = dict(zip(vids_to_eval, isaver_items))
+        return vf_cls_probs
+
+    @classmethod
+    def _involved_gpu_compute(
+            cls, out, dataset, neth,
+            vf_connections_dwti, vids_to_eval,
+            size_video_chunk,
+            ) -> Dict[Vid_daly, Dict[int, np.ndarray]]:
+        frame_chunks = []
+        for vid in vids_to_eval:
+            f_connections_dwti = vf_connections_dwti[vid]
+            finds = np.array(list(f_connections_dwti))
+            finds_split = snippets.leqn_split(
+                    finds, size_video_chunk)
+            for subset_finds in finds_split:
+                frame_chunks.append((vid, subset_finds))
+
+        def isaver_eval_func(frame_chunk):
+            vid, finds = frame_chunk
+            f_connections_dwti = vf_connections_dwti[vid]
+            video_path = dataset.videos[vid]['path']
+            with vt_cv.video_capture_open(video_path) as vcap:
+                frames_u8 = vt_cv.video_sample(
+                        vcap, finds, debug_filename=video_path)
+            f_cls_probs = {}
+            for find, frame_BGR in zip(finds, frames_u8):
+                connections_dwti = f_connections_dwti[find]
+                boxes = connections_dwti['boxes']
+                cls_probs = neth.score_boxes(
+                        frame_BGR, boxes)  # N, (bcg+10)
+                f_cls_probs[find] = cls_probs
+            return f_cls_probs
+        isaver = snippets.Simple_isaver(
+                small.mkdir(out/'isave_rcnn_vid_eval'),
+                frame_chunks, isaver_eval_func,
+                save_interval=60,
+                log_interval=300)
+        isaver_items = isaver.run()
+        vf_cls_probs: Dict[Vid_daly, Dict[int, np.ndarray]]
+        vf_cls_probs = {}
+        for (vid, subset_finds), f_cls_probs in zip(
+                frame_chunks, isaver_items):
+            vf_cls_probs.setdefault(vid, {}).update(f_cls_probs)
+        return vf_cls_probs
+
+    @classmethod
+    def score_tubes(
+            cls, cf, out,
+            dataset: Dataset_daly_ocv,
+            split_vids,
+            tubes_dwein: Dict[I_dwein, T_dwein],
+            neth) -> Optional[AV_dict[T_dwein_scored]]:
+        """
+        Logic behind simple "evaluate boxes" experiment
+        """
+        vf_connections_dwti: Dict[Vid_daly, Dict[int, Box_connections_dwti]] = \
+            cls._define_boxes_to_evaluate(cf, dataset, split_vids, tubes_dwein)
+
+        vids_to_eval = list(vf_connections_dwti.keys())
+        if cf['compute.split.enabled']:
+            vids_to_eval = cls._perform_split(
+                    cf, vf_connections_dwti, vids_to_eval)
+
+        if cf['scoring.keyframes_only']:
+            vf_cls_probs = cls._simple_gpu_compute(out, dataset,
+                    neth, vf_connections_dwti, vids_to_eval)
+        else:
+            size_video_chunk = 300
+            vf_cls_probs = cls._involved_gpu_compute(out, dataset,
+                    neth, vf_connections_dwti, vids_to_eval, size_video_chunk)
 
         av_stubes = cls._aggregate_scores(
                 dataset, tubes_dwein, vf_connections_dwti, vf_cls_probs)
 
         return av_stubes
+
+    @classmethod
+    def demo_run(cls, cf, out, dataset, split_vids, tubes_dwein, neth):
+        vf_connections_dwti = cls._define_boxes_to_evaluate(
+                cf, dataset, split_vids, tubes_dwein)
+        vf_connections_dwti = sample_dict(
+            vf_connections_dwti, N=5, NP_SEED=0)
+        vfold = small.mkdir(out/'demovis')
+        cls._demovis_apply(vfold, neth, dataset, vf_connections_dwti)
 
 
 def _resolve_actobjects(cf, dataset, split_vids):
