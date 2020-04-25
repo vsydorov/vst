@@ -157,6 +157,15 @@ def leqn_split(arr, N):
     return np.array_split(arr, (len(arr)-1)//N + 1)
 
 
+def weighted_array_split(X, weights, N):
+    approx_weight_per_split = weights.sum() // N
+    approx_split_indices = approx_weight_per_split * np.arange(1, N)
+    split_indices = np.searchsorted(
+            weights.cumsum(), approx_split_indices)
+    X_split = np.array_split(X, split_indices)
+    return X_split
+
+
 def check_step_v2(
         step: int,
         period_spec: str):
