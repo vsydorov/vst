@@ -44,7 +44,8 @@ from thes.data.tubes.routines import (
 from thes.data.tubes.nms import (
     compute_nms_for_av_stubes,)
 from thes.evaluation.ap.convert import (
-    compute_ap_for_avtubes_as_df,)
+    compute_ap_for_avtubes_as_df,
+    compute_ap_for_avtubes_WG_as_df)
 from thes.evaluation.recall import (
     compute_recall_for_avtubes_as_dfs,)
 from thes.tools import snippets
@@ -255,6 +256,7 @@ class Ncfg_generic_rcnn_eval:
         cfg.set_deftype("""
         scoring:
             keyframes_only: [True, bool]
+            agg_kind: ['mean', ['mean', 'max']]
         demo_run:
             enabled: [False, bool]
             N: [50, int]
@@ -334,8 +336,9 @@ class Ncfg_generic_rcnn_eval:
                     f.write('\n'.join(txt_output))
 
     @classmethod
-    def _perform_split(cls, cf, vf_connections_dwti, vids_to_eval):
+    def _perform_split(cls, cf, vf_connections_dwti):
         # Reduce keys according to split
+        vids_to_eval = list(vf_connections_dwti.keys())
         weights_dict = {k: len(v) for k, v in vf_connections_dwti.items()}
         weights = np.array(list(weights_dict.values()))
         cc, ct = (cf['compute.split.chunk'], cf['compute.split.total'])
@@ -346,33 +349,58 @@ class Ncfg_generic_rcnn_eval:
                 for vids in vids_split]
         chunk_vids = vids_split[cc]
         log.info(f'Quick split stats [{cc,ct=}]: ''Vids(frames): {}({}) -> {}({})'.format(
-            len(vids_to_eval), np.sum(weights), len(chunk_vids), weights_split[cc]))
+            len(vids_to_eval), np.sum(weights),
+            len(chunk_vids), weights_split[cc]))
         log.debug(f'Full stats [{cc,ct=}]:\n'
                 f'vids_split={pprint.pformat(vids_split)}\n'
                 f'{weights_split=}\n'
                 f'{chunk_vids=}\n'
                 f'{weights_split[cc]=}')
-        return chunk_vids
+        chunk_vf_connections_dwti = {vid: vf_connections_dwti[vid]
+                for vid in chunk_vids}
+        return chunk_vf_connections_dwti
 
     @classmethod
     def _aggregate_scores(cls,
             dataset, tubes_dwein,
-            vf_connections_dwti, vf_cls_probs):
+            vf_connections_dwti,
+            vf_cls_probs,
+            agg_kind):
         # Pretty clear we'll be summing up the scores anyway
-        ftube_scores = {k: np.zeros(11) for k in tubes_dwein}
-        for vid, f_cls_probs in vf_cls_probs.items():
-            for f, cls_probs in f_cls_probs.items():
-                dwtis = vf_connections_dwti[vid][f]['dwti_sources']
-                for dwti, prob in zip(dwtis, cls_probs):
-                    ftube_scores[dwti] += prob
+        assert vf_connections_dwti.keys() == vf_cls_probs.keys()
+
+        if agg_kind == 'mean':
+            ftube_sum = {}
+            ftube_counts = {}
+            for vid, f_cls_probs in vf_cls_probs.items():
+                for f, cls_probs in f_cls_probs.items():
+                    dwtis = vf_connections_dwti[vid][f]['dwti_sources']
+                    for dwti, prob in zip(dwtis, cls_probs):
+                        ftube_sum[dwti] = \
+                                ftube_sum.get(dwti, np.zeros(11)) + prob
+                        ftube_counts[dwti] = \
+                                ftube_counts.get(dwti, 0) + 1
+            ftube_scores = {k: v/ftube_counts[k]
+                    for k, v in ftube_sum.items()}
+        elif agg_kind == 'max':
+            ftube_scores = {}
+            for vid, f_cls_probs in vf_cls_probs.items():
+                for f, cls_probs in f_cls_probs.items():
+                    dwtis = vf_connections_dwti[vid][f]['dwti_sources']
+                    for dwti, prob in zip(dwtis, cls_probs):
+                        ftube_scores[dwti] = \
+                            np.maximum(ftube_scores.get(
+                                dwti, np.zeros(11)), prob)
+        else:
+            raise NotImplementedError()
 
         # Create av_stubes
         av_stubes: AV_dict[T_dwein_scored] = {}
-        for dwt_index, tube in tubes_dwein.items():
+        for dwt_index, scores in ftube_scores.items():
             (vid, bunch_id, tube_id) = dwt_index
             for action_name, score in zip(
-                    dataset.action_names, ftube_scores[dwt_index][1:]):
-                stube = tube.copy()
+                    dataset.action_names, scores[1:]):
+                stube = tubes_dwein[dwt_index].copy()
                 stube = cast(T_dwein_scored, stube)
                 stube['score'] = score
                 (av_stubes
@@ -382,8 +410,7 @@ class Ncfg_generic_rcnn_eval:
 
     @classmethod
     def _simple_gpu_compute(
-            cls, out, dataset, neth,
-            vf_connections_dwti, vids_to_eval
+            cls, out, dataset, neth, vf_connections_dwti
             ) -> Dict[Vid_daly, Dict[int, np.ndarray]]:
         """Progress saved on video-level scale"""
         def isaver_eval_func(vid):
@@ -400,6 +427,7 @@ class Ncfg_generic_rcnn_eval:
                 cls_probs = neth.score_boxes(frame_BGR, boxes)  # N, (bcg+10)
                 f_cls_probs[find] = cls_probs
             return f_cls_probs
+        vids_to_eval = list(vf_connections_dwti.keys())
         isaver = snippets.Simple_isaver(
                 small.mkdir(out/'isave_rcnn_vid_eval'),
                 vids_to_eval, isaver_eval_func,
@@ -412,10 +440,11 @@ class Ncfg_generic_rcnn_eval:
     @classmethod
     def _involved_gpu_compute(
             cls, out, dataset, neth,
-            vf_connections_dwti, vids_to_eval,
+            vf_connections_dwti,
             size_video_chunk,
             ) -> Dict[Vid_daly, Dict[int, np.ndarray]]:
         frame_chunks = []
+        vids_to_eval = list(vf_connections_dwti.keys())
         for vid in vids_to_eval:
             f_connections_dwti = vf_connections_dwti[vid]
             finds = np.array(list(f_connections_dwti))
@@ -458,29 +487,33 @@ class Ncfg_generic_rcnn_eval:
             dataset: Dataset_daly_ocv,
             split_vids,
             tubes_dwein: Dict[I_dwein, T_dwein],
-            neth) -> Optional[AV_dict[T_dwein_scored]]:
+            neth) -> AV_dict[T_dwein_scored]:
         """
         Logic behind simple "evaluate boxes" experiment
         """
         vf_connections_dwti: Dict[Vid_daly, Dict[int, Box_connections_dwti]] = \
             cls._define_boxes_to_evaluate(cf, dataset, split_vids, tubes_dwein)
 
-        vids_to_eval = list(vf_connections_dwti.keys())
         if cf['compute.split.enabled']:
-            vids_to_eval = cls._perform_split(
-                    cf, vf_connections_dwti, vids_to_eval)
+            vf_connections_dwti = cls._perform_split(
+                    cf, vf_connections_dwti)
 
         if cf['scoring.keyframes_only']:
-            vf_cls_probs = cls._simple_gpu_compute(out, dataset,
-                    neth, vf_connections_dwti, vids_to_eval)
+            vf_cls_probs = cls._simple_gpu_compute(
+                out, dataset, neth, vf_connections_dwti)
         else:
             size_video_chunk = 300
-            vf_cls_probs = cls._involved_gpu_compute(out, dataset,
-                    neth, vf_connections_dwti, vids_to_eval, size_video_chunk)
+            vf_cls_probs = cls._involved_gpu_compute(
+                out, dataset, neth, vf_connections_dwti, size_video_chunk)
 
+        agg_kind = cf['scoring.agg_kind']
         av_stubes = cls._aggregate_scores(
-                dataset, tubes_dwein, vf_connections_dwti, vf_cls_probs)
+                dataset, tubes_dwein, vf_connections_dwti,
+                vf_cls_probs, agg_kind)
 
+        small.save_pkl(out/'vf_connections_dwti.pkl', vf_connections_dwti)
+        small.save_pkl(out/'vf_cls_probs.pkl', vf_cls_probs)
+        small.save_pkl(out/'av_stubes.pkl', av_stubes)
         return av_stubes
 
     @classmethod
@@ -738,6 +771,219 @@ def _meanpool_avstubes(
     return av_stubes
 
 
+from thes.data.dataset.external import (
+    Action_name_daly)
+from thes.data.tubes.nms import compute_nms_for_stubes
+I_weingroup = Tuple[Vid_daly, int]
+
+
+def _weingroup_nms(
+        av_stubes: AV_dict[T_dwein_scored],
+        nms_thresh):
+
+    # Break-up detections into weingroups
+    awg_stubes: Dict[Action_name_daly,
+            Dict[I_weingroup, List[T_dwein_scored]]] = {}
+    for a, v_stubes in av_stubes.items():
+        for vid, stubes in v_stubes.items():
+            for i, stube in enumerate(stubes):
+                (vid, bunch_id, tube_id) = stube['index']
+                (awg_stubes.setdefault(a, {})
+                    .setdefault((vid, bunch_id), []).append(stube))
+
+    # Perform NMS within each weingroup
+    awg_stubes_nmsed: Dict[Action_name_daly,
+            Dict[I_weingroup, List[T_dwein_scored]]] = {}
+    for a, wg_stubes in awg_stubes.items():
+        for iwg, stubes in wg_stubes.items():
+            nmsed_stubes = compute_nms_for_stubes(
+                    stubes, nms_thresh)
+            awg_stubes_nmsed.setdefault(a, {})[iwg] = nmsed_stubes
+
+    # Ungroup back
+    av_stubes_nmsed: AV_dict[T_dwein_scored] = {}
+    for a, wg_stubes in awg_stubes_nmsed.items():
+        for iwg, stubes in wg_stubes.items():
+            vid, bunch_id = iwg
+            for stube in stubes:
+                (av_stubes_nmsed
+                    .setdefault(a, {})
+                    .setdefault(vid, [])
+                    .append(stube))
+    return av_stubes_nmsed
+
+
+def _get_df_daly_groundtruth(gt_tubes: Dict[I_dgt, T_dgt]):
+    dgt_frange_ = np.array([
+        (gt_tube['start_frame'], gt_tube['end_frame'])
+        for gt_tube in gt_tubes.values()])
+    df_dgt = pd.DataFrame(dgt_frange_,
+            pd.MultiIndex.from_tuples(
+                list(gt_tubes.keys()), names=['vid', 'act', 'id']),
+            columns=['start', 'end'],)
+    return df_dgt
+
+
+def _get_df_weingroup_range(dwein_tubes: Dict[I_dwein, T_dwein]):
+    dwt_frange_ = [
+        (tube['frame_inds'].min(), tube['frame_inds'].max())
+        for tube in dwein_tubes.values()]
+    dwt_df = pd.DataFrame(dwt_frange_, pd.MultiIndex.from_tuples(
+        dwein_tubes.keys(), names=['vid', 'gid', 'tid']),
+        columns=['start', 'end'])
+
+    dwt_df_grouped_ = dwt_df.groupby(level=[0, 1]).agg(lambda x: set(x))
+    assert dwt_df_grouped_.applymap(
+            lambda x: len(x) == 1).all().all(), \
+            'All groups must have equal size'
+    weingroup_range = dwt_df_grouped_.applymap(lambda x: list(x)[0])
+    return weingroup_range
+
+
+def _reindex_avd_to_dgt(
+        av_gt_tubes: AV_dict[T_dgt]
+        ) -> Dict[I_dgt, T_dgt]:
+    dgt_tubes = {}
+    for a, v_gt_tubes in av_gt_tubes.items():
+        for vid, gt_tube_list in v_gt_tubes.items():
+            for i, gt_tube in enumerate(gt_tube_list):
+                dgt_tubes[(vid, a, i)] = gt_tube
+    return dgt_tubes
+
+
+from thes.data.tubes.routines import temporal_ious_NN
+
+
+def _get_weingroup_assignment(
+        dgt_tubes: Dict[I_dgt, T_dgt],
+        tubes_dwein: Dict[I_dwein, T_dwein],
+        ) -> Tuple[List[I_weingroup], List[I_dgt]]:
+
+    easy_dgt_tubes: Dict[I_dgt, T_dgt] = {}
+    for k, v in dgt_tubes.items():
+        fl = v['flags']
+        diff = fl['isReflection'] or fl['isAmbiguous']
+        if not diff:
+            easy_dgt_tubes[k] = v
+    df_gt = _get_df_daly_groundtruth(easy_dgt_tubes)
+    df_weingroup_range = _get_df_weingroup_range(tubes_dwein)
+
+    wgi = []
+    gti = []
+    all_vids = df_gt.index.levels[0]
+    for vid in all_vids:
+        wg = df_weingroup_range.loc[vid].sort_values(['start', 'end'])
+        gt = df_gt.loc[vid].sort_values(['start', 'end'])
+        assert len(wg) == len(gt)
+        ious = temporal_ious_NN(wg.to_numpy(), gt.to_numpy())
+        assert (ious >= 0.75).all()
+        for gid in wg.index:
+            wgi.append((vid, gid))
+        for (act, ind) in gt.index:
+            gti.append((vid, act, ind))
+    assert len(set(wgi)) == len(wgi) == len(set(gti)) == len(gti)
+    return wgi, gti
+
+
+def _gather_check_all_present(gather_paths):
+    # Check missing
+    missing_paths = []
+    for path in gather_paths:
+        path = Path(path)
+        if not path.exists():
+            missing_paths.append(path)
+    if len(missing_paths):
+        log.info('Some paths are MISSING:\n{}'.format(
+            pprint.pformat(missing_paths)))
+        return False
+    else:
+        return True
+
+def _len_rescore_avstubes(av_stubes):
+    norm_av_stubes = {}
+    for a, v_stubes in av_stubes.items():
+        for v, stubes in v_stubes.items():
+            for stube in stubes:
+                nstube = copy.copy(stube)
+                nstube['score'] = nstube['score']/len(nstube['frame_inds'])
+                (norm_av_stubes.setdefault(a, {})
+                    .setdefault(v, [])
+                    .append(nstube))
+    return norm_av_stubes
+
+
+def _vis_scoresorted_tubes(out, dataset, wnms_av_stubes):
+    action = 'Drinking'
+    vfold = small.mkdir(out/action)
+    v_stubes = wnms_av_stubes[action]
+    flat_tubes = []
+    for vid, stubes in v_stubes.items():
+        for i_stube, stube in enumerate(stubes):
+            flat_tubes.append({'tube': stube, 'ind': (vid, i_stube)})
+    sorted_flat_tubes = sorted(flat_tubes,
+            key=lambda x: x['tube']['score'], reverse=True)
+
+    for i_sorted, flat_tube in enumerate(sorted_flat_tubes):
+        vid, i_stube = flat_tube['ind']
+        tube = flat_tube['tube']
+        score = tube['score']
+        sf, ef = tube['start_frame'], tube['end_frame']
+        frame_inds = tube['frame_inds']
+        video_fold = small.mkdir(vfold/f'{i_sorted:04d}_vid{vid}_{sf}_to_{ef}_score{score:02f}')
+        video_path = dataset.videos[vid]['path']
+
+        # Extract
+        with vt_cv.video_capture_open(video_path) as vcap:
+            frames_u8 = vt_cv.video_sample(
+                    vcap, frame_inds, debug_filename=video_path)
+        # Draw
+        drawn_frames_u8 = []
+        for i, (find, frame_BGR) in enumerate(zip(frame_inds, frames_u8)):
+            image = frame_BGR.copy()
+            box = tube['boxes'][i]
+            snippets.cv_put_box_with_text(image, box,
+                text='{} {} {:.2f}'.format(
+                    i, action, score))
+            drawn_frames_u8.append(image)
+
+        # # Save as images
+        # for find, image in zip(frame_inds, drawn_frames_u8):
+        #     cv2.imwrite(str(
+        #         video_fold/'Fr{:05d}.png'.format(find)), image)
+
+        # Save as video
+        snippets.qsave_video(video_fold/'overlaid.mp4', drawn_frames_u8)
+
+
+from thes.evaluation.ap.convert import (
+        _convert_to_flat_representation,
+        _compute_eligible_tubes_for_eval_weingroup
+        )
+from thes.evaluation.ap.core import (voc_ap)
+from thes.data.tubes.routines import (
+        spatial_tube_iou_v3)
+
+
+def _compute_iou_coverages(fgts, fdets,
+        det_to_eligible_gt,
+        matchable_ifgts,
+        ifdet, spatiotemporal) -> List[float]:
+    fdet = fdets[ifdet]
+    gt_ids_that_overlap = det_to_eligible_gt.get(ifdet, {})
+    # Compute IOUs
+    iou_coverages: List[float] = []
+    for gt_id, temp_iou in gt_ids_that_overlap.items():
+        fgt = fgts[gt_id]
+        spatial_miou = \
+                spatial_tube_iou_v3(fdet['obj'], fgt['obj'])
+        if spatiotemporal:
+            iou = temp_iou * spatial_miou
+        else:
+            iou = spatial_miou
+        iou_coverages.append(iou)
+    return iou_coverages
+
+
 # Experiments
 
 
@@ -806,11 +1052,11 @@ def apply_pncaffe_rcnn_in_frames(workfolder, cfg_dict, add_args):
     neth: Nicolas_net_helper = Ncfg_nicphil_rcnn.resolve_helper(cf)
 
     if cf['demo_run.enabled']:
-        Ncfg_generic_rcnn_eval.demo_run()
+        Ncfg_generic_rcnn_eval.demo_run(
+            cf, out, dataset, split_vids, tubes_dwein, neth)
         return
     av_stubes = Ncfg_generic_rcnn_eval.score_tubes(
             cf, out, dataset, split_vids, tubes_dwein, neth)
-    small.save_pkl(out/'av_stubes.pkl', av_stubes)
     Ncfg_tube_eval.evalprint_if(cf, av_stubes, av_gt_tubes)
 
 
@@ -823,7 +1069,6 @@ def apply_pfadet_rcnn_in_frames(workfolder, cfg_dict, add_args):
     cfg = snippets.YConfig(cfg_dict)
     Ncfg_dataset.set_dataset_seed(cfg)
     Ncfg_tubes.set_defcfg(cfg)
-    Ncfg_generic_rcnn_eval.set_defcfg(cfg)
     cfg.set_deftype("""
     d2_rcnn:
         model: [~, ~]
@@ -844,6 +1089,62 @@ def apply_pfadet_rcnn_in_frames(workfolder, cfg_dict, add_args):
     #         cf, out, dataset, split_vids, tubes_dwein, neth)
     # small.save_pkl(out/'av_stubes.pkl', av_stubes)
     # Ncfg_tube_eval.evalprint_if(cf, av_stubes, av_gt_tubes)
+
+
+def gather_avstubes(workfolder, cfg_dict, add_args):
+    out, = snippets.get_subfolders(workfolder, ['out'])
+    cfg = snippets.YConfig(cfg_dict)
+    cfg.set_defaults_handling(raise_without_defaults=False)
+    cfg.set_deftype("""
+    gather:
+        kind: ['explicit', ['explicit', 'rcnn']]
+        paths: [~, ~]
+    """)
+    Ncfg_tube_eval.set_defcfg(cfg)
+    cf = cfg.parse()
+
+    dataset, split_vids, av_gt_tubes = \
+            Ncfg_dataset.resolve_dataset_tubes(cf)
+
+    # Experiment logic
+    gather_paths = cf['gather.paths']
+    if not _gather_check_all_present(gather_paths):
+        return
+
+    av_stubes: AV_dict[T_dwein_scored]
+    if cf['gather.kind'] == 'explicit':
+        av_stubes = {}
+        for path in gather_paths:
+            av_stubes_ = small.load_pkl(path)
+            for a, v_stubes in av_stubes_.items():
+                for v, stubes in v_stubes.items():
+                    av_stubes.setdefault(a, {})[v] = stubes
+    elif cf['gather.kind'] == 'rcnn':
+        av_stubes = {}
+        vf_connections_dwti = {}
+        vf_cls_probs = {}
+        for path in gather_paths:
+            path = Path(path)
+            av_stubes_ = small.load_pkl(path)
+            vf_cls_probs_ = small.load_pkl(
+                    path.parent/'vf_cls_probs.pkl')
+            vf_connections_dwti_ = small.load_pkl(
+                    path.parent/'vf_connections_dwti.pkl')
+            for a, v_stubes in av_stubes_.items():
+                assert (v_stubes.keys() == vf_cls_probs_.keys()
+                        == vf_connections_dwti_.keys())
+                for v, stubes in v_stubes.items():
+                    av_stubes.setdefault(a, {})[v] = stubes
+
+            vf_cls_probs.update(vf_cls_probs_)
+            vf_connections_dwti.update(vf_connections_dwti_)
+        small.save_pkl(out/'vf_connections_dwti.pkl', vf_connections_dwti)
+        small.save_pkl(out/'vf_cls_probs.pkl', vf_cls_probs)
+    else:
+        raise NotImplementedError()
+
+    small.save_pkl(out/'av_stubes.pkl', av_stubes)
+    Ncfg_tube_eval.evalprint_if(cf, av_stubes, av_gt_tubes)
 
 
 def merge_scores_avstubes(workfolder, cfg_dict, add_args):
@@ -928,9 +1229,10 @@ def eval_avstubes(workfolder, cfg_dict, add_args):
     tubes_to_eval: AV_dict[T_dwein_scored] = \
             small.load_pkl(cf['tubes_path'])
 
+    # Extended version of "Ncfg_tube_eval.evalprint_if"
     nms_thresh = cf['tube_eval.nms.thresh']
     iou_thresholds: List[float] = cf['tube_eval.iou_thresholds']
-    minscore_cutoff = 0.00
+    minscore_cutoff = cf['tube_eval.minscore_cutoff']
 
     tubes_to_eval = av_stubes_above_score(
             tubes_to_eval, minscore_cutoff)
@@ -939,3 +1241,225 @@ def eval_avstubes(workfolder, cfg_dict, add_args):
     dfdict = _compute_exhaustive_evaluation_stats(
             av_gt_tubes, tubes_to_eval, iou_thresholds)
     _print_exhaustive_evaluation_stats(dfdict)
+
+
+def vis_stubes(workfolder, cfg_dict, add_args):
+    out, = snippets.get_subfolders(workfolder, ['out'])
+    cfg = snippets.YConfig(cfg_dict)
+    cfg.set_defaults_handling(raise_without_defaults=False)
+    Ncfg_dataset.set_dataset_seed(cfg)
+    cfg.set_defaults("""
+    paths:
+        av_stubes: ~
+        vf_connections_dwti: ~
+        vf_cls_probs: ~
+    """)
+    cf = cfg.parse()
+
+    dataset, split_vids, av_gt_tubes = \
+            Ncfg_dataset.resolve_dataset_tubes(cf)
+    av_stubes: AV_dict[T_dwein_scored] = \
+            small.load_pkl(cf['paths.av_stubes'])
+    vf_connections_dwti: Dict[Vid_daly, Dict[int, Box_connections_dwti]] = \
+            small.load_pkl(cf['paths.vf_connections_dwti'])
+    vf_cls_probs: Dict[Vid_daly, Dict[int, np.ndarray]] = \
+            small.load_pkl(cf['paths.vf_cls_probs'])
+
+    # WGI GTI
+    dgt_tubes: Dict[I_dgt, T_dgt] = _reindex_avd_to_dgt(av_gt_tubes)
+    tubes_dwein: Dict[I_dwein, T_dwein] = loadconvert_tubes_dwein('/home/vsydorov/projects/deployed/2019_12_Thesis/dervo/thes/gpuhost7/2020_03_31/10_clean_inputs/20_wein_tubes/thes.gpuhost7.2020_03_31.10_clean_inputs.20_wein_tubes/194e3a301c202bc5e818dca26953ddb268aa98b3/out/extracted_tubes.pkl')
+    tubes_dwein = dtindex_filter_split(tubes_dwein, split_vids)
+    wgi, gti = _get_weingroup_assignment(dgt_tubes, tubes_dwein)
+    wgi_to_gti: Dict[I_weingroup, I_dgt] = dict(zip(wgi, gti))
+
+    nms_thresh = 0.5
+    wnms_av_stubes = \
+            (small.stash2(out/'_temp_wnms_norm_av_stubes.pkl')
+            (_weingroup_nms, av_stubes, nms_thresh))
+
+    iou_thresholds = [0.3, 0.5]
+    co_wnms_av_stubes = av_stubes_above_score(
+            wnms_av_stubes, 0.05)
+    wnms_ap = compute_ap_for_avtubes_as_df(
+            av_gt_tubes, co_wnms_av_stubes, iou_thresholds, False, False)
+
+    action = 'Drinking'
+    action_dwti_ind = dataset.action_names.index(action) + 1
+    vfold = small.mkdir(out/'ap_emulate'/action)
+    v_stubes = wnms_av_stubes[action]
+    v_gt_tubes = av_gt_tubes[action]
+
+    # ap-like preparations
+    fgts, fdets = _convert_to_flat_representation(v_gt_tubes, v_stubes)
+    det_to_eligible_gt = _compute_eligible_tubes_for_eval_weingroup(
+            fgts, fdets, wgi_to_gti)
+    gt_already_matched = np.zeros(len(fgts), dtype=bool)
+    nd = len(fdets)
+    tp = np.zeros(nd)
+    fp = np.zeros(nd)
+    npos = len([x for x in fgts if not x['diff']])
+    detection_scores = np.array([x['score'] for x in fdets])
+    detection_scores = detection_scores.round(3)
+    sorted_inds = np.argsort(-detection_scores)
+    iou_thresh = 0.5
+    use_diff = False
+
+    # Provenance
+    detection_matched_to_which_gt = np.ones(len(fdets), dtype=int)*-1
+    ifdet_to_iou_coverages = {}
+
+    for d, ifdet in enumerate(sorted_inds):
+        matchable_ifgts = list(det_to_eligible_gt.get(ifdet, {}))
+        if not len(matchable_ifgts):
+            fp[d] = 1
+            continue
+
+        iou_coverages: List[float] = \
+            _compute_iou_coverages(fgts, fdets, det_to_eligible_gt,
+                    matchable_ifgts, ifdet, False)
+
+        ifdet_to_iou_coverages[ifdet] = iou_coverages
+
+        max_coverage_local_id: int = np.argmax(iou_coverages)
+        max_coverage: float = iou_coverages[max_coverage_local_id]
+        max_coverage_ifgt = matchable_ifgts[max_coverage_local_id]
+        if max_coverage > iou_thresh:
+            if (not use_diff) and fgts[max_coverage_ifgt]['diff']:
+                continue
+            if not gt_already_matched[max_coverage_ifgt]:
+                tp[d] = 1
+                gt_already_matched[max_coverage_ifgt] = True
+                detection_matched_to_which_gt[ifdet] = max_coverage_ifgt
+            else:
+                fp[d] = 1
+        else:
+            fp[d] = 1
+
+    cumsum_fp = np.cumsum(fp)
+    cumsum_tp = np.cumsum(tp)
+    rec = cumsum_tp / float(npos)
+    prec = cumsum_tp / np.maximum(cumsum_tp + cumsum_fp, np.finfo(np.float64).eps)
+    ap = voc_ap(rec, prec, False)
+
+    log.info(f'{ap=}')
+    # Visualize this
+    for d, ifdet in enumerate(sorted_inds):
+        if not tp[d]:
+            continue
+
+        tube = fdets[ifdet]['obj']
+        score = tube['score']
+        sf, ef = tube['start_frame'], tube['end_frame']
+        vid = tube['index'][0]
+        frame_inds = tube['frame_inds']
+        video_fold = small.mkdir(vfold/f'D{d:04d}_IFDET{ifdet:04d}_V({vid})_{sf}_to_{ef}_score{score:02f}')
+        video_path = dataset.videos[vid]['path']
+
+        # Extract
+        with vt_cv.video_capture_open(video_path) as vcap:
+            frames_u8 = vt_cv.video_sample(
+                    vcap, frame_inds, debug_filename=video_path)
+        # Draw
+        drawn_frames_u8 = []
+        for i, (find, frame_BGR) in enumerate(zip(frame_inds, frames_u8)):
+            image = frame_BGR.copy()
+            box = tube['boxes'][i]
+
+            connections_dwti = vf_connections_dwti[vid][find]
+            scores_dwti = vf_cls_probs[vid][find]
+            source_id = connections_dwti['dwti_sources'].index(tube['index'])
+
+            dwti_box = connections_dwti['boxes'][source_id]
+            dwti_score = scores_dwti[source_id][action_dwti_ind]
+            assert np.allclose(dwti_box, box)
+
+            snippets.cv_put_box_with_text(image, box,
+                text='{}({}); {:.2f}/{:.2f}; {}'.format(
+                    i, find, dwti_score, score, action))
+            drawn_frames_u8.append(image)
+
+        # # Save as images
+        # for find, image in zip(frame_inds, drawn_frames_u8):
+        #     cv2.imwrite(str(
+        #         video_fold/'Fr{:05d}.png'.format(find)), image)
+
+        # Save as video
+        snippets.qsave_video(video_fold/'overlaid.mp4', drawn_frames_u8)
+
+
+def eval_stubes_experimental(workfolder, cfg_dict, add_args):
+    out, = snippets.get_subfolders(workfolder, ['out'])
+    cfg = snippets.YConfig(cfg_dict)
+    cfg.set_defaults_handling(raise_without_defaults=False)
+    Ncfg_dataset.set_dataset_seed(cfg)
+    Ncfg_tubes.set_defcfg(cfg)
+    cfg.set_defaults("""
+    tubes_path: ~
+    """)
+    Ncfg_tube_eval.set_defcfg(cfg)
+    cf = cfg.parse()
+
+    dataset, split_vids, av_gt_tubes = \
+            Ncfg_dataset.resolve_dataset_tubes(cf)
+    tubes_to_eval: AV_dict[T_dwein_scored] = \
+            small.load_pkl(cf['tubes_path'])
+
+    dgt_tubes: Dict[I_dgt, T_dgt] = _reindex_avd_to_dgt(av_gt_tubes)
+    tubes_dwein: Dict[I_dwein, T_dwein]
+    tubes_dwein = loadconvert_tubes_dwein('/home/vsydorov/projects/deployed/2019_12_Thesis/dervo/thes/gpuhost7/2020_03_31/10_clean_inputs/20_wein_tubes/thes.gpuhost7.2020_03_31.10_clean_inputs.20_wein_tubes/194e3a301c202bc5e818dca26953ddb268aa98b3/out/extracted_tubes.pkl')
+    tubes_dwein = dtindex_filter_split(tubes_dwein, split_vids)
+
+    wgi, gti = _get_weingroup_assignment(dgt_tubes, tubes_dwein)
+    wgi_to_gti: Dict[I_weingroup, I_dgt] = dict(zip(wgi, gti))
+
+    # Evaluation
+    keyframe_av_stubes = small.load_pkl('/home/vsydorov/projects/deployed/2019_12_Thesis/dervo/thes/gpuhost7/2020_03_31/30_whole_video/30_pncaffe_rcnn/05_develop/10_splits_keyframes/thes.gpuhost7.2020_03_31.30_whole_video.30_pncaffe_rcnn.05_develop.10_splits_keyframes/RAW/out/av_stubes.pkl')
+
+    # Recall without NMS
+    iou_thresholds = cf['tube_eval.iou_thresholds']
+    nms_thresh = 0.5
+    recall_norm = compute_recall_for_avtubes_as_dfs(
+            av_gt_tubes, norm_av_stubes, iou_thresholds, False)[0]
+    recall_kf = compute_recall_for_avtubes_as_dfs(
+            av_gt_tubes, keyframe_av_stubes, iou_thresholds, False)[0]
+    # Ap without NMS
+    ap_norm = compute_ap_for_avtubes_as_df(
+            av_gt_tubes, norm_av_stubes, iou_thresholds, False, False)
+    ap_kf = compute_ap_for_avtubes_as_df(
+            av_gt_tubes, keyframe_av_stubes, iou_thresholds, False, False)
+
+    # # Apply "special NMS"
+    # wnms_norm_av_stubes = _weingroup_nms(norm_av_stubes, nms_thresh)
+    # wnms_keyframe_av_stubes = _weingroup_nms(keyframe_av_stubes, nms_thresh)
+
+    # Apply "special NMS"
+    wnms_norm_av_stubes = \
+            (small.stash2(out/'_temp_wnms_norm_av_stubes.pkl')
+            (_weingroup_nms, norm_av_stubes, nms_thresh))
+    wnms_keyframe_av_stubes = \
+            (small.stash2(out/'_temp_wnms_keyframe_av_stubes.pkl')
+            (_weingroup_nms, keyframe_av_stubes, nms_thresh))
+
+
+    # Recall with "special" NMS
+    wnms_recall_norm = compute_recall_for_avtubes_as_dfs(
+            av_gt_tubes, wnms_norm_av_stubes, iou_thresholds, False)[0]
+    wnms_recall_kf = compute_recall_for_avtubes_as_dfs(
+            av_gt_tubes, wnms_keyframe_av_stubes, iou_thresholds, False)[0]
+
+    # AP with "special" NMS.
+    wnms_ap_norm = compute_ap_for_avtubes_as_df(
+            av_gt_tubes, wnms_norm_av_stubes, iou_thresholds, False, False)
+    wnms_ap_kf = compute_ap_for_avtubes_as_df(
+            av_gt_tubes, wnms_keyframe_av_stubes, iou_thresholds, False, False)
+
+    # WG AP with "special" NMS
+    wnms_wap_norm = compute_ap_for_avtubes_WG_as_df(wgi_to_gti,
+            av_gt_tubes, wnms_norm_av_stubes, iou_thresholds, False, False)
+    wnms_wap_kf = compute_ap_for_avtubes_WG_as_df(wgi_to_gti,
+            av_gt_tubes, wnms_keyframe_av_stubes, iou_thresholds, False, False)
+
+    import pudb; pudb.set_trace()  # XXX BREAKPOINT
+    # Ncfg_tube_eval.evalprint_if(cf, norm_av_stubes, av_gt_tubes)
+    # Ncfg_tube_eval.evalprint_if(cf, keyframe_av_stubes, av_gt_tubes)
+    # Ncfg_tube_eval.evalprint_if(cf, av_stubes, av_gt_tubes)

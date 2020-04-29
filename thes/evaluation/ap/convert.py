@@ -158,6 +158,92 @@ def compute_ap_for_avtubes_as_df(
     return _apdict_to_df(cls_thresh_ap)
 
 
+# weingroup twist
+
+
+I_weingroup = Tuple[Vid_daly, int]
+
+
+def _compute_eligible_tubes_for_eval_weingroup(
+        fgts: List[AP_fgt_tube],
+        fdets: List[AP_fdet_tube],
+        wgi_to_gti: Dict[I_weingroup, I_dgt],
+            ) -> Dict[IFDET, Dict[IFGT, float]]:
+    if len(fdets) == 0:
+        return {}
+    gti_to_ifgt: Dict[I_dgt, IFGT] = {
+            fgt['obj']['index']: ifgt  # type: ignore
+            for ifgt, fgt in enumerate(fgts)}
+    # Break detections into weingroups
+    wgi_to_ifdets: Dict[I_weingroup, List[IFDET]] = {}
+    for ifdet, fdet in enumerate(fdets):
+        (vid, bunch_id, tube_id) = fdet['obj']['index']  # type: ignore
+        ifdet = cast(IFDET, ifdet)
+        (wgi_to_ifdets
+                .setdefault((vid, bunch_id), [])  # type: ignore
+                .append(ifdet))
+
+    ifdet_to_ifgt_tious: Dict[IFDET, Dict[IFGT, float]] = {}
+    for wgi, ifdets in wgi_to_ifdets.items():
+        gti = wgi_to_gti.get(wgi)
+        if gti is None:
+            continue
+        ifgt = gti_to_ifgt.get(gti)
+        if ifgt is None:
+            continue
+        fgt = fgts[ifgt]
+        for ifdet in ifdets:
+            fdet = fdets[ifdet]
+            temp_iou = temporal_IOU(
+                    fdet['obj']['start_frame'], fdet['obj']['end_frame'],
+                    fgt['obj']['start_frame'], fgt['obj']['end_frame'])
+            ifdet_to_ifgt_tious[ifdet] = {ifgt: temp_iou}
+    return ifdet_to_ifgt_tious
+
+
+def _tube_daly_ap_v_weingroup(
+        wgi_to_gti: Dict[I_weingroup, I_dgt],
+        v_gt_tubes: V_dict[T_dgt],
+        v_stubes: V_dict[TV_frametube_scored_co],
+        iou_thresholds: List[float],
+        spatiotemporal: bool,
+        use_diff: bool,
+            ) -> Dict[float, float]:
+    use_diff = True  # no difference, since no diff flags exist
+    use_07_metric = False  # no reason to use this metric
+    # Convert to flat ap-able representation
+    fgts, fdets = _convert_to_flat_representation(v_gt_tubes, v_stubes)
+    # Eligible computations are weingroup dependent
+    det_to_eligible_gt = _compute_eligible_tubes_for_eval_weingroup(
+            fgts, fdets, wgi_to_gti)
+    thresh_ap: Dict[float, float] = {}
+    ap_computer = AP_tube_computer(fgts, fdets, det_to_eligible_gt)
+    for iou_thresh in iou_thresholds:
+        thresh_ap[iou_thresh] = ap_computer.compute_ap(
+                iou_thresh, spatiotemporal, use_diff, use_07_metric)
+    return thresh_ap
+
+
+def compute_ap_for_avtubes_WG_as_df(
+        wgi_to_gti: Dict[I_weingroup, I_dgt],
+        av_gt_tubes: AV_dict[T_dgt],
+        av_stubes: AV_dict[TV_frametube_scored_co],
+        iou_thresholds: List[float],
+        spatiotemporal: bool,
+        use_diff: bool
+        ) -> pd.DataFrame:
+    cls_thresh_ap = {}
+    for action_cls in av_gt_tubes.keys():
+        thresh_ap = _tube_daly_ap_v_weingroup(wgi_to_gti,
+            av_gt_tubes[action_cls], av_stubes[action_cls],
+            iou_thresholds, spatiotemporal, use_diff)
+        cls_thresh_ap[action_cls] = thresh_ap
+    dft_ap = pd.DataFrame(cls_thresh_ap).T
+    dft_ap = dft_ap.sort_index()
+    dft_ap.loc['all'] = dft_ap.mean()
+    return dft_ap
+
+
 """Detection of image level boxes"""
 
 

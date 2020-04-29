@@ -18,9 +18,19 @@ from pathlib import Path
 
 from typing import (Iterable, List, Dict, Any)
 
-from vsydorov_tools import small
+from vsydorov_tools import small, cv as vt_cv
 
 log = logging.getLogger(__name__)
+
+
+def qsave_video(filepath, X_BGR):
+    X_BGR = np.array(X_BGR)
+    assert len(X_BGR.shape) == 4
+    H, W = X_BGR.shape[1:3]
+    video_path = vt_cv.suffix_helper(filepath, 'XVID')
+    with vt_cv.video_writer_open(video_path, (W, H), 10, 'XVID') as vout:
+        for frame in X_BGR:
+            vout.write(frame)
 
 
 def cv_put_box_with_text(

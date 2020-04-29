@@ -59,7 +59,7 @@ def spatiotemp_tube_iou_1N(
 
 
 def compute_nms_for_stubes(
-        stubes: List[Frametube_scored], thresh: float):
+        stubes: List[TV_frametube_scored_co], thresh: float):
     return nms_over_custom_elements(
             stubes, spatiotemp_tube_iou_1N, lambda x: x['score'], thresh)
 
