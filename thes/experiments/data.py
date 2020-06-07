@@ -5,7 +5,8 @@ from typing import (List, Tuple, Dict, cast, TypedDict, Set)  # NOQA
 from vsydorov_tools import small
 
 from thes.tools import snippets
-from thes.data.dataset.external import (Dataset_daly_ocv)
+from thes.data.dataset.external import (
+        Dataset_daly_ocv, Dataset_charades_ocv)
 from thes.data.tubes.types import (
     I_dwein, Tube_daly_wein_as_provided)
 from thes.data.tubes.types import (
@@ -16,12 +17,18 @@ def precompute_cache(workfolder, cfg_dict, add_args):
     out, = snippets.get_subfolders(workfolder, ['out'])
     cfg = snippets.YConfig(cfg_dict)
     cfg.set_deftype("""
-    dataset: [~, ['daly', 'voc2007']]
+    dataset: [~, str]
+    charades:
+        mirror: ['gpuhost7', str]
+        resolution: ['480', str]
     """)
     cf = cfg.parse()
 
     if cf['dataset'] == 'daly':
         dataset = Dataset_daly_ocv()
+    elif cf['dataset'] == 'charades':
+        dataset = Dataset_charades_ocv(
+                cf['charades.mirror'], cf['charades.resolution'])
     elif cf['dataset'] == 'voc2007':
         raise NotImplementedError()
     else:

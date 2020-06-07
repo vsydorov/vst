@@ -62,7 +62,8 @@ def _examine_stats(self, rstats):
 def _examine_kframes(self, rstats):
     vids = list(self.videos.keys())
     d_rstats = pd.DataFrame(rstats).T.loc[vids]
-    d_rstats['est_fps'] = (d_rstats['max_pos_frames']-1)*1000/d_rstats['max_pos_msec']
+    d_rstats['est_fps'] = (d_rstats['max_pos_frames']-1)*\
+            1000/d_rstats['max_pos_msec']
 
     action_list = []
     for vid, video in self.videos.items():

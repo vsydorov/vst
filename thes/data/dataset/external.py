@@ -16,7 +16,8 @@ from abc import abstractmethod, ABC
 from tqdm import tqdm
 from pathlib import Path
 from collections import OrderedDict
-from typing import Dict, List, Tuple, cast, NewType, Any, TypedDict
+from typing import (Dict, List, Tuple, cast, NewType,
+        Any, TypedDict, Optional, Literal)
 
 from vsydorov_tools import small, cv as vt_cv
 
@@ -193,6 +194,9 @@ class Video_daly_ocv(TypedDict):
     # ocv
     height: int
     width: int
+    nframes: int
+    est_length: float
+    est_fps: float
 
 
 class Dataset_daly_ocv(Dataset_daly):
@@ -209,7 +213,9 @@ class Dataset_daly_ocv(Dataset_daly):
         videos_ocv = {}
         for vid, video in self.videos.items():
             rs = rstats[vid]
-            est_fps = (rs['max_pos_frames']-1)*1000/rs['max_pos_msec']
+            nframes = rs['max_pos_frames']
+            est_fps = (nframes-1)*1000/rs['max_pos_msec']
+            est_length = np.round(nframes / est_fps, 4)
             wh = np.array([rs['width'], rs['height']])
             whwh = np.tile(wh, 2)
             instances_ocv = {}
@@ -219,7 +225,7 @@ class Dataset_daly_ocv(Dataset_daly):
                     keyframes = []
                     for kf in instance['keyframes']:
                         bbox_abs = kf['boundingBox'][0] * whwh
-                        objects_abs = kf['objects']
+                        objects_abs = kf['objects'].copy()
                         objects_abs[:, :4] *= whwh
                         pose_abs = kf['pose']
                         pose_abs[:, :4] *= whwh
@@ -241,8 +247,8 @@ class Dataset_daly_ocv(Dataset_daly):
                     end_frame -= 1
                     instance_ocv.update({
                         'keyframes': keyframes,
-                        'start_frame': start_frame,
-                        'end_frame': end_frame})
+                        'start_frame': int(start_frame),
+                        'end_frame': int(end_frame)})
                     instance_ocv = cast(Instance_daly_ocv, instance_ocv)
                     ains_ocv.append(instance_ocv)
                 instances_ocv[action_name] = ains_ocv
@@ -250,7 +256,11 @@ class Dataset_daly_ocv(Dataset_daly):
             video_ocv.update({
                 'instances': instances_ocv,
                 'height': rs['height'],
-                'width': rs['width']})
+                'width': rs['width'],
+                'nframes': nframes,
+                'est_length': est_length,
+                'est_fps': est_fps
+                })
             videos_ocv[vid] = video_ocv
         return videos_ocv
 
@@ -268,6 +278,281 @@ class Dataset_daly_ocv(Dataset_daly):
             'rstats': rstats,
             'videos_ocv': videos_ocv,
         }
+        small.save_pkl(fold/'precomputed_stats.pkl', precomputed_stats)
+
+    def populate_from_folder(self, fold):
+        fold = Path(fold)
+        precomputed_stats = small.load_pkl(fold/'precomputed_stats.pkl')
+        self.rstats = precomputed_stats['rstats']
+        self.videos_ocv = precomputed_stats['videos_ocv']
+
+
+Vid_char = NewType('Vid_char', Vid)
+Action_name_char = NewType('Action_name_char', str)
+Object_name_char = NewType('Object_name_char', str)
+Verb_name_char = NewType('Verb_name_char', str)
+
+
+class Action_instance_char(TypedDict):
+    name: Action_name_char
+    start_time: float
+    end_time: float
+
+
+class Video_char(TypedDict):
+    vid: Vid_char
+    subject: str
+    scene: str
+    quality: Optional[int]
+    relevance: Optional[int]
+    verified: str
+    script: str
+    objects: List[Object_name_char]
+    descriptions: str
+    actions: List[Action_instance_char]
+    length: float
+
+
+class Dataset_charades(object):
+    """
+    Charades dataset, featuring trainval split that was released
+    """
+    root_path: Path
+
+    action_names: List[Action_name_char]
+    object_names = cast(List[Object_name_char], [
+        'None', 'bag', 'bed', 'blanket', 'book', 'box', 'broom',
+        'chair', 'closet/cabinet', 'clothes', 'cup/glass/bottle',
+        'dish', 'door', 'doorknob', 'doorway', 'floor', 'food',
+        'groceries', 'hair', 'hands', 'laptop', 'light', 'medicine',
+        'mirror', 'paper/notebook', 'phone/camera', 'picture', 'pillow',
+        'refrigerator', 'sandwich', 'shelf', 'shoe', 'sofa/couch',
+        'table', 'television', 'towel', 'vacuum', 'window'])
+    verb_names = cast(List[Verb_name_char], [
+        'awaken', 'close', 'cook', 'dress', 'drink', 'eat', 'fix',
+        'grasp', 'hold', 'laugh', 'lie', 'make', 'open', 'photograph',
+        'play', 'pour', 'put', 'run', 'sit', 'smile', 'sneeze',
+        'snuggle', 'stand', 'take', 'talk', 'throw', 'tidy', 'turn',
+        'undress', 'walk', 'wash', 'watch', 'work'])
+    action_mapping: Dict[Action_name_char, Tuple[
+        Object_name_char, Verb_name_char]]
+    split: Dict[Vid_char, Dataset_subset]
+    videos: Dict[Vid_char, Video_char]
+
+    # Utility
+    _action_labels: Dict[str, Action_name_char]
+    _object_labels: Dict[str, Object_name_char]
+    _verb_labels: Dict[str, Verb_name_char]
+
+    def __init__(self):
+        super().__init__()
+        self.root_path = get_dataset_path('action/charades_take2')
+        self._anno_fold = self.root_path/'annotation/Charades'
+        self._load_csv_files()
+
+    def _get_classes_objects_verbs(self):
+        def _get1(filename):
+            with (filename).open('r') as f:
+                lines = f.readlines()
+            d = {}
+            for x in lines:
+                x = x.strip()
+                d[x[:4]] = x[5:]
+            return d
+
+        def _get3(filename):
+            with (filename).open('r') as f:
+                lines = f.readlines()
+            d = {}
+            for x in lines:
+                xs = x.strip().split()
+                d[xs[0]] = (xs[1], xs[2])
+            return d
+
+        _action_labels = _get1(self._anno_fold/'Charades_v1_classes.txt')
+        _object_labels = _get1(self._anno_fold/'Charades_v1_objectclasses.txt')
+        _verb_labels = _get1(self._anno_fold/'Charades_v1_verbclasses.txt')
+        _action_mapping_labels = _get3(self._anno_fold/'Charades_v1_mapping.txt')
+        self._action_labels = _action_labels
+        self._object_labels = _object_labels
+        self._verb_labels = _verb_labels
+
+        self.action_names = list(_action_labels.values())
+        assert self.object_names == list(_object_labels.values())
+        assert self.verb_names == list(_verb_labels.values())
+        self.action_mapping = {
+            _action_labels[a]: (_object_labels[o], _verb_labels[v])
+            for a, (o, v) in _action_mapping_labels.items()}
+
+    @staticmethod
+    def _read_video_csv(filename, action_labels) -> List[Video_char]:
+        videos = []
+        with filename.open('r') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                objects = cast(List[Object_name_char],
+                        row['objects'].split(';'))
+                vid = Vid_char(Vid(row['id']))
+                length = float(row['length'])
+                actions = []
+                if len(row['actions']):
+                    for action_str in row['actions'].split(';'):
+                        a, beg, end = action_str.split()
+                        action_name = action_labels[a]
+                        start_time = float(beg)
+                        end_time = float(end)
+                        action = Action_instance_char(
+                            name=action_name, start_time=start_time,
+                            end_time=end_time)
+                        actions.append(action)
+                relevance = int(row['relevance']) \
+                        if row['relevance'] else None
+                quality = int(row['quality']) \
+                        if row['quality'] else None
+                video: Video_char = {
+                        'vid': vid,
+                        'subject': row['subject'],
+                        'scene': row['scene'],
+                        'quality': quality,
+                        'relevance': relevance,
+                        'verified': row['verified'],
+                        'script': row['script'],
+                        'objects': objects,
+                        'descriptions': row['descriptions'],
+                        'actions': actions,
+                        'length': length
+                        }
+                videos.append(video)
+        return videos
+
+    def _load_csv_files(self):
+        self._get_classes_objects_verbs()
+
+        # Load training and validation videos
+        train_videos = self._read_video_csv(
+            self._anno_fold/ 'Charades_v1_train.csv', self._action_labels)
+        val_videos = self._read_video_csv(
+            self._anno_fold/ 'Charades_v1_test.csv', self._action_labels)
+        split = {}
+        for v in train_videos:
+            split[v['vid']] = 'train'
+        for v in val_videos:
+            split[v['vid']] = 'val'
+
+        videos = []
+        videos.extend(train_videos)
+        videos.extend(val_videos)
+        keys = [v['vid'] for v in videos]
+        videos = dict(zip(keys, videos))
+        self.split = split
+        self.videos: Dict[Vid_daly, Video_daly] = videos
+
+
+class Action_instance_char_ocv(Action_instance_char):
+    start_frame: F0
+    end_frame: F0
+
+
+class Video_char_ocv(TypedDict):
+    vid: Vid_char
+    subject: str
+    scene: str
+    quality: Optional[int]
+    relevance: Optional[int]
+    verified: str
+    script: str
+    objects: List[Object_name_char]
+    descriptions: str
+    actions: List[Action_instance_char_ocv]
+    length: float
+    # ocv
+    height: int
+    width: int
+    nframes: int
+    est_length: float
+    est_fps: float
+
+
+class Dataset_charades_ocv(Dataset_charades):
+    rstats: Dict[Vid_char, OCV_rstats]
+    videos_ocv: Dict[Vid_char, Video_char_ocv]
+
+    mirror: Literal['horus', 'gpuhost7', 'scratch2']
+    resolution: Literal['original', '480']
+
+    _rfold_dict = {'original': 'Charades_v1', '480': 'Charades_v1_480'}
+
+    def __init__(self, mirror, resolution):
+        super().__init__()
+        self.mirror = mirror
+        self.resolution = resolution
+
+    def precompute_to_folder(self, fold):
+        fold = Path(fold)
+        # Construct path pattern
+        _pattern = (self.root_path/'mirrors'/self.mirror/
+                self._rfold_dict[self.resolution]/'{}.mp4')
+        vids = list(self.videos.keys())
+        isaver = snippets.Threading_isaver(
+            small.mkdir(fold/'isave_rstats'), vids,
+            lambda vid: compute_ocv_rstats(str(_pattern).format(vid)), 25, 8)
+        isaver_items = isaver.run()
+        rstats: Dict[Vid_daly, OCV_rstats] = dict(zip(vids, isaver_items))
+
+        frames_unreachable = {}
+        fps_mismatch = {}
+        length_mismatch = {}
+        actions_dropped = {}
+        videos_ocv = {}
+        for vid, rs in rstats.items():
+            video = self.videos[vid]
+            nframes = rs['max_pos_frames']
+            est_fps = (nframes - 1) * 1000 / rs['max_pos_msec']
+            est_length = np.round(nframes / est_fps, 4)
+            if nframes != rs['frame_count']:
+                frames_unreachable[vid] = (nframes, rs['frame_count'])
+            if not np.isclose(est_fps, rs['fps']):
+                fps_mismatch[vid] = (est_fps, rs['fps'])
+            if not np.isclose(est_length, video['length']):
+                length_mismatch[vid] = (est_length, video['length'])
+            actions_ocv: List[Action_instance_char_ocv] = []
+            for i, action in enumerate(video['actions']):
+                action_ocv = copy.copy(action)
+                start_frame = max(0, np.ceil(action['start_time'] * est_fps) - 1)
+                end_frame = np.ceil(action['end_time'] * est_fps)
+                if end_frame > nframes:
+                    end_frame = nframes
+                end_frame -= 1
+                action_ocv['start_frame'] = int(start_frame)
+                action_ocv['end_frame'] = int(end_frame)
+                if start_frame > end_frame:
+                    actions_dropped[(vid, i)] = \
+                            (action_ocv, nframes, self.split[vid])
+                else:
+                    actions_ocv.append(action_ocv)
+            video_ocv = copy.deepcopy(video)
+            video_ocv = cast(Video_char_ocv, video_ocv)
+            video_ocv.update({
+                'actions': actions_ocv,
+                'height': rs['height'],
+                'width': rs['width'],
+                'nframes': nframes,
+                'est_length': est_length,
+                'est_fps': est_fps
+                })
+            videos_ocv[vid] = video_ocv
+
+        OCV_GOOD = len(frames_unreachable) == len(fps_mismatch) == 0
+        MISMATCH_NUM_GOOD = len(length_mismatch) == 9844
+        DROPPED_ONLY_TRAIN = all([a[2] == 'train'
+            for a in actions_dropped.values()])
+        DROPPED_NUM_GOOD = len(actions_dropped) == 7
+        if not (OCV_GOOD and MISMATCH_NUM_GOOD and
+                DROPPED_ONLY_TRAIN and DROPPED_NUM_GOOD):
+            log.warn('Different error stats')
+        precomputed_stats = {
+            'rstats': rstats,
+            'videos_ocv': videos_ocv}
         small.save_pkl(fold/'precomputed_stats.pkl', precomputed_stats)
 
     def populate_from_folder(self, fold):

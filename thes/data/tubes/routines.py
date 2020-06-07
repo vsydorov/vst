@@ -71,6 +71,16 @@ def numpy_inner_overlap_N1(boxes1, box2):
     return ioverlaps
 
 
+def numpy_inner_overlap_NN(boxes1, boxes2):
+    assert boxes1.shape == boxes2.shape
+    assert len(boxes1.shape) == 2
+    assert boxes1.shape[-1] == 4
+    inter_areas = _inter_areas(boxes1, boxes2)
+    boxes1_areas = _bareas(boxes1)
+    ioverlaps = inter_areas / boxes1_areas
+    return ioverlaps
+
+
 def numpy_iou_N1(boxes1, box2):
     assert len(boxes1.shape) == 2
     assert boxes1.shape[-1] == 4
