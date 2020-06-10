@@ -51,9 +51,7 @@ def cv_put_box_with_text(
     """
 
     l, t, r, d = map(int, box_ltrd)
-    result = cv2.rectangle(
-            image,
-            (l, t), (r, d),
+    cv2.rectangle(image, (l, t), (r, d),
             color=rec_color,
             thickness=rec_thickness)
 
@@ -83,7 +81,7 @@ def cv_put_box_with_text(
                 fontScale=text_size,
                 color=text_color,
                 thickness=text_thickness)
-    return result
+    return image
 
 
 class Averager(object):
