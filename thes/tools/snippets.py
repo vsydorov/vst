@@ -501,7 +501,7 @@ def _tqdm_str(pbar, ninc=0):
     return tqdm_str
 
 
-class Base_isaver(ABC):
+class Isaver_base(ABC):
     def __init__(self, folder, total):
         self._re_finished = (
             r'item_(?P<i>\d+)_of_(?P<N>\d+).finished')
@@ -549,7 +549,7 @@ class Base_isaver(ABC):
             len(inds_to_purge), files_purged))
 
 
-class Mixin_restore_save(object):
+class Isaver_mixin_restore_save(object):
     def _restore(self):
         intermediate_files: Dict[int, Dict[str, Path]] = \
                 self._get_intermediate_files()
@@ -568,7 +568,7 @@ class Mixin_restore_save(object):
         ifiles['finished'].touch()
 
 
-class Simple_isaver(Mixin_restore_save, Base_isaver):
+class Simple_isaver(Isaver_mixin_restore_save, Isaver_base):
     """
     Will process a list with a func
 
@@ -614,7 +614,7 @@ class Simple_isaver(Mixin_restore_save, Base_isaver):
         return self.result
 
 
-class Threading_isaver(Mixin_restore_save, Base_isaver):
+class Threading_isaver(Isaver_mixin_restore_save, Isaver_base):
     """
     Will process a list with a func, in async manner
     """

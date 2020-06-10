@@ -1,4 +1,6 @@
 import numpy as np
+import logging
+import time
 import copy
 from types import MethodType
 from tqdm import tqdm
@@ -13,13 +15,17 @@ import slowfast.utils.checkpoint as cu
 
 from detectron2.layers import ROIAlign
 
+from vsydorov_tools import small
 from vsydorov_tools import cv as vt_cv
+from vsydorov_tools import log as vt_log
 
 from thes.data.dataset.external import (Dataset_daly_ocv)
 from thes.tools import snippets
 from thes.detectron.daly import (
     get_daly_split_vids)
 from thes.slowfast.cfg import (base_sf_i3d_config)
+
+log = logging.getLogger(__name__)
 
 
 def np_to_gpu(X):
@@ -224,6 +230,92 @@ class TDataset_over_keyframes(torch.utils.data.Dataset):
         return len(self.keyframes)
 
 
+def create_keyframelist(dataset):
+    # Record keyframes
+    keyframes = []
+    for vid, ovideo in dataset.videos_ocv.items():
+        nframes = ovideo['nframes']
+        for action_name, instances in ovideo['instances'].items():
+            for ins_ind, instance in enumerate(instances):
+                fl = instance['flags']
+                diff = fl['isReflection'] or fl['isAmbiguous']
+                if diff:
+                    continue
+                for kf_ind, keyframe in enumerate(instance['keyframes']):
+                    frame0 = keyframe['frame']
+                    action_id = dataset.action_names.index(action_name)
+                    kf_dict = {
+                            'vid': vid,
+                            'action_id': action_id,
+                            'action_name': action_name,
+                            'ins_ind': ins_ind,
+                            'kf_ind': kf_ind,
+                            'bbox': keyframe['bbox_abs'],
+                            'video_path': ovideo['path'],
+                            'frame0': int(frame0),
+                            'nframes': nframes,
+                            'height': ovideo['height'],
+                            'width': ovideo['width'],
+                            }
+                    keyframes.append(kf_dict)
+    return keyframes
+
+
+class Dataloader_isaver(
+        snippets.Isaver_mixin_restore_save, snippets.Isaver_base):
+    """
+    Will process a list with a 'func', 'prepare_func(start_i)' is to be run before processing
+    """
+    def __init__(self, folder,
+            total, func, prepare_func,
+            save_every=0,
+            save_interval=120,  # every 2 minutes by default
+            log_interval=None,):
+        super().__init__(folder, total)
+        self.func = func
+        self.prepare_func = prepare_func
+        self._save_every = save_every
+        self._save_interval = save_interval
+        self._log_interval = log_interval
+        self.result = []
+
+    def run(self):
+        i_last = self._restore()
+        self._time_last_save = time.perf_counter()
+        self._time_last_log = time.perf_counter()
+        self._i_last_saved = 0
+
+        Ys_np = []
+
+        def flush_purge():
+            self.result.extend(Ys_np)
+            Ys_np.clear()
+            self._save(i_last)
+            self._purge_intermediate_files()
+
+        loader = self.prepare_func(i_last)
+        pbar = tqdm(loader, total=len(loader))
+        for i_batch, data_input in enumerate(pbar):
+            II_np, Y_np = self.func(data_input)
+            Ys_np.append(Y_np)
+            i_last = II_np[-1]
+            PURGE = False
+            if self._save_every > 0:
+                PURGE |= (i_last - self._i_last_saved) >= self._save_every
+            if self._save_interval:
+                since_last_save = time.perf_counter() - self._time_last_save
+                PURGE |= since_last_save > self._save_interval
+            if PURGE:
+                flush_purge()
+                self._time_last_save = time.perf_counter()
+            if self._log_interval:
+                since_last_log = time.perf_counter() - self._time_last_log
+                if since_last_log > self._log_interval:
+                    log.info(snippets._tqdm_str(pbar))
+                    self._time_last_log = time.perf_counter()
+        flush_purge()
+        return self.result
+
 def extract_slowfast_feats(workfolder, cfg_dict, add_args):
     out, = snippets.get_subfolders(workfolder, ['out'])
     cfg = snippets.YConfig(cfg_dict)
@@ -239,61 +331,55 @@ def extract_slowfast_feats(workfolder, cfg_dict, add_args):
     # DALY Dataset
     dataset = Dataset_daly_ocv()
     dataset.populate_from_folder(cf['dataset.cache_folder'])
-    split_label = cf['dataset.subset']
-    split_vids = get_daly_split_vids(dataset, split_label)
+    # split_label = cf['dataset.subset']
+    # split_vids = get_daly_split_vids(dataset, split_label)
 
     sf_cfg = base_sf_i3d_config()
     sf_cfg.NUM_GPUS = 1
-    sf_cfg.TEST.BATCH_SIZE = 8
+    sf_cfg.TEST.BATCH_SIZE = 16
     # Load model
     model = slowfast.models.build_model(sf_cfg)
     model.eval()
     # misc.log_model_info(model, sf_cfg, is_train=False)
 
     CHECKPOINT_FILE_PATH = '/home/vsydorov/projects/deployed/2019_12_Thesis/links/scratch2/102_slowfast/20_checkpoints/I3D_8x8_R50.pkl'
-    cu.load_checkpoint(
-        CHECKPOINT_FILE_PATH, model, False, None,
-        inflation=False, convert_from_caffe2=True,)
+    with vt_log.logging_disabled(logging.WARNING):
+        cu.load_checkpoint(
+            CHECKPOINT_FILE_PATH, model, False, None,
+            inflation=False, convert_from_caffe2=True,)
 
-    # Record keyframes
-    keyframes = []
-    for vid in split_vids:
-        ovideo = dataset.videos_ocv[vid]
-        nframes = ovideo['nframes']
-        for action_name, instances in ovideo['instances'].items():
-            for ins_ind, instance in enumerate(instances):
-                fl = instance['flags']
-                diff = fl['isReflection'] or fl['isAmbiguous']
-                if diff:
-                    continue
-                for keyframe in instance['keyframes']:
-                    frame0 = keyframe['frame']
-                    action_id = dataset.action_names.index(action_name)
-                    kf_dict = {
-                            'bbox': keyframe['bbox_abs'],
-                            'vid': vid,
-                            'video_path': ovideo['path'],
-                            'frame0': int(frame0),
-                            'nframes': nframes,
-                            'action_id': action_id,
-                            'action_name': action_name,
-                            'height': ovideo['height'],
-                            'width': ovideo['width'],
-                            }
-                    keyframes.append(kf_dict)
+    keyframes = create_keyframelist(dataset)
 
     model_nframes = sf_cfg.DATA.NUM_FRAMES
     model_sample = sf_cfg.DATA.SAMPLING_RATE
     extractor_roi = Extractor_roi(model, model_nframes)
-    tdataset_kf = TDataset_over_keyframes(keyframes, model_nframes, model_sample)
 
     BATCH_SIZE = 8
-    NUM_WORKERS = 4
-    loader = torch.utils.data.DataLoader(tdataset_kf,
-            batch_size=BATCH_SIZE, shuffle=False,
-            num_workers=NUM_WORKERS, pin_memory=True)
+    NUM_WORKERS = 12
 
-    for i, (II, Xts, bboxes) in tqdm(enumerate(loader), total=len(loader)):
+    def prepare_func(start_i):
+        remaining_keyframes = keyframes[start_i+1:]
+        tdataset_kf = TDataset_over_keyframes(
+                remaining_keyframes, model_nframes, model_sample)
+        loader = torch.utils.data.DataLoader(tdataset_kf,
+                batch_size=BATCH_SIZE, shuffle=False,
+                num_workers=NUM_WORKERS, pin_memory=True)
+        return loader
+
+    def func(data_input):
+        II, Xts, bboxes = data_input
         Xs_f32c = to_gpu_normalize_permute(Xts)
         bboxes_c = bboxes.type(torch.cuda.FloatTensor)
         Y = extractor_roi.forward([Xs_f32c], bboxes_c)
+        II_np = II.cpu().numpy()
+        Y_np = Y.cpu().numpy()
+        return II_np, Y_np
+
+    disaver_fold = small.mkdir(out/'disaver')
+    total = len(keyframes)
+    disaver = Dataloader_isaver(disaver_fold, total, func, prepare_func,
+            save_interval=60)
+    outputs = disaver.run()
+    sq_outputs = np.vstack(outputs).squeeze()
+    small.save_pkl(out/'sq_outputs.pkl', sq_outputs)
+    small.save_pkl(out/'keyframes.pkl', keyframes)
