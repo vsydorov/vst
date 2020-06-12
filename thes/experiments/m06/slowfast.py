@@ -20,6 +20,7 @@ from scipy.special import softmax
 import torch
 import torch.nn as nn
 import torch.utils.data
+import torch.nn.functional as F
 
 import slowfast.models
 import slowfast.utils.misc as misc
@@ -504,6 +505,17 @@ def create_kinda_objaction_struct(dataset, test_kfs, Y_conf_scores_sm):
     return objactions_vf
 
 
+def split_off(X, linked_vids, good_vids):
+    if isinstance(X, np.ndarray):
+        isin = np.in1d(linked_vids, good_vids)
+        result = X[isin]
+    elif isinstance(X, list):
+        result = [x for x, v in zip(X, linked_vids) if v in good_vids]
+    else:
+        raise RuntimeError()
+    return result
+
+
 def train_mlp_over_extracted_feats(workfolder, cfg_dict, add_args):
     out, = snippets.get_subfolders(workfolder, ['out'])
     cfg = snippets.YConfig(cfg_dict)
@@ -531,16 +543,6 @@ def train_mlp_over_extracted_feats(workfolder, cfg_dict, add_args):
     outputs = small.load_pkl(computed_featfold/'sq_outputs.pkl')
     kf_vids = [kf['vid'] for kf in keyframes]
 
-    def split_off(X, linked_vids, good_vids):
-        if isinstance(X, np.ndarray):
-            isin = np.in1d(linked_vids, good_vids)
-            result = X[isin]
-        elif isinstance(X, list):
-            result = [x for x, v in zip(X, linked_vids) if v in good_vids]
-        else:
-            raise RuntimeError()
-        return result
-
     X_trainval = split_off(outputs, kf_vids, trainval_vids)
     kf_trainval = split_off(keyframes, kf_vids, trainval_vids)
     kf_vids_trainval = [kf['vid'] for kf in kf_trainval]
@@ -551,7 +553,6 @@ def train_mlp_over_extracted_feats(workfolder, cfg_dict, add_args):
 
     X_test = split_off(outputs, kf_vids, test_vids)
     kf_test = split_off(keyframes, kf_vids, test_vids)
-    kf_vids_test = [kf['vid'] for kf in kf_test]
     aid_test = [kf['action_id'] for kf in kf_test]
     X_test = scaler.transform(X_test)
 
@@ -563,22 +564,24 @@ def train_mlp_over_extracted_feats(workfolder, cfg_dict, add_args):
     kf_val = split_off(kf_trainval, kf_vids_trainval, val_vids)
     aid_val = [kf['action_id'] for kf in kf_val]
 
-    def compute_perf(IN):
-        alpha, hl_size, max_iter = IN
-        clf = MLPClassifier(hl_size, random_state=0, max_iter=max_iter, alpha=alpha)
-        clf.fit(X_train, aid_train)
-        Y_val = clf.predict(X_val)
-        acc = accuracy_score(aid_val, Y_val)
-        return acc
+    val_search = False
+    if val_search:
+        def compute_perf(IN):
+            alpha, hl_size, max_iter = IN
+            clf = MLPClassifier(hl_size, random_state=0, max_iter=max_iter, alpha=alpha)
+            clf.fit(X_train, aid_train)
+            Y_val = clf.predict(X_val)
+            acc = accuracy_score(aid_val, Y_val)
+            return acc
 
-    alpha_values = np.logspace(-3, -1, 7)
-    hlayer_sizes = ((200,), (250,))
-    max_iter = (200, 400, 600)
-    params = list(itertools.product(alpha_values, hlayer_sizes, max_iter))
+        alpha_values = np.logspace(-3, -1, 7)
+        hlayer_sizes = ((200,), (250,))
+        max_iter = (200, 400, 600)
+        params = list(itertools.product(alpha_values, hlayer_sizes, max_iter))
 
-    fold = small.mkdir(out/'isaver_ahl_perf')
-    isaver = snippets.Isaver_threading(fold, params, compute_perf, 2, 24)
-    perfs = isaver.run()
+        fold = small.mkdir(out/'isaver_ahl_perf')
+        isaver = snippets.Isaver_threading(fold, params, compute_perf, 2, 24)
+        perfs = isaver.run()
 
     # Train on trainval
     clf = MLPClassifier((200,), random_state=0, max_iter=300, alpha=0.02)
@@ -622,7 +625,55 @@ def train_mlp_over_extracted_feats(workfolder, cfg_dict, add_args):
     log.info(f'AP:\n{df_ap_s_nodiff}')
 
 
-def train_extracted_feats(workfolder, cfg_dict, add_args):
+def _val_preparations(outputs, keyframes, Vids):
+    global_kf_vids = [kf['vid'] for kf in keyframes]
+
+    class D_trainval():
+        X = split_off(outputs, global_kf_vids, Vids.trainval)
+        kf = split_off(keyframes, global_kf_vids, Vids.trainval)
+        kf_vids = [kf['vid'] for kf in kf]
+        aid = [kf['action_id'] for kf in kf]
+
+    scaler = StandardScaler()
+    D_trainval.X = scaler.fit_transform(D_trainval.X)
+
+    class D_test():
+        X = split_off(outputs, global_kf_vids, Vids.test)
+        kf = split_off(keyframes, global_kf_vids, Vids.test)
+        aid = np.array([kf['action_id'] for kf in kf])
+        X = scaler.transform(X)
+
+    class D_train():
+        X = split_off(D_trainval.X, D_trainval.kf_vids, Vids.train)
+        kf = split_off(D_trainval.kf, D_trainval.kf_vids, Vids.train)
+        aid = np.array([kf['action_id'] for kf in kf])
+
+    class D_val():
+        X = split_off(D_trainval.X, D_trainval.kf_vids, Vids.val)
+        kf = split_off(D_trainval.kf, D_trainval.kf_vids, Vids.val)
+        aid = np.array([kf['action_id'] for kf in kf])
+
+    return D_trainval, D_test, D_train, D_val
+
+
+class Net(nn.Module):
+    def __init__(self, D_in, D_out, H, dropout_rate=0.5):
+        super().__init__()
+        self.linear1 = nn.Linear(D_in, H)
+        self.linear2 = nn.Linear(H, D_out)
+        self.dropout = nn.Dropout(dropout_rate)
+        # self.bn = nn.BatchNorm1d(H, momentum=0.1)
+
+    def forward(self, x):
+        x = self.linear1(x)
+        x = F.relu(x)
+        x = self.dropout(x)
+        # x = self.bn(x)
+        x = self.linear2(x)
+        return x
+
+
+def train_torch_mlp_over_extracted_feats(workfolder, cfg_dict, add_args):
     out, = snippets.get_subfolders(workfolder, ['out'])
     cfg = snippets.YConfig(cfg_dict)
     cfg.set_deftype("""
@@ -640,53 +691,64 @@ def train_extracted_feats(workfolder, cfg_dict, add_args):
     dataset = Dataset_daly_ocv()
     dataset.populate_from_folder(cf['dataset.cache_folder'])
 
-    trainval_vids = get_daly_split_vids(dataset, 'train')
-    val_vids, train_vids = split_off_validation_set(dataset, 0.1)
-    test_vids = get_daly_split_vids(dataset, 'test')
-
+    class Vids():
+        val, train = split_off_validation_set(dataset, 0.1)
+        trainval = get_daly_split_vids(dataset, 'train')
+        test = get_daly_split_vids(dataset, 'test')
 
     computed_featfold = Path(cf['computed_featfold'])
     keyframes = small.load_pkl(computed_featfold/'keyframes.pkl')
     outputs = small.load_pkl(computed_featfold/'sq_outputs.pkl')
-    N = len(keyframes)
+    D_trainval, D_test, D_train, D_val = _val_preparations(outputs, keyframes, Vids)
+
+    D_in = D_train.X.shape[-1]
+    D_out = len(dataset.action_names)
+    H = 32
+    model = Net(D_in, D_out, H)
+    loss_fn = torch.nn.CrossEntropyLoss(reduction='mean')
+
+    learning_rate = 1e-5
+    optimizer = torch.optim.AdamW(model.parameters(),
+            lr=learning_rate,
+            weight_decay=5e-2)
+    N_iters = 2000
+    X_train = torch.from_numpy(D_train.X)
+    Y_train = torch.from_numpy(D_train.aid)
+    X_val = torch.from_numpy(D_val.X)
+    Y_val = torch.from_numpy(D_val.aid)
+    model.train()
+    for t in range(N_iters):
+        pred_train = model(X_train)
+        loss = loss_fn(pred_train, Y_train)
+        if t % 50 == 0:
+            # Train perf
+            model.eval()
+            with torch.no_grad():
+                pred_train = model(X_train)
+                acc_train = pred_train.argmax(1).eq(Y_train).sum().item()/len(Y_train) * 100
+                pred_val = model(X_val)
+                acc_val = pred_val.argmax(1).eq(Y_val).sum().item()/len(Y_val) * 100
+            model.train()
+            log.info(f'{t}: {loss.item()} {acc_train=:.2f} {acc_val=:.2f}')
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+    import pudb; pudb.set_trace()  # XXX BREAKPOINT
+    with torch.no_grad():
+        Y_val = model(X_val)
+    Y_val_np = Y_val.numpy()
+    Y_val_preds = np.argmax(Y_val_np, axis=1)
+
+    acc = accuracy_score(D_val.aid, Y_val_preds)
+    log.info(f'Val {acc=}')
 
 
-    train_feats = []
-    train_kfs = []
-    test_feats = []
-    test_kfs = []
-    for keyframe, feat in zip(keyframes, outputs):
-        if keyframe['vid'] in train_vids:
-            train_feats.append(feat)
-            train_kfs.append(keyframe)
-        if keyframe['vid'] in test_vids:
-            test_feats.append(feat)
-            test_kfs.append(keyframe)
-
-    train_feats = np.array(train_feats)
-    train_aids = np.array([x['action_id'] for x in train_kfs])
-
-    test_feats = np.array(test_feats)
-    test_aids = np.array([x['action_id'] for x in test_kfs])
-
-    def scale_clf():
-        scaler = StandardScaler()
-        scaler.fit(train_feats)
-        clf = LinearSVC(verbose=1, max_iter=2000)
-        clf.fit(X_train, train_aids)
-        return scaler, clf
-
-    scaler, clf = small.stash2(out/'scaler_clf.pkl')(scale_clf)
-
-    X_train = scaler.transform(train_feats)
-    X_test = scaler.transform(test_feats)
-    Y_test = clf.predict(X_test)
-
-    Y_conf_scores = clf.decision_function(X_test)
-    Y_conf_scores_sm = softmax(Y_conf_scores, axis=1)
-
-    acc = accuracy_score(test_aids, Y_test)
-    log.info(f'{acc=}')
-    roc_auc = roc_auc_score(test_aids, Y_conf_scores_sm,
-            multi_class='ovr')
-    log.info(f'{roc_auc=}')
+    import pudb; pudb.set_trace()  # XXX BREAKPOINT
+    # clf = MLPClassifier((200,), random_state=0, max_iter=300, alpha=0.02)
+    # clf.fit(D_trainval.X, D_trainval.aid)
+    # Y_test = clf.predict(D_test.X)
+    # acc = accuracy_score(D_test.aid, Y_test)
+    # log.info(f'Test {acc=}')
+    # import pudb; pudb.set_trace()  # XXX BREAKPOINT
+    pass
