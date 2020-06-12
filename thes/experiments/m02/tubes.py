@@ -2,33 +2,29 @@ import copy
 import pprint
 import itertools
 import pandas as pd
-import warnings
 import logging
-import cv2
 import numpy as np
-from tqdm import tqdm
 from pathlib import Path
-from typing import (
-        List, Tuple, Dict, cast, TypedDict, Set, Sequence, Optional)
+from typing import (  # NOQA
+    List, Tuple, Dict, cast, TypedDict, Set, Sequence, Optional)
 
 from vsydorov_tools import small
 from vsydorov_tools import cv as vt_cv
 
 from thes.data.dataset.external import (
-    Dataset_daly_ocv, Vid_daly)
+    Dataset_daly_ocv, Vid_daly, get_daly_split_vids, )
 from thes.caffe import Nicolas_net_helper
 from thes.detectron.rcnn import D2_rcnn_helper
 from thes.generic_rcnn import (Ncfg_generic_rcnn_eval)
 from thes.detectron.daly import (
-    get_daly_split_vids, simplest_daly_to_datalist_v2,
+    simplest_daly_to_datalist_v2,
     get_datalist_action_object_converter,)
 from thes.data.tubes.types import (
     I_dwein, T_dwein, T_dwein_scored, I_dgt, T_dgt,
     loadconvert_tubes_dwein, get_daly_gt_tubes,
     push_into_avdict, dtindex_filter_split,
     Objaction_dets, Frametube,
-    av_filter_split, av_stubes_above_score,
-    AV_dict,)
+    av_stubes_above_score, AV_dict,)
 from thes.data.tubes.routines import (
     score_ftubes_via_objaction_overlap_aggregation,)
 from thes.data.tubes.nms import (

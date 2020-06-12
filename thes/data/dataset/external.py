@@ -199,6 +199,65 @@ class Video_daly_ocv(TypedDict):
     est_fps: float
 
 
+def get_daly_split_vids(
+        dataset: Dataset_daly,
+        split_label: Literal['train', 'test']
+        ) -> List[Vid_daly]:
+    split_vids = [
+        vid for vid, split in dataset.split.items()
+        if split == split_label]
+    if split_label == 'train':
+        split_size = 310
+    elif split_label == 'test':
+        split_size = 200
+    else:
+        raise RuntimeError()
+    assert len(split_vids) == split_size
+    return split_vids
+
+
+def split_off_validation_set(dataset, fraction, n_samplings=20, seed=42):
+    # // Split a validation set off (roughly equalize number of keyframes)
+    # Keyframe number per vid
+    keyframes_va = {}
+    for vid, video in dataset.videos.items():
+        counter = np.zeros(len(dataset.action_names))
+        for action_name, ains in video['instances'].items():
+            aid = dataset.action_names.index(action_name)
+            for ins_ind, instance in enumerate(ains):
+                for kf_ind, kf in enumerate(instance['keyframes']):
+                    counter[aid] += 1
+        keyframes_va[vid] = counter
+    kdf = pd.DataFrame(keyframes_va).T
+    trainval_vids = get_daly_split_vids(dataset, 'train')
+    kdf_train = kdf.loc[trainval_vids]
+    kf_sum = kdf_train.sum()
+
+    random_state = np.random.RandomState(seed)
+
+    def get_perms_and_fractions():
+        perms = random_state.permutation(trainval_vids)
+        selected, rest = np.split(perms, [int(len(perms) * fraction)])
+        kf_val_sum = kdf.loc[selected].sum()
+        frac = kf_val_sum/kf_sum
+        frac_min = frac.min()
+        frac_max = frac.max()
+        return (selected, rest), frac_min, frac_max
+
+    samples = [get_perms_and_fractions() for i in range(n_samplings)]
+    # frac_min must be above 0
+    samples = [x for x in samples if x[1] > 0]
+    assert len(samples) > 0, '>= 1 action missing'
+    # frac_max must be below 1
+    samples = [x for x in samples if x[2] < 1]
+    assert len(samples) > 0, '>=1 action fully sampled'
+    # time_max must be closest to fraction
+    fraction_diff = [abs(fraction-x[1]) for x in samples]
+    closest_id = np.argmin(fraction_diff)
+    val_vids, train_vids = samples[closest_id][0]
+    return val_vids, train_vids
+
+
 class Dataset_daly_ocv(Dataset_daly):
     """
     We access the videos with opencv here
@@ -267,7 +326,7 @@ class Dataset_daly_ocv(Dataset_daly):
     def precompute_to_folder(self, fold):
         fold = Path(fold)
         vids = list(self.videos.keys())
-        isaver = snippets.Threading_isaver(
+        isaver = snippets.Isaver_threading(
             small.mkdir(fold/'isave_rstats'), vids,
             lambda vid: compute_ocv_rstats(
                 self.root_path/f'videos/{vid}.mp4'), 4, 8)
@@ -493,7 +552,7 @@ class Dataset_charades_ocv(Dataset_charades):
         _pattern = (self.root_path/'mirrors'/self.mirror/
                 self._rfold_dict[self.resolution]/'{}.mp4')
         vids = list(self.videos.keys())
-        isaver = snippets.Threading_isaver(
+        isaver = snippets.Isaver_threading(
             small.mkdir(fold/'isave_rstats'), vids,
             lambda vid: compute_ocv_rstats(str(_pattern).format(vid)), 25, 8)
         isaver_items = isaver.run()

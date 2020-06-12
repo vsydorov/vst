@@ -15,15 +15,18 @@ from detectron2.utils.visualizer import Visualizer
 
 from vsydorov_tools import small
 
-from thes.data.dataset.external import (Dataset_daly_ocv)
+from thes.data.dataset.external import (
+    Dataset_daly_ocv, get_daly_split_vids)
 from thes.detectron.cfg import (
-    D2DICT_GPU_SCALING_DEFAULTS, d2dict_gpu_scaling, set_detectron_cfg_base,
-    set_detectron_cfg_train, set_detectron_cfg_test,)
+    D2DICT_GPU_SCALING_DEFAULTS, d2dict_gpu_scaling,
+    set_detectron_cfg_base,
+    set_detectron_cfg_train,
+    set_detectron_cfg_test,)
 from thes.detectron.internals import launch_w_logging
 from thes.detectron.externals import (
     simple_d2_setup, DalyVideoDatasetTrainer, get_frame_without_crashing)
 from thes.detectron.daly import (
-    Datalist, Dl_record, get_daly_split_vids, simplest_daly_to_datalist_v2,
+    Datalist, Dl_record, simplest_daly_to_datalist_v2,
     daly_to_datalist_pfadet, get_category_map_o100, make_datalist_o100,
     get_datalist_action_object_converter)
 from thes.evaluation.ap.convert import (compute_ap_for_video_datalist)
@@ -264,7 +267,7 @@ def _eval_routine(cf, cf_add_d2, out,
         cpu_instances = predictions["instances"].to(cpu_device)
         return cpu_instances
 
-    df_isaver = snippets.Simple_isaver(
+    df_isaver = snippets.Isaver_simple(
             small.mkdir(out/'isaver'), datalist, eval_func, '::50')
     predicted_datalist = df_isaver.run()
 

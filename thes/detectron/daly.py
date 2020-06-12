@@ -38,23 +38,6 @@ class Dl_record(TypedDict):
 Datalist = List[Dl_record]
 
 
-def get_daly_split_vids(
-        dataset: Dataset_daly_ocv,
-        split_label: Literal['train', 'test']
-        ) -> List[Vid_daly]:
-    split_vids = [
-        vid for vid, split in dataset.split.items()
-        if split == split_label]
-    if split_label == 'train':
-        split_size = 310
-    elif split_label == 'test':
-        split_size = 200
-    else:
-        raise RuntimeError()
-    assert len(split_vids) == split_size
-    return split_vids
-
-
 def daly_to_datalist_pfadet(
         dataset: Dataset_daly_ocv, split_vids) -> Datalist:
     d2_datalist = []

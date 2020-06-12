@@ -1,9 +1,21 @@
 import numpy as np
+import itertools
+import pandas as pd
 import logging
 import time
 import copy
+from pathlib import Path
 from types import MethodType
+from typing import (Dict, Any)
 from tqdm import tqdm
+import cv2
+import concurrent.futures
+from sklearn.svm import LinearSVC
+from sklearn.neural_network import MLPClassifier
+from sklearn.preprocessing import (StandardScaler)
+from sklearn.metrics import (
+    average_precision_score, accuracy_score, roc_auc_score)
+from scipy.special import softmax
 
 import torch
 import torch.nn as nn
@@ -19,11 +31,24 @@ from vsydorov_tools import small
 from vsydorov_tools import cv as vt_cv
 from vsydorov_tools import log as vt_log
 
-from thes.data.dataset.external import (Dataset_daly_ocv)
+from thes.data.dataset.external import (
+        Dataset_daly_ocv, Vid_daly,
+        get_daly_split_vids, split_off_validation_set)
+from thes.data.tubes.types import (
+    I_dwein, T_dwein, T_dwein_scored, I_dgt, T_dgt,
+    get_daly_gt_tubes, push_into_avdict,
+    AV_dict, loadconvert_tubes_dwein, Objaction_dets,
+    dtindex_filter_split, av_stubes_above_score)
+from thes.data.tubes.nms import (
+    compute_nms_for_av_stubes,)
+from thes.evaluation.recall import (
+    compute_recall_for_avtubes_as_dfs,)
+from thes.evaluation.ap.convert import (
+    compute_ap_for_avtubes_as_df)
 from thes.tools import snippets
-from thes.detectron.daly import (
-    get_daly_split_vids)
 from thes.slowfast.cfg import (base_sf_i3d_config)
+from thes.data.tubes.routines import (
+        score_ftubes_via_objaction_overlap_aggregation)
 
 log = logging.getLogger(__name__)
 
@@ -84,10 +109,6 @@ class Extractor_roi(object):
             out = self.roi_align(out, bboxes)
             out = self.s_pool(out)
         return out
-
-
-import cv2
-import concurrent.futures
 
 
 def yana_size_query(X, dsize):
@@ -383,3 +404,289 @@ def extract_slowfast_feats(workfolder, cfg_dict, add_args):
     sq_outputs = np.vstack(outputs).squeeze()
     small.save_pkl(out/'sq_outputs.pkl', sq_outputs)
     small.save_pkl(out/'keyframes.pkl', keyframes)
+
+
+def _perframe_detection_display(out, test_kfs, Y_conf_scores_sm, dataset):
+    # Display our detections
+    det2_fold = small.mkdir(out/'det2')
+    state = np.random.RandomState(400)
+    iter_index = state.permutation(np.arange(len(test_kfs)))[:400]
+    for i, ii in enumerate(tqdm(iter_index)):
+        kf = test_kfs[ii]
+        scores = Y_conf_scores_sm[ii]
+        vid = kf['vid']
+        frame0 = kf['frame0']
+        pred_box = kf['bbox']
+        video_path = dataset.videos[vid]['path']
+        with vt_cv.video_capture_open(video_path) as vcap:
+            frames_u8 = vt_cv.video_sample(
+                    vcap, [frame0], debug_filename=video_path)
+        frame_u8 = frames_u8[0]
+        act_scores = pd.Series(dict(zip(dataset.action_names, scores)))
+        act_scores = act_scores.sort_values(ascending=False)[:3]
+        stract = ' '.join([f'{x[:5]}: {y:.2f}' for x, y in act_scores.items()])
+        rec_color = (0, 0, 80)
+        good = kf['action_name'] == act_scores.index[0]
+        if good:
+            rec_color = (0, 80, 0)
+        snippets.cv_put_box_with_text(frame_u8, pred_box,
+            text='{}'.format(stract), rec_color=rec_color)
+        cv2.imwrite(str(det2_fold/f'{i:05d}_{vid}_frame{frame0:05d}.jpg'), frame_u8)
+
+
+def _tube_detection_display(out, av_stubes_, dataset):
+    action = 'Drinking'
+    vfold = small.mkdir(out/'det3_tube'/action)
+    v_stubes = av_stubes_[action]
+    flat_tubes = []
+    for vid, stubes in v_stubes.items():
+        for i_stube, stube in enumerate(stubes):
+            flat_tubes.append({'tube': stube, 'ind': (vid, i_stube)})
+    sorted_flat_tubes = sorted(flat_tubes,
+            key=lambda x: x['tube']['score'], reverse=True)
+    sorted_flat_tubes = sorted_flat_tubes[:10]
+
+    for i_sorted, flat_tube in enumerate(tqdm(sorted_flat_tubes)):
+        vid, i_stube = flat_tube['ind']
+        tube = flat_tube['tube']
+        score = tube['score']
+        sf, ef = tube['start_frame'], tube['end_frame']
+        frame_inds = tube['frame_inds']
+        video_fold = small.mkdir(vfold/f'{i_sorted:04d}_vid{vid}_{sf}_to_{ef}_score{score:02f}')
+        video_path = dataset.videos[vid]['path']
+
+        # Extract
+        with vt_cv.video_capture_open(video_path) as vcap:
+            frames_u8 = vt_cv.video_sample(
+                    vcap, frame_inds, debug_filename=video_path)
+        # Draw
+        drawn_frames_u8 = []
+        for i, (find, frame_BGR) in enumerate(zip(frame_inds, frames_u8)):
+            image = frame_BGR.copy()
+            box = tube['boxes'][i]
+            snippets.cv_put_box_with_text(image, box,
+                text='{} {} {:.2f}'.format(
+                    i, action, score))
+            drawn_frames_u8.append(image)
+
+        snippets.qsave_video(video_fold/'overlaid.mp4', drawn_frames_u8)
+        break
+
+def create_kinda_objaction_struct(dataset, test_kfs, Y_conf_scores_sm):
+    # // Creating kinda objaction structure
+    # Group vid -> frame
+    grouped_kfscores_vf: Dict[Vid_daly, Dict[int, Any]] = {}
+    for kf, scores in zip(test_kfs, Y_conf_scores_sm):
+        vid = kf['vid']
+        frame0 = kf['frame0']
+        pred_box = kf['bbox']
+        (grouped_kfscores_vf
+                .setdefault(vid, {})
+                .setdefault(frame0, [])
+                .append([pred_box, scores]))
+    # fake objactions
+    objactions_vf: Dict[Vid_daly, Dict[int, Objaction_dets]] = {}
+    for vid, grouped_kfscores_f in grouped_kfscores_vf.items():
+        for frame_ind, gkfscores in grouped_kfscores_f.items():
+            all_scores, all_boxes, all_classes = [], [], []
+            for (box, scores) in gkfscores:
+                all_boxes.append(np.tile(box, (len(scores), 1)))
+                all_classes.append(np.array(dataset.action_names))
+                all_scores.append(scores)
+            all_scores_ = np.hstack(all_scores)
+            all_classes_ = np.hstack(all_classes)
+            all_boxes_ = np.vstack(all_boxes)
+            detections = {
+                    'pred_boxes': all_boxes_,
+                    'scores': all_scores_,
+                    'pred_classes': all_classes_}
+            objactions_vf.setdefault(vid, {})[frame_ind] = detections
+    return objactions_vf
+
+
+def train_mlp_over_extracted_feats(workfolder, cfg_dict, add_args):
+    out, = snippets.get_subfolders(workfolder, ['out'])
+    cfg = snippets.YConfig(cfg_dict)
+    cfg.set_deftype("""
+    seed: [42, int]
+    dataset:
+        name: ['daly', ['daly']]
+        cache_folder: [~, str]
+        subset: ['train', ~]
+    tubes_dwein: [~, str]
+    computed_featfold: [~, str]
+    """)
+    cf = cfg.parse()
+
+    # DALY Dataset
+    dataset = Dataset_daly_ocv()
+    dataset.populate_from_folder(cf['dataset.cache_folder'])
+
+    val_vids, train_vids = split_off_validation_set(dataset, 0.1)
+    trainval_vids = get_daly_split_vids(dataset, 'train')
+    test_vids = get_daly_split_vids(dataset, 'test')
+
+    computed_featfold = Path(cf['computed_featfold'])
+    keyframes = small.load_pkl(computed_featfold/'keyframes.pkl')
+    outputs = small.load_pkl(computed_featfold/'sq_outputs.pkl')
+    kf_vids = [kf['vid'] for kf in keyframes]
+
+    def split_off(X, linked_vids, good_vids):
+        if isinstance(X, np.ndarray):
+            isin = np.in1d(linked_vids, good_vids)
+            result = X[isin]
+        elif isinstance(X, list):
+            result = [x for x, v in zip(X, linked_vids) if v in good_vids]
+        else:
+            raise RuntimeError()
+        return result
+
+    X_trainval = split_off(outputs, kf_vids, trainval_vids)
+    kf_trainval = split_off(keyframes, kf_vids, trainval_vids)
+    kf_vids_trainval = [kf['vid'] for kf in kf_trainval]
+    aid_trainval = [kf['action_id'] for kf in kf_trainval]
+
+    scaler = StandardScaler()
+    X_trainval = scaler.fit_transform(X_trainval)
+
+    X_test = split_off(outputs, kf_vids, test_vids)
+    kf_test = split_off(keyframes, kf_vids, test_vids)
+    kf_vids_test = [kf['vid'] for kf in kf_test]
+    aid_test = [kf['action_id'] for kf in kf_test]
+    X_test = scaler.transform(X_test)
+
+    X_train = split_off(X_trainval, kf_vids_trainval, train_vids)
+    kf_train = split_off(kf_trainval, kf_vids_trainval, train_vids)
+    aid_train = [kf['action_id'] for kf in kf_train]
+
+    X_val = split_off(X_trainval, kf_vids_trainval, val_vids)
+    kf_val = split_off(kf_trainval, kf_vids_trainval, val_vids)
+    aid_val = [kf['action_id'] for kf in kf_val]
+
+    def compute_perf(IN):
+        alpha, hl_size, max_iter = IN
+        clf = MLPClassifier(hl_size, random_state=0, max_iter=max_iter, alpha=alpha)
+        clf.fit(X_train, aid_train)
+        Y_val = clf.predict(X_val)
+        acc = accuracy_score(aid_val, Y_val)
+        return acc
+
+    alpha_values = np.logspace(-3, -1, 7)
+    hlayer_sizes = ((200,), (250,))
+    max_iter = (200, 400, 600)
+    params = list(itertools.product(alpha_values, hlayer_sizes, max_iter))
+
+    fold = small.mkdir(out/'isaver_ahl_perf')
+    isaver = snippets.Isaver_threading(fold, params, compute_perf, 2, 24)
+    perfs = isaver.run()
+
+    # Train on trainval
+    clf = MLPClassifier((200,), random_state=0, max_iter=300, alpha=0.02)
+    clf.fit(X_trainval, aid_trainval)
+    Y_test = clf.predict(X_test)
+    acc = accuracy_score(aid_test, Y_test)
+    log.info(f'Test {acc=}')
+
+    Y_conf_scores_sm = clf.predict_proba(X_test)
+    roc_auc = roc_auc_score(aid_test, Y_conf_scores_sm,
+            multi_class='ovr')
+    log.info(f'{roc_auc=}')
+
+    # // Tube AP (very, very rought performance)
+    # Dwein tubes
+    tubes_dwein: Dict[I_dwein, T_dwein] = \
+            loadconvert_tubes_dwein(cf['tubes_dwein'])
+    tubes_dwein_test = dtindex_filter_split(tubes_dwein, test_vids)
+    # GT tubes
+    dgt_tubes: Dict[I_dgt, T_dgt] = \
+            get_daly_gt_tubes(dataset)
+    dgt_tubes_test = dtindex_filter_split(dgt_tubes, test_vids)
+    av_gt_tubes_test: AV_dict[T_dgt] = push_into_avdict(dgt_tubes_test)
+
+    objactions_vf = create_kinda_objaction_struct(
+            dataset, kf_test, Y_conf_scores_sm)
+    # Assigning scores based on intersections
+    av_stubes: AV_dict[T_dwein_scored] = \
+        score_ftubes_via_objaction_overlap_aggregation(
+            dataset, objactions_vf, tubes_dwein_test, 'iou',
+            0.1, 0.0)
+    av_stubes_ = av_stubes_above_score(
+            av_stubes, 0.0)
+    av_stubes_ = compute_nms_for_av_stubes(
+            av_stubes_, 0.3)
+    iou_thresholds = [.3, .5, .7]
+    df_recall_s_nodiff = compute_recall_for_avtubes_as_dfs(
+            av_gt_tubes_test, av_stubes_, iou_thresholds, False)[0]
+    df_ap_s_nodiff = compute_ap_for_avtubes_as_df(
+            av_gt_tubes_test, av_stubes_, iou_thresholds, False, False)
+    log.info(f'AP:\n{df_ap_s_nodiff}')
+
+
+def train_extracted_feats(workfolder, cfg_dict, add_args):
+    out, = snippets.get_subfolders(workfolder, ['out'])
+    cfg = snippets.YConfig(cfg_dict)
+    cfg.set_deftype("""
+    seed: [42, int]
+    dataset:
+        name: ['daly', ['daly']]
+        cache_folder: [~, str]
+        subset: ['train', ~]
+    tubes_dwein: [~, str]
+    computed_featfold: [~, str]
+    """)
+    cf = cfg.parse()
+
+    # DALY Dataset
+    dataset = Dataset_daly_ocv()
+    dataset.populate_from_folder(cf['dataset.cache_folder'])
+
+    trainval_vids = get_daly_split_vids(dataset, 'train')
+    val_vids, train_vids = split_off_validation_set(dataset, 0.1)
+    test_vids = get_daly_split_vids(dataset, 'test')
+
+
+    computed_featfold = Path(cf['computed_featfold'])
+    keyframes = small.load_pkl(computed_featfold/'keyframes.pkl')
+    outputs = small.load_pkl(computed_featfold/'sq_outputs.pkl')
+    N = len(keyframes)
+
+
+    train_feats = []
+    train_kfs = []
+    test_feats = []
+    test_kfs = []
+    for keyframe, feat in zip(keyframes, outputs):
+        if keyframe['vid'] in train_vids:
+            train_feats.append(feat)
+            train_kfs.append(keyframe)
+        if keyframe['vid'] in test_vids:
+            test_feats.append(feat)
+            test_kfs.append(keyframe)
+
+    train_feats = np.array(train_feats)
+    train_aids = np.array([x['action_id'] for x in train_kfs])
+
+    test_feats = np.array(test_feats)
+    test_aids = np.array([x['action_id'] for x in test_kfs])
+
+    def scale_clf():
+        scaler = StandardScaler()
+        scaler.fit(train_feats)
+        clf = LinearSVC(verbose=1, max_iter=2000)
+        clf.fit(X_train, train_aids)
+        return scaler, clf
+
+    scaler, clf = small.stash2(out/'scaler_clf.pkl')(scale_clf)
+
+    X_train = scaler.transform(train_feats)
+    X_test = scaler.transform(test_feats)
+    Y_test = clf.predict(X_test)
+
+    Y_conf_scores = clf.decision_function(X_test)
+    Y_conf_scores_sm = softmax(Y_conf_scores, axis=1)
+
+    acc = accuracy_score(test_aids, Y_test)
+    log.info(f'{acc=}')
+    roc_auc = roc_auc_score(test_aids, Y_conf_scores_sm,
+            multi_class='ovr')
+    log.info(f'{roc_auc=}')

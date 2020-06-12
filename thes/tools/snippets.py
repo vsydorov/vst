@@ -568,7 +568,7 @@ class Isaver_mixin_restore_save(object):
         ifiles['finished'].touch()
 
 
-class Simple_isaver(Isaver_mixin_restore_save, Isaver_base):
+class Isaver_simple(Isaver_mixin_restore_save, Isaver_base):
     """
     Will process a list with a func
 
@@ -614,7 +614,7 @@ class Simple_isaver(Isaver_mixin_restore_save, Isaver_base):
         return self.result
 
 
-class Threading_isaver(Isaver_mixin_restore_save, Isaver_base):
+class Isaver_threading(Isaver_mixin_restore_save, Isaver_base):
     """
     Will process a list with a func, in async manner
     """

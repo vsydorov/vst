@@ -215,7 +215,7 @@ class Ncfg_generic_rcnn_eval:
                 f_cls_probs[find] = cls_probs
             return f_cls_probs
         vids_to_eval = list(vf_connections_dwti.keys())
-        isaver = snippets.Simple_isaver(
+        isaver = snippets.Isaver_simple(
                 small.mkdir(out/'isave_rcnn_vid_eval'),
                 vids_to_eval, isaver_eval_func,
                 '::10', 120)
@@ -255,7 +255,7 @@ class Ncfg_generic_rcnn_eval:
                         frame_BGR, boxes)  # N, (bcg+10)
                 f_cls_probs[find] = cls_probs
             return f_cls_probs
-        isaver = snippets.Simple_isaver(
+        isaver = snippets.Isaver_simple(
                 small.mkdir(out/'isave_rcnn_vid_eval'),
                 frame_chunks, isaver_eval_func,
                 save_interval=60,
