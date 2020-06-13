@@ -632,7 +632,7 @@ def _val_preparations(outputs, keyframes, Vids):
         X = split_off(outputs, global_kf_vids, Vids.trainval)
         kf = split_off(keyframes, global_kf_vids, Vids.trainval)
         kf_vids = [kf['vid'] for kf in kf]
-        aid = [kf['action_id'] for kf in kf]
+        aid = np.array([kf['action_id'] for kf in kf])
 
     scaler = StandardScaler()
     D_trainval.X = scaler.fit_transform(D_trainval.X)
@@ -716,39 +716,63 @@ def train_torch_mlp_over_extracted_feats(workfolder, cfg_dict, add_args):
     Y_train = torch.from_numpy(D_train.aid)
     X_val = torch.from_numpy(D_val.X)
     Y_val = torch.from_numpy(D_val.aid)
+    X_trainval = torch.from_numpy(D_trainval.X)
+    Y_trainval = torch.from_numpy(D_trainval.aid)
+    X_test = torch.from_numpy(D_test.X)
     model.train()
     for t in range(N_iters):
-        pred_train = model(X_train)
-        loss = loss_fn(pred_train, Y_train)
+        pred_train = model(X_trainval)
+        loss = loss_fn(pred_train, Y_trainval)
         if t % 50 == 0:
             # Train perf
             model.eval()
             with torch.no_grad():
-                pred_train = model(X_train)
-                acc_train = pred_train.argmax(1).eq(Y_train).sum().item()/len(Y_train) * 100
-                pred_val = model(X_val)
-                acc_val = pred_val.argmax(1).eq(Y_val).sum().item()/len(Y_val) * 100
+                pred_trainval = model(X_trainval)
+                acc_trainval = pred_trainval.argmax(1).eq(Y_trainval).sum().item()/len(Y_trainval) * 100
             model.train()
-            log.info(f'{t}: {loss.item()} {acc_train=:.2f} {acc_val=:.2f}')
+            log.info(f'{t}: {loss.item()} {acc_trainval=:.2f}')
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
-    import pudb; pudb.set_trace()  # XXX BREAKPOINT
+    model.eval()
     with torch.no_grad():
-        Y_val = model(X_val)
-    Y_val_np = Y_val.numpy()
-    Y_val_preds = np.argmax(Y_val_np, axis=1)
+        Y_test = model(X_test)
+    Y_test_np = Y_test.numpy()
+    Y_test_preds = np.argmax(Y_test_np, axis=1)
+    acc = accuracy_score(D_test.aid, Y_test_preds)
+    log.info(f'Test {acc=}')
 
-    acc = accuracy_score(D_val.aid, Y_val_preds)
-    log.info(f'Val {acc=}')
+    Y_test_np_softmax = softmax(Y_test_np, axis=1)
+    roc_auc = roc_auc_score(D_test.aid, Y_test_np_softmax,
+            multi_class='ovr')
+    log.info(f'{roc_auc=}')
 
+    # // Tube AP (very, very rought performance)
+    # Dwein tubes
+    tubes_dwein: Dict[I_dwein, T_dwein] = \
+            loadconvert_tubes_dwein(cf['tubes_dwein'])
+    tubes_dwein_test = dtindex_filter_split(tubes_dwein, Vids.test)
+    # GT tubes
+    dgt_tubes: Dict[I_dgt, T_dgt] = \
+            get_daly_gt_tubes(dataset)
+    dgt_tubes_test = dtindex_filter_split(dgt_tubes, Vids.test)
+    av_gt_tubes_test: AV_dict[T_dgt] = push_into_avdict(dgt_tubes_test)
 
-    import pudb; pudb.set_trace()  # XXX BREAKPOINT
-    # clf = MLPClassifier((200,), random_state=0, max_iter=300, alpha=0.02)
-    # clf.fit(D_trainval.X, D_trainval.aid)
-    # Y_test = clf.predict(D_test.X)
-    # acc = accuracy_score(D_test.aid, Y_test)
-    # log.info(f'Test {acc=}')
-    # import pudb; pudb.set_trace()  # XXX BREAKPOINT
-    pass
+    objactions_vf = create_kinda_objaction_struct(
+            dataset, D_test.kf, Y_test_np_softmax)
+    # Assigning scores based on intersections
+    av_stubes: AV_dict[T_dwein_scored] = \
+        score_ftubes_via_objaction_overlap_aggregation(
+            dataset, objactions_vf, tubes_dwein_test, 'iou',
+            0.1, 0.0)
+    av_stubes_ = av_stubes_above_score(
+            av_stubes, 0.0)
+    av_stubes_ = compute_nms_for_av_stubes(
+            av_stubes_, 0.3)
+    iou_thresholds = [.3, .5, .7]
+    df_recall_s_nodiff = compute_recall_for_avtubes_as_dfs(
+            av_gt_tubes_test, av_stubes_, iou_thresholds, False)[0]
+    df_ap_s_nodiff = compute_ap_for_avtubes_as_df(
+            av_gt_tubes_test, av_stubes_, iou_thresholds, False, False)
+    log.info(f'AP:\n{df_ap_s_nodiff}')
