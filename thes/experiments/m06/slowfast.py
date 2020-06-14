@@ -47,7 +47,7 @@ from thes.evaluation.recall import (
 from thes.evaluation.ap.convert import (
     compute_ap_for_avtubes_as_df)
 from thes.tools import snippets
-from thes.slowfast.cfg import (base_sf_i3d_config)
+from thes.slowfast.cfg import (basic_sf_cfg)
 from thes.data.tubes.routines import (
         score_ftubes_via_objaction_overlap_aggregation)
 
@@ -65,14 +65,9 @@ norm_mean_t = np_to_gpu(norm_mean)
 norm_std = np.array([0.225, 0.225, 0.225])
 norm_std_t = np_to_gpu(norm_std)
 test_crop_size = 255
-# DETECTION.ROI_XFORM_RESOLUTION
-xform_resolution = 7
-# SPATIAL_SCALE_FACTOR
-spatial_scale_factor = 16
-i3d_poolsize = [[2, 1, 1]]
-# [[cfg.DATA.NUM_FRAMES // pool_size[0][0], 1, 1]]
 
-def monkey_forward(self, x):
+def sf_resnet_headless_forward(self, x):
+    # slowfast/models/video_model_builder.py/ResNet.forward
     x = self.s1(x)
     x = self.s2(x)
     for pathway in range(self.num_pathways):
@@ -83,33 +78,65 @@ def monkey_forward(self, x):
     x = self.s5(x)
     return x
 
-class Extractor_roi(object):
-    def __init__(self, model, model_nframes):
-        self._model = copy.copy(model)
-        self._model.forward = MethodType(monkey_forward, self._model)
+def sf_slowfast_headless_forward(self, x):
+    # slowfast/models/video_model_builder.py/SlowFast.forward
+    x = self.s1(x)
+    x = self.s1_fuse(x)
+    x = self.s2(x)
+    x = self.s2_fuse(x)
+    for pathway in range(self.num_pathways):
+        pool = getattr(self, "pathway{}_pool".format(pathway))
+        x[pathway] = pool(x[pathway])
+    x = self.s3(x)
+    x = self.s3_fuse(x)
+    x = self.s4(x)
+    x = self.s4_fuse(x)
+    x = self.s5(x)
+    return x
 
-        resolution = [xform_resolution] * 2
-        # Definitions
-        tpool_size = [model_nframes//i3d_poolsize[0][0], 1, 1]
-        self.t_pool = nn.AvgPool3d(tpool_size, stride=1)
-        self.roi_align = ROIAlign(resolution,
-                spatial_scale=1.0/32,
-                sampling_ratio=0,
-                aligned=True)
-        self.s_pool = nn.MaxPool2d(resolution, stride=1)
+class Extractor_roi(nn.Module):
+    def __init__(self,
+            model, forward_method,
+            pool_size, resolution, scale_factor):
+        super().__init__()
+        self._model = copy.copy(model)
+        self._model.forward = MethodType(forward_method, self._model)
+        self.num_pathways = len(pool_size)
+
+        for pi in range(self.num_pathways):
+            tpool = nn.AvgPool3d(
+                    [pool_size[pi][0], 1, 1], stride=1)
+            self.add_module(f's{pi}_tpool', tpool)
+            roi_align = ROIAlign(
+                    resolution[pi],
+                    spatial_scale=1.0/scale_factor[pi],
+                    sampling_ratio=0,
+                    aligned=True)
+            self.add_module(f's{pi}_roi', roi_align)
+            spool = nn.MaxPool2d(resolution[pi], stride=1)
+            self.add_module(f's{pi}_spool', spool)
 
     def forward(self, X, bboxes):
-        with torch.no_grad():
-            # Forward through model
-            x = self._model(X)
-            # Forward
-            assert len(x) == 1
-            out = self.t_pool(x[0])
+        # Forward through model
+        x = self._model(X)
+        # / Roi_Pooling
+        pool_out = []
+        for pi in range(self.num_pathways):
+            t_pool = getattr(self, f's{pi}_tpool')
+            out = t_pool(x[pi])
             assert out.shape[2] == 1
             out = torch.squeeze(out, 2)
-            out = self.roi_align(out, bboxes)
-            out = self.s_pool(out)
-        return out
+
+            roi_align = getattr(self, f's{pi}_roi')
+            out = roi_align(out, bboxes)
+
+            s_pool = getattr(self, f's{pi}_spool')
+            out = s_pool(out)
+            pool_out.append(out)
+        # B C H W.
+        x = torch.cat(pool_out, 1)
+        x = x.view(x.shape[0], -1)
+        return x
 
 
 def yana_size_query(X, dsize):
@@ -173,6 +200,7 @@ def tfm_video_center_crop(first64, th, tw):
 
 
 def prepare_video(frames_u8):
+    # frames_u8 is N,H,W,C (BGR)
     frames_rgb = np.flip(frames_u8, -1)
     # Resize
     X, resize_params = tfm_video_resize_threaded(
@@ -180,16 +208,17 @@ def prepare_video(frames_u8):
     # Centercrop
     X, ccrop_params = tfm_video_center_crop(
             X, test_crop_size, test_crop_size)
-    # Convert to torch, add batch dimension
+    # Convert to torch
     Xt = torch.from_numpy(X)
     return Xt, resize_params, ccrop_params
 
 def to_gpu_normalize_permute(Xt):
+    # Convert to float on GPU
     X_f32c = Xt.type(torch.cuda.FloatTensor)
     X_f32c /= 255
-    # Normalization after float conversion
+    # Normalize
     X_f32c = (X_f32c-norm_mean_t)/norm_std_t
-    # Pad 0 dim and permute done last
+    # THWC -> CTHW
     assert len(X_f32c.shape) == 5
     X_f32c = X_f32c.permute(0, 4, 1, 2, 3)
     return X_f32c
@@ -226,12 +255,16 @@ def _vis_boxes(out, bbox, frames_u8, X_f32c, bbox_tldr):
 
 
 class TDataset_over_keyframes(torch.utils.data.Dataset):
-    def __init__(self, keyframes, model_nframes, model_sample):
+    def __init__(self, keyframes, model_nframes, model_sample,
+            is_slowfast: bool, slowfast_alpha: int):
         self.keyframes = keyframes
         center_frame = (model_nframes-1)//2
         self.sample_grid0 = (np.arange(model_nframes)-center_frame)*model_sample
+        self._is_slowfast = is_slowfast
+        self._slowfast_alpha = slowfast_alpha
 
     def __getitem__(self, index):
+        # Extract frames
         keyframe = self.keyframes[index]
         video_path = keyframe['video_path']
         i0 = keyframe['frame0']
@@ -242,11 +275,30 @@ class TDataset_over_keyframes(torch.utils.data.Dataset):
             frames_u8 = vt_cv.video_sample(vcap, finds_to_sample)
         frames_u8 = np.array(frames_u8)
 
-        # frames_u8 is N,H,W,C
+        # Resize video, convert to torch tensor
         Xt, resize_params, ccrop_params = prepare_video(frames_u8)
+
+        # Resolve pathways
+        if self._is_slowfast:
+            # slowfast/datasets/utils.py/pack_pathway_output
+            TIME_DIM = 0
+            fast_pathway = Xt
+            slow_pathway = torch.index_select(
+                Xt,
+                TIME_DIM,
+                torch.linspace(
+                    0, Xt.shape[TIME_DIM] - 1,
+                    Xt.shape[TIME_DIM] // self._slowfast_alpha
+                ).long(),
+            )
+            frame_list = [slow_pathway, fast_pathway]
+        else:
+            frame_list = [Xt]
+
+        # Bboxes
         bbox_tldr = prepare_box(keyframe['bbox'], resize_params, ccrop_params)
         bbox_tldr0 = np.r_[0, bbox_tldr]
-        return index, Xt, bbox_tldr0
+        return index, frame_list, bbox_tldr0
 
     def __len__(self) -> int:
         return len(self.keyframes)
@@ -338,7 +390,7 @@ class Dataloader_isaver(
         flush_purge()
         return self.result
 
-def extract_slowfast_feats(workfolder, cfg_dict, add_args):
+def extract_i3d_feats(workfolder, cfg_dict, add_args):
     out, = snippets.get_subfolders(workfolder, ['out'])
     cfg = snippets.YConfig(cfg_dict)
     cfg.set_deftype("""
@@ -357,14 +409,12 @@ def extract_slowfast_feats(workfolder, cfg_dict, add_args):
     # split_vids = get_daly_split_vids(dataset, split_label)
 
     sf_cfg = base_sf_i3d_config()
-    sf_cfg.NUM_GPUS = 1
     sf_cfg.TEST.BATCH_SIZE = 16
     # Load model
     model = slowfast.models.build_model(sf_cfg)
     model.eval()
     # misc.log_model_info(model, sf_cfg, is_train=False)
 
-    CHECKPOINT_FILE_PATH = '/home/vsydorov/projects/deployed/2019_12_Thesis/links/scratch2/102_slowfast/20_checkpoints/I3D_8x8_R50.pkl'
     with vt_log.logging_disabled(logging.WARNING):
         cu.load_checkpoint(
             CHECKPOINT_FILE_PATH, model, False, None,
@@ -372,9 +422,8 @@ def extract_slowfast_feats(workfolder, cfg_dict, add_args):
 
     keyframes = create_keyframelist(dataset)
 
-    model_nframes = sf_cfg.DATA.NUM_FRAMES
-    model_sample = sf_cfg.DATA.SAMPLING_RATE
-    extractor_roi = Extractor_roi(model, model_nframes)
+    extractor_roi = Extractor_roi(
+        model, sf_resnet_headless_forward, model_nframes)
 
     BATCH_SIZE = 8
     NUM_WORKERS = 12
@@ -392,7 +441,8 @@ def extract_slowfast_feats(workfolder, cfg_dict, add_args):
         II, Xts, bboxes = data_input
         Xs_f32c = to_gpu_normalize_permute(Xts)
         bboxes_c = bboxes.type(torch.cuda.FloatTensor)
-        Y = extractor_roi.forward([Xs_f32c], bboxes_c)
+        with torch.no_grad():
+            Y = extractor_roi.forward(Xs_f32c, bboxes_c)
         II_np = II.cpu().numpy()
         Y_np = Y.cpu().numpy()
         return II_np, Y_np
@@ -403,6 +453,111 @@ def extract_slowfast_feats(workfolder, cfg_dict, add_args):
             save_interval=60)
     outputs = disaver.run()
     sq_outputs = np.vstack(outputs).squeeze()
+    small.save_pkl(out/'sq_outputs.pkl', sq_outputs)
+    small.save_pkl(out/'keyframes.pkl', keyframes)
+
+def extract_sf_feats(workfolder, cfg_dict, add_args):
+    out, = snippets.get_subfolders(workfolder, ['out'])
+    cfg = snippets.YConfig(cfg_dict)
+    cfg.set_deftype("""
+    seed: [42, int]
+    dataset:
+        name: ['daly', ['daly']]
+        cache_folder: [~, str]
+        subset: ['train', ~]
+    model: [~, ['slowfast', 'i3d']]
+    """)
+    cf = cfg.parse()
+
+    # DALY Dataset
+    dataset = Dataset_daly_ocv()
+    dataset.populate_from_folder(cf['dataset.cache_folder'])
+
+    model_str = cf['model']
+    if model_str == 'slowfast':
+        rel_yml_path = 'Kinetics/c2/SLOWFAST_4x16_R50.yaml'
+        CHECKPOINT_FILE_PATH = '/home/vsydorov/projects/deployed/2019_12_Thesis/links/scratch2/102_slowfast/20_zoo_checkpoints/kinetics400/SLOWFAST_4x16_R50.pkl'
+        headless_forward_func = sf_slowfast_headless_forward
+        is_slowfast = True
+    elif model_str == 'i3d':
+        rel_yml_path = 'Kinetics/c2/I3D_8x8_R50.yaml'
+        CHECKPOINT_FILE_PATH = '/home/vsydorov/projects/deployed/2019_12_Thesis/links/scratch2/102_slowfast/20_zoo_checkpoints/kinetics400/I3D_8x8_R50.pkl'
+        headless_forward_func = sf_resnet_headless_forward
+        is_slowfast = False
+    else:
+        raise RuntimeError()
+
+    # DETECTION.ROI_XFORM_RESOLUTION
+    xform_resolution = 7
+
+    # / Config and derived things
+    sf_cfg = basic_sf_cfg(rel_yml_path)
+    sf_cfg.NUM_GPUS = 1
+    model_nframes = sf_cfg.DATA.NUM_FRAMES
+    model_sample = sf_cfg.DATA.SAMPLING_RATE
+    slowfast_alpha = sf_cfg.SLOWFAST.ALPHA
+
+    if model_str == 'slowfast':
+        _POOL_SIZE = [[1, 1, 1], [1, 1, 1]]
+        pool_size = [
+            [model_nframes//slowfast_alpha//_POOL_SIZE[0][0], 1, 1],
+            [model_nframes//_POOL_SIZE[1][0], 1, 1]]
+        resolution = [[xform_resolution] * 2] * 2
+        scale_factor = [32] * 2
+    elif model_str == 'i3d':
+        _POOL_SIZE = [[2, 1, 1]]
+        pool_size = [
+                [model_nframes//_POOL_SIZE[0][0], 1, 1]]
+        resolution = [[xform_resolution] * 2]
+        scale_factor= [32]
+        is_slowfast = False
+    else:
+        raise RuntimeError()
+
+    # Load model
+    model = slowfast.models.build_model(sf_cfg)
+    model.eval()
+    with vt_log.logging_disabled(logging.WARNING):
+        cu.load_checkpoint(
+            CHECKPOINT_FILE_PATH, model, False, None,
+            inflation=False, convert_from_caffe2=True,)
+
+    keyframes = create_keyframelist(dataset)
+
+    extractor_roi = Extractor_roi(
+        model, headless_forward_func,
+        pool_size, resolution, scale_factor)
+
+    BATCH_SIZE = 8
+    NUM_WORKERS = 12
+    # NUM_WORKERS = 0
+
+    def prepare_func(start_i):
+        remaining_keyframes = keyframes[start_i+1:]
+        tdataset_kf = TDataset_over_keyframes(
+                remaining_keyframes, model_nframes, model_sample,
+                is_slowfast, slowfast_alpha)
+        loader = torch.utils.data.DataLoader(tdataset_kf,
+                batch_size=BATCH_SIZE, shuffle=False,
+                num_workers=NUM_WORKERS, pin_memory=True)
+        return loader
+
+    def func(data_input):
+        II, Xts, bboxes = data_input
+        Xts_f32c = [to_gpu_normalize_permute(x) for x in Xts]
+        bboxes_c = bboxes.type(torch.cuda.FloatTensor)
+        with torch.no_grad():
+            Y = extractor_roi.forward(Xts_f32c, bboxes_c)
+        II_np = II.cpu().numpy()
+        Y_np = Y.cpu().numpy()
+        return II_np, Y_np
+
+    disaver_fold = small.mkdir(out/'disaver')
+    total = len(keyframes)
+    disaver = Dataloader_isaver(disaver_fold, total, func, prepare_func,
+            save_interval=60)
+    outputs = disaver.run()
+    sq_outputs = np.vstack(outputs)
     small.save_pkl(out/'sq_outputs.pkl', sq_outputs)
     small.save_pkl(out/'keyframes.pkl', keyframes)
 
