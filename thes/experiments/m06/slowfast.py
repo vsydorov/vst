@@ -390,72 +390,6 @@ class Dataloader_isaver(
         flush_purge()
         return self.result
 
-def extract_i3d_feats(workfolder, cfg_dict, add_args):
-    out, = snippets.get_subfolders(workfolder, ['out'])
-    cfg = snippets.YConfig(cfg_dict)
-    cfg.set_deftype("""
-    seed: [42, int]
-    dataset:
-        name: ['daly', ['daly']]
-        cache_folder: [~, str]
-        subset: ['train', ~]
-    """)
-    cf = cfg.parse()
-
-    # DALY Dataset
-    dataset = Dataset_daly_ocv()
-    dataset.populate_from_folder(cf['dataset.cache_folder'])
-    # split_label = cf['dataset.subset']
-    # split_vids = get_daly_split_vids(dataset, split_label)
-
-    sf_cfg = base_sf_i3d_config()
-    sf_cfg.TEST.BATCH_SIZE = 16
-    # Load model
-    model = slowfast.models.build_model(sf_cfg)
-    model.eval()
-    # misc.log_model_info(model, sf_cfg, is_train=False)
-
-    with vt_log.logging_disabled(logging.WARNING):
-        cu.load_checkpoint(
-            CHECKPOINT_FILE_PATH, model, False, None,
-            inflation=False, convert_from_caffe2=True,)
-
-    keyframes = create_keyframelist(dataset)
-
-    extractor_roi = Extractor_roi(
-        model, sf_resnet_headless_forward, model_nframes)
-
-    BATCH_SIZE = 8
-    NUM_WORKERS = 12
-
-    def prepare_func(start_i):
-        remaining_keyframes = keyframes[start_i+1:]
-        tdataset_kf = TDataset_over_keyframes(
-                remaining_keyframes, model_nframes, model_sample)
-        loader = torch.utils.data.DataLoader(tdataset_kf,
-                batch_size=BATCH_SIZE, shuffle=False,
-                num_workers=NUM_WORKERS, pin_memory=True)
-        return loader
-
-    def func(data_input):
-        II, Xts, bboxes = data_input
-        Xs_f32c = to_gpu_normalize_permute(Xts)
-        bboxes_c = bboxes.type(torch.cuda.FloatTensor)
-        with torch.no_grad():
-            Y = extractor_roi.forward(Xs_f32c, bboxes_c)
-        II_np = II.cpu().numpy()
-        Y_np = Y.cpu().numpy()
-        return II_np, Y_np
-
-    disaver_fold = small.mkdir(out/'disaver')
-    total = len(keyframes)
-    disaver = Dataloader_isaver(disaver_fold, total, func, prepare_func,
-            save_interval=60)
-    outputs = disaver.run()
-    sq_outputs = np.vstack(outputs).squeeze()
-    small.save_pkl(out/'sq_outputs.pkl', sq_outputs)
-    small.save_pkl(out/'keyframes.pkl', keyframes)
-
 def extract_sf_feats(workfolder, cfg_dict, add_args):
     out, = snippets.get_subfolders(workfolder, ['out'])
     cfg = snippets.YConfig(cfg_dict)
@@ -464,7 +398,6 @@ def extract_sf_feats(workfolder, cfg_dict, add_args):
     dataset:
         name: ['daly', ['daly']]
         cache_folder: [~, str]
-        subset: ['train', ~]
     model: [~, ['slowfast', 'i3d']]
     """)
     cf = cfg.parse()
@@ -670,264 +603,235 @@ def split_off(X, linked_vids, good_vids):
         raise RuntimeError()
     return result
 
+class Ncfg_mlp:
 
-def train_mlp_over_extracted_feats(workfolder, cfg_dict, add_args):
+    class Net_mlp_featcls(nn.Module):
+        def __init__(self, D_in, D_out, H, dropout_rate=0.5):
+            super().__init__()
+            self.linear1 = nn.Linear(D_in, H)
+            self.linear2 = nn.Linear(H, D_out)
+            self.dropout = nn.Dropout(dropout_rate)
+            # self.bn = nn.BatchNorm1d(H, momentum=0.1)
+
+        def forward(self, x):
+            x = self.linear1(x)
+            x = F.relu(x)
+            x = self.dropout(x)
+            # x = self.bn(x)
+            x = self.linear2(x)
+            return x
+
+    @staticmethod
+    def set_defcfg(cfg):
+        cfg.set_deftype("""
+        seed: [42, int]
+        dataset:
+            name: ['daly', ['daly']]
+            cache_folder: [~, str]
+            val_split:
+                fraction: [0.1, float]
+                nsamplings: [20, int]
+                seed: [42, int]
+        tubes_dwein: [~, str]
+        computed_featfold: [~, str]
+        """)
+        cfg.set_defaults("""
+        net:
+            H: 32
+        train:
+            lr: 1.0e-5
+            weight_decay: 5e-2
+            niters: 2000
+        n_trials: 5
+        """)
+
+    @staticmethod
+    def get_vids(cf, dataset):
+        v_fraction = cf['dataset.val_split.fraction']
+        v_nsamplings = cf['dataset.val_split.nsamplings']
+        v_seed = cf['dataset.val_split.seed']
+
+        class Vgroup:
+            val, train = split_off_validation_set(
+                    dataset, v_fraction, v_nsamplings, v_seed)
+            trainval = get_daly_split_vids(dataset, 'train')
+            test = get_daly_split_vids(dataset, 'test')
+        return Vgroup
+
+    @staticmethod
+    def split_features(outputs, keyframes, Vgroup):
+        global_kf_vids = [kf['vid'] for kf in keyframes]
+
+        class D_trainval():
+            X = split_off(outputs, global_kf_vids, Vgroup.trainval)
+            kf = split_off(keyframes, global_kf_vids, Vgroup.trainval)
+            kf_vids = [kf['vid'] for kf in kf]
+            Y = np.array([kf['action_id'] for kf in kf])
+
+        scaler = StandardScaler()
+        D_trainval.X = scaler.fit_transform(D_trainval.X)
+
+        class D_train():
+            X = split_off(D_trainval.X, D_trainval.kf_vids, Vgroup.train)
+            kf = split_off(D_trainval.kf, D_trainval.kf_vids, Vgroup.train)
+            Y = np.array([kf['action_id'] for kf in kf])
+
+        class D_val():
+            X = split_off(D_trainval.X, D_trainval.kf_vids, Vgroup.val)
+            kf = split_off(D_trainval.kf, D_trainval.kf_vids, Vgroup.val)
+            Y = np.array([kf['action_id'] for kf in kf])
+
+        class D_test():
+            X = split_off(outputs, global_kf_vids, Vgroup.test)
+            kf = split_off(keyframes, global_kf_vids, Vgroup.test)
+            Y = np.array([kf['action_id'] for kf in kf])
+            X = scaler.transform(X)
+
+        return D_trainval, D_train, D_val, D_test
+
+    @classmethod
+    def create_model(self, dataset, outputs, H):
+        D_in = outputs.shape[-1]
+        D_out = len(dataset.action_names)
+        H = 32
+        model = self.Net_mlp_featcls(D_in, D_out, H)
+        loss_fn = torch.nn.CrossEntropyLoss(reduction='mean')
+        return model, loss_fn
+
+    @staticmethod
+    def qacc(pred, Y):
+        return pred.argmax(1).eq(Y).sum().item()/len(Y) * 100
+
+    @classmethod
+    def optimize(self, cf, model, loss_fn, D_to_train, log_period='::'):
+        optimizer = torch.optim.AdamW(model.parameters(),
+            lr=cf['train.lr'], weight_decay=cf['train.weight_decay'])
+        niters = cf['train.niters']
+        X_to_train = torch.from_numpy(D_to_train.X)
+        Y_to_train = torch.from_numpy(D_to_train.Y)
+        model.train()
+        for t in range(niters):
+            pred_train = model(X_to_train)
+            loss = loss_fn(pred_train, Y_to_train)
+            if snippets.check_step_sslice(t, log_period):
+                # Train perf
+                model.eval()
+                with torch.no_grad():
+                    pred_trainval = model(X_to_train)
+                    acc_trainval = self.qacc(pred_trainval, Y_to_train)
+                model.train()
+                log.info(f'{t}: {loss.item()} {acc_trainval=:.2f}')
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+    @staticmethod
+    def evaluate_acc(model, D_to_test):
+        X_to_test = torch.from_numpy(D_to_test.X)
+
+        model.eval()
+        with torch.no_grad():
+            Y_test = model(X_to_test)
+        Y_test_np = Y_test.numpy()
+        Y_test_preds = np.argmax(Y_test_np, axis=1)
+        acc = accuracy_score(D_to_test.Y, Y_test_preds)
+
+        Y_test_np_softmax = softmax(Y_test_np, axis=1)
+        Y_test_np_softmax = Y_test_np_softmax.copy()
+        roc_auc = roc_auc_score(D_to_test.Y, Y_test_np_softmax,
+                multi_class='ovr')
+        return Y_test_np_softmax, acc, roc_auc
+
+    @staticmethod
+    def evaluate_tubes(cf, Vgroup, D_test, dataset, Y_test_np_softmax):
+        # // Tube AP (very, very rought performance)
+        # Dwein tubes
+        tubes_dwein: Dict[I_dwein, T_dwein] = \
+                loadconvert_tubes_dwein(cf['tubes_dwein'])
+        tubes_dwein_test = dtindex_filter_split(tubes_dwein, Vgroup.test)
+        # GT tubes
+        dgt_tubes: Dict[I_dgt, T_dgt] = \
+                get_daly_gt_tubes(dataset)
+        dgt_tubes_test = dtindex_filter_split(dgt_tubes, Vgroup.test)
+        av_gt_tubes_test: AV_dict[T_dgt] = push_into_avdict(dgt_tubes_test)
+
+        objactions_vf = create_kinda_objaction_struct(
+                dataset, D_test.kf, Y_test_np_softmax)
+        # Assigning scores based on intersections
+        av_stubes: AV_dict[T_dwein_scored] = \
+            score_ftubes_via_objaction_overlap_aggregation(
+                dataset, objactions_vf, tubes_dwein_test, 'iou',
+                0.1, 0.0, enable_tqdm=False)
+        av_stubes_ = av_stubes_above_score(
+                av_stubes, 0.0)
+        av_stubes_ = compute_nms_for_av_stubes(
+                av_stubes_, 0.3)
+        iou_thresholds = [.3, .5, .7]
+        df_recall_s_nodiff = compute_recall_for_avtubes_as_dfs(
+                av_gt_tubes_test, av_stubes_, iou_thresholds, False)[0]
+        df_ap_s_nodiff = compute_ap_for_avtubes_as_df(
+                av_gt_tubes_test, av_stubes_, iou_thresholds, False, False)
+        return df_recall_s_nodiff, df_ap_s_nodiff
+
+
+def torchmlp_feat_classify_validate(workfolder, cfg_dict, add_args):
     out, = snippets.get_subfolders(workfolder, ['out'])
     cfg = snippets.YConfig(cfg_dict)
-    cfg.set_deftype("""
-    seed: [42, int]
-    dataset:
-        name: ['daly', ['daly']]
-        cache_folder: [~, str]
-        subset: ['train', ~]
-    tubes_dwein: [~, str]
-    computed_featfold: [~, str]
-    """)
+    Ncfg_mlp.set_defcfg(cfg)
     cf = cfg.parse()
 
-    # DALY Dataset
+    # Inputs
+    initial_seed = cf['seed']
     dataset = Dataset_daly_ocv()
     dataset.populate_from_folder(cf['dataset.cache_folder'])
-
-    val_vids, train_vids = split_off_validation_set(dataset, 0.1)
-    trainval_vids = get_daly_split_vids(dataset, 'train')
-    test_vids = get_daly_split_vids(dataset, 'test')
-
+    Vgroup = Ncfg_mlp.get_vids(cf, dataset)
     computed_featfold = Path(cf['computed_featfold'])
     keyframes = small.load_pkl(computed_featfold/'keyframes.pkl')
     outputs = small.load_pkl(computed_featfold/'sq_outputs.pkl')
-    kf_vids = [kf['vid'] for kf in keyframes]
+    D_trainval, D_train, D_val, D_test = \
+            Ncfg_mlp.split_features(outputs, keyframes, Vgroup)
 
-    X_trainval = split_off(outputs, kf_vids, trainval_vids)
-    kf_trainval = split_off(keyframes, kf_vids, trainval_vids)
-    kf_vids_trainval = [kf['vid'] for kf in kf_trainval]
-    aid_trainval = [kf['action_id'] for kf in kf_trainval]
+    torch.manual_seed(initial_seed)
+    model, loss_fn = Ncfg_mlp.create_model(dataset, outputs, cf['net.H'])
 
-    scaler = StandardScaler()
-    X_trainval = scaler.fit_transform(X_trainval)
-
-    X_test = split_off(outputs, kf_vids, test_vids)
-    kf_test = split_off(keyframes, kf_vids, test_vids)
-    aid_test = [kf['action_id'] for kf in kf_test]
-    X_test = scaler.transform(X_test)
-
-    X_train = split_off(X_trainval, kf_vids_trainval, train_vids)
-    kf_train = split_off(kf_trainval, kf_vids_trainval, train_vids)
-    aid_train = [kf['action_id'] for kf in kf_train]
-
-    X_val = split_off(X_trainval, kf_vids_trainval, val_vids)
-    kf_val = split_off(kf_trainval, kf_vids_trainval, val_vids)
-    aid_val = [kf['action_id'] for kf in kf_val]
-
-    val_search = False
-    if val_search:
-        def compute_perf(IN):
-            alpha, hl_size, max_iter = IN
-            clf = MLPClassifier(hl_size, random_state=0, max_iter=max_iter, alpha=alpha)
-            clf.fit(X_train, aid_train)
-            Y_val = clf.predict(X_val)
-            acc = accuracy_score(aid_val, Y_val)
-            return acc
-
-        alpha_values = np.logspace(-3, -1, 7)
-        hlayer_sizes = ((200,), (250,))
-        max_iter = (200, 400, 600)
-        params = list(itertools.product(alpha_values, hlayer_sizes, max_iter))
-
-        fold = small.mkdir(out/'isaver_ahl_perf')
-        isaver = snippets.Isaver_threading(fold, params, compute_perf, 2, 24)
-        perfs = isaver.run()
-
-    # Train on trainval
-    clf = MLPClassifier((200,), random_state=0, max_iter=300, alpha=0.02)
-    clf.fit(X_trainval, aid_trainval)
-    Y_test = clf.predict(X_test)
-    acc = accuracy_score(aid_test, Y_test)
-    log.info(f'Test {acc=}')
-
-    Y_conf_scores_sm = clf.predict_proba(X_test)
-    roc_auc = roc_auc_score(aid_test, Y_conf_scores_sm,
-            multi_class='ovr')
-    log.info(f'{roc_auc=}')
-
-    # // Tube AP (very, very rought performance)
-    # Dwein tubes
-    tubes_dwein: Dict[I_dwein, T_dwein] = \
-            loadconvert_tubes_dwein(cf['tubes_dwein'])
-    tubes_dwein_test = dtindex_filter_split(tubes_dwein, test_vids)
-    # GT tubes
-    dgt_tubes: Dict[I_dgt, T_dgt] = \
-            get_daly_gt_tubes(dataset)
-    dgt_tubes_test = dtindex_filter_split(dgt_tubes, test_vids)
-    av_gt_tubes_test: AV_dict[T_dgt] = push_into_avdict(dgt_tubes_test)
-
-    objactions_vf = create_kinda_objaction_struct(
-            dataset, kf_test, Y_conf_scores_sm)
-    # Assigning scores based on intersections
-    av_stubes: AV_dict[T_dwein_scored] = \
-        score_ftubes_via_objaction_overlap_aggregation(
-            dataset, objactions_vf, tubes_dwein_test, 'iou',
-            0.1, 0.0)
-    av_stubes_ = av_stubes_above_score(
-            av_stubes, 0.0)
-    av_stubes_ = compute_nms_for_av_stubes(
-            av_stubes_, 0.3)
-    iou_thresholds = [.3, .5, .7]
-    df_recall_s_nodiff = compute_recall_for_avtubes_as_dfs(
-            av_gt_tubes_test, av_stubes_, iou_thresholds, False)[0]
-    df_ap_s_nodiff = compute_ap_for_avtubes_as_df(
-            av_gt_tubes_test, av_stubes_, iou_thresholds, False, False)
-    log.info(f'AP:\n{df_ap_s_nodiff}')
+    # model, loss_fn = Ncfg_mlp.create_model(cf['net.H'])
 
 
-def _val_preparations(outputs, keyframes, Vids):
-    global_kf_vids = [kf['vid'] for kf in keyframes]
-
-    class D_trainval():
-        X = split_off(outputs, global_kf_vids, Vids.trainval)
-        kf = split_off(keyframes, global_kf_vids, Vids.trainval)
-        kf_vids = [kf['vid'] for kf in kf]
-        aid = np.array([kf['action_id'] for kf in kf])
-
-    scaler = StandardScaler()
-    D_trainval.X = scaler.fit_transform(D_trainval.X)
-
-    class D_test():
-        X = split_off(outputs, global_kf_vids, Vids.test)
-        kf = split_off(keyframes, global_kf_vids, Vids.test)
-        aid = np.array([kf['action_id'] for kf in kf])
-        X = scaler.transform(X)
-
-    class D_train():
-        X = split_off(D_trainval.X, D_trainval.kf_vids, Vids.train)
-        kf = split_off(D_trainval.kf, D_trainval.kf_vids, Vids.train)
-        aid = np.array([kf['action_id'] for kf in kf])
-
-    class D_val():
-        X = split_off(D_trainval.X, D_trainval.kf_vids, Vids.val)
-        kf = split_off(D_trainval.kf, D_trainval.kf_vids, Vids.val)
-        aid = np.array([kf['action_id'] for kf in kf])
-
-    return D_trainval, D_test, D_train, D_val
-
-
-class Net(nn.Module):
-    def __init__(self, D_in, D_out, H, dropout_rate=0.5):
-        super().__init__()
-        self.linear1 = nn.Linear(D_in, H)
-        self.linear2 = nn.Linear(H, D_out)
-        self.dropout = nn.Dropout(dropout_rate)
-        # self.bn = nn.BatchNorm1d(H, momentum=0.1)
-
-    def forward(self, x):
-        x = self.linear1(x)
-        x = F.relu(x)
-        x = self.dropout(x)
-        # x = self.bn(x)
-        x = self.linear2(x)
-        return x
-
-
-def train_torch_mlp_over_extracted_feats(workfolder, cfg_dict, add_args):
+def torchmlp_feat_classify_test(workfolder, cfg_dict, add_args):
     out, = snippets.get_subfolders(workfolder, ['out'])
     cfg = snippets.YConfig(cfg_dict)
-    cfg.set_deftype("""
-    seed: [42, int]
-    dataset:
-        name: ['daly', ['daly']]
-        cache_folder: [~, str]
-        subset: ['train', ~]
-    tubes_dwein: [~, str]
-    computed_featfold: [~, str]
-    """)
+    Ncfg_mlp.set_defcfg(cfg)
     cf = cfg.parse()
 
-    # DALY Dataset
+    # Inputs
+    initial_seed = cf['seed']
+    n_trials = cf['n_trials']
     dataset = Dataset_daly_ocv()
     dataset.populate_from_folder(cf['dataset.cache_folder'])
-
-    class Vids():
-        val, train = split_off_validation_set(dataset, 0.1)
-        trainval = get_daly_split_vids(dataset, 'train')
-        test = get_daly_split_vids(dataset, 'test')
-
+    Vgroup = Ncfg_mlp.get_vids(cf, dataset)
     computed_featfold = Path(cf['computed_featfold'])
     keyframes = small.load_pkl(computed_featfold/'keyframes.pkl')
     outputs = small.load_pkl(computed_featfold/'sq_outputs.pkl')
-    D_trainval, D_test, D_train, D_val = _val_preparations(outputs, keyframes, Vids)
+    D_trainval, D_train, D_val, D_test = \
+            Ncfg_mlp.split_features(outputs, keyframes, Vgroup)
 
-    D_in = D_train.X.shape[-1]
-    D_out = len(dataset.action_names)
-    H = 32
-    model = Net(D_in, D_out, H)
-    loss_fn = torch.nn.CrossEntropyLoss(reduction='mean')
+    def experiment(i):
+        torch.manual_seed(initial_seed+i)
+        model, loss_fn = Ncfg_mlp.create_model(dataset, outputs, cf['net.H'])
+        Ncfg_mlp.optimize(cf, model, loss_fn, D_trainval)
+        Y_test_np_softmax, acc, roc_auc = Ncfg_mlp.evaluate_acc(model, D_test)
+        df_recall_s_nodiff, df_ap_s_nodiff = Ncfg_mlp.evaluate_tubes(
+                cf, Vgroup, D_test, dataset, Y_test_np_softmax)
+        return [acc, roc_auc, df_recall_s_nodiff, df_ap_s_nodiff]
 
-    learning_rate = 1e-5
-    optimizer = torch.optim.AdamW(model.parameters(),
-            lr=learning_rate,
-            weight_decay=5e-2)
-    N_iters = 2000
-    X_train = torch.from_numpy(D_train.X)
-    Y_train = torch.from_numpy(D_train.aid)
-    X_val = torch.from_numpy(D_val.X)
-    Y_val = torch.from_numpy(D_val.aid)
-    X_trainval = torch.from_numpy(D_trainval.X)
-    Y_trainval = torch.from_numpy(D_trainval.aid)
-    X_test = torch.from_numpy(D_test.X)
-    model.train()
-    for t in range(N_iters):
-        pred_train = model(X_trainval)
-        loss = loss_fn(pred_train, Y_trainval)
-        if t % 50 == 0:
-            # Train perf
-            model.eval()
-            with torch.no_grad():
-                pred_trainval = model(X_trainval)
-                acc_trainval = pred_trainval.argmax(1).eq(Y_trainval).sum().item()/len(Y_trainval) * 100
-            model.train()
-            log.info(f'{t}: {loss.item()} {acc_trainval=:.2f}')
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-    model.eval()
-    with torch.no_grad():
-        Y_test = model(X_test)
-    Y_test_np = Y_test.numpy()
-    Y_test_preds = np.argmax(Y_test_np, axis=1)
-    acc = accuracy_score(D_test.aid, Y_test_preds)
-    log.info(f'Test {acc=}')
-
-    Y_test_np_softmax = softmax(Y_test_np, axis=1)
-    roc_auc = roc_auc_score(D_test.aid, Y_test_np_softmax,
-            multi_class='ovr')
-    log.info(f'{roc_auc=}')
-
-    # // Tube AP (very, very rought performance)
-    # Dwein tubes
-    tubes_dwein: Dict[I_dwein, T_dwein] = \
-            loadconvert_tubes_dwein(cf['tubes_dwein'])
-    tubes_dwein_test = dtindex_filter_split(tubes_dwein, Vids.test)
-    # GT tubes
-    dgt_tubes: Dict[I_dgt, T_dgt] = \
-            get_daly_gt_tubes(dataset)
-    dgt_tubes_test = dtindex_filter_split(dgt_tubes, Vids.test)
-    av_gt_tubes_test: AV_dict[T_dgt] = push_into_avdict(dgt_tubes_test)
-
-    objactions_vf = create_kinda_objaction_struct(
-            dataset, D_test.kf, Y_test_np_softmax)
-    # Assigning scores based on intersections
-    av_stubes: AV_dict[T_dwein_scored] = \
-        score_ftubes_via_objaction_overlap_aggregation(
-            dataset, objactions_vf, tubes_dwein_test, 'iou',
-            0.1, 0.0)
-    av_stubes_ = av_stubes_above_score(
-            av_stubes, 0.0)
-    av_stubes_ = compute_nms_for_av_stubes(
-            av_stubes_, 0.3)
-    iou_thresholds = [.3, .5, .7]
-    df_recall_s_nodiff = compute_recall_for_avtubes_as_dfs(
-            av_gt_tubes_test, av_stubes_, iou_thresholds, False)[0]
-    df_ap_s_nodiff = compute_ap_for_avtubes_as_df(
-            av_gt_tubes_test, av_stubes_, iou_thresholds, False, False)
-    log.info(f'AP:\n{df_ap_s_nodiff}')
+    isaver = snippets.Isaver_simple(small.mkdir(out/'isaver_ntrials'), range(n_trials), experiment)
+    trial_results = isaver.run()
+    [acc, roc_auc, recall, ap] = zip(*trial_results)
+    acc, roc_auc = map(lambda x: np.array(x)*100, (acc, roc_auc))
+    recall, ap = map(lambda x: pd.concat(
+        x, keys=range(5), axis=1).mean(axis=1, level=1), (recall, ap))
+    with small.np_printoptions(precision=2):
+        log.info('Accuracy; mean: {:.2f}, all: {} '.format(np.mean(acc), acc))
+        log.info('Roc_auc; mean: {:.2f} all: {} '.format(np.mean(roc_auc), roc_auc))
+    log.info(f'Mean Recall\n{recall}')
+    log.info(f'mean AP:\n{ap}')

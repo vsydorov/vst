@@ -181,13 +181,18 @@ def score_ftubes_via_objaction_overlap_aggregation(
         ftubes: Dict[I_dwein, T_dwein],
         overlap_type: Literal['inner_overlap', 'iou'],
         overlap_cutoff: float,
-        score_cutoff: float
+        score_cutoff: float,
+        enable_tqdm: bool = True,
         ) -> AV_dict[T_dwein_scored]:
     """
     """
     # To every tube, find matching keyframes
     dwti_ascore: Dict[I_dwein, Dict[Action_name_daly, float]] = {}
-    for dwt_index, tube in tqdm(ftubes.items(), 'match_keyframes'):
+    if enable_tqdm:
+        pbar = tqdm(ftubes.items(), 'match_keyframes')
+    else:
+        pbar = ftubes.items()
+    for dwt_index, tube in pbar:
         (vid, bunch_id, tube_id) = dwt_index
         cls_scores: Dict[Action_name_daly, float] = {}
         for frame_ind, tube_box in zip(
