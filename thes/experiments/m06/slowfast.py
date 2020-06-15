@@ -61,9 +61,7 @@ def np_to_gpu(X):
 
 
 norm_mean = np.array([0.45, 0.45, 0.45])
-norm_mean_t = np_to_gpu(norm_mean)
 norm_std = np.array([0.225, 0.225, 0.225])
-norm_std_t = np_to_gpu(norm_std)
 test_crop_size = 255
 
 def sf_resnet_headless_forward(self, x):
@@ -212,7 +210,7 @@ def prepare_video(frames_u8):
     Xt = torch.from_numpy(X)
     return Xt, resize_params, ccrop_params
 
-def to_gpu_normalize_permute(Xt):
+def to_gpu_normalize_permute(Xt, norm_mean_t, norm_std_t):
     # Convert to float on GPU
     X_f32c = Xt.type(torch.cuda.FloatTensor)
     X_f32c /= 255
@@ -465,6 +463,9 @@ def extract_sf_feats(workfolder, cfg_dict, add_args):
     NUM_WORKERS = 12
     # NUM_WORKERS = 0
 
+    norm_mean_t = np_to_gpu(norm_mean)
+    norm_std_t = np_to_gpu(norm_std)
+
     def prepare_func(start_i):
         remaining_keyframes = keyframes[start_i+1:]
         tdataset_kf = TDataset_over_keyframes(
@@ -477,7 +478,7 @@ def extract_sf_feats(workfolder, cfg_dict, add_args):
 
     def func(data_input):
         II, Xts, bboxes = data_input
-        Xts_f32c = [to_gpu_normalize_permute(x) for x in Xts]
+        Xts_f32c = [to_gpu_normalize_permute(x, norm_mean_t, norm_std_t) for x in Xts]
         bboxes_c = bboxes.type(torch.cuda.FloatTensor)
         with torch.no_grad():
             Y = extractor_roi.forward(Xts_f32c, bboxes_c)
