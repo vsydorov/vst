@@ -62,7 +62,7 @@ def np_to_gpu(X):
 
 norm_mean = np.array([0.45, 0.45, 0.45])
 norm_std = np.array([0.225, 0.225, 0.225])
-test_crop_size = 255
+test_crop_size = 256
 
 def sf_resnet_headless_forward(self, x):
     # slowfast/models/video_model_builder.py/ResNet.forward
@@ -134,7 +134,54 @@ class Extractor_roi(nn.Module):
         # B C H W.
         x = torch.cat(pool_out, 1)
         x = x.view(x.shape[0], -1)
-        return x
+        result = {'roipooled': x}
+        return result
+
+
+class Extractor_fullframe(nn.Module):
+    def __init__(self,
+            model, forward_method,
+            temp_pool_size, spat_pool_size):
+        super().__init__()
+        self._model = copy.copy(model)
+        self._model.forward = MethodType(forward_method, self._model)
+        self.num_pathways = len(temp_pool_size)
+
+        for pi in range(self.num_pathways):
+            # Avg.tpool, then Max.spool
+            tpool = nn.AvgPool3d((temp_pool_size[pi], 1, 1))
+            self.add_module(f's{pi}_tpool', tpool)
+            spool = nn.MaxPool2d(
+                    (spat_pool_size[pi], spat_pool_size[pi]), stride=1)
+            self.add_module(f's{pi}_spool', spool)
+            # Avg.stpool
+            stpool = nn.AdaptiveAvgPool3d((1, 1, 1))
+            self.add_module(f's{pi}_stpool', stpool)
+
+    def forward(self, X, bboxes):
+        # Forward through model
+        x = self._model(X)
+        tavg_smax_pool_out = []
+        st_avg_pool_out = []
+        for pi in range(self.num_pathways):
+            # Avg.tpool, Max.spool
+            t_pool = getattr(self, f's{pi}_tpool')
+            s_pool = getattr(self, f's{pi}_spool')
+            out1 = t_pool(x[pi])
+            assert out1.shape[2] == 1
+            out1 = torch.squeeze(out1, 2)
+            out1 = s_pool(out1)
+            tavg_smax_pool_out.append(out1)
+            # Avg. stpool
+            st_pool = getattr(self, f's{pi}_stpool')
+            out2 = st_pool(x[pi])
+            st_avg_pool_out.append(out2)
+        tavg_smax = torch.cat(tavg_smax_pool_out, 1)
+        tavg_smax = tavg_smax.view(tavg_smax.shape[0], -1)
+        st_avg = torch.cat(st_avg_pool_out, 1)
+        st_avg = st_avg.view(st_avg.shape[0], -1)
+        result = {'tavg_smax': tavg_smax, 'st_avg': st_avg}
+        return result
 
 
 def yana_size_query(X, dsize):
@@ -397,6 +444,7 @@ def extract_sf_feats(workfolder, cfg_dict, add_args):
         name: ['daly', ['daly']]
         cache_folder: [~, str]
     model: [~, ['slowfast', 'i3d']]
+    extraction_mode: ['roi', ['roi', 'fullframe']]
     """)
     cf = cfg.parse()
 
@@ -410,11 +458,13 @@ def extract_sf_feats(workfolder, cfg_dict, add_args):
         CHECKPOINT_FILE_PATH = '/home/vsydorov/projects/deployed/2019_12_Thesis/links/scratch2/102_slowfast/20_zoo_checkpoints/kinetics400/SLOWFAST_4x16_R50.pkl'
         headless_forward_func = sf_slowfast_headless_forward
         is_slowfast = True
+        _POOL_SIZE = [[1, 1, 1], [1, 1, 1]]
     elif model_str == 'i3d':
         rel_yml_path = 'Kinetics/c2/I3D_8x8_R50.yaml'
         CHECKPOINT_FILE_PATH = '/home/vsydorov/projects/deployed/2019_12_Thesis/links/scratch2/102_slowfast/20_zoo_checkpoints/kinetics400/I3D_8x8_R50.pkl'
         headless_forward_func = sf_resnet_headless_forward
         is_slowfast = False
+        _POOL_SIZE = [[2, 1, 1]]
     else:
         raise RuntimeError()
 
@@ -428,23 +478,6 @@ def extract_sf_feats(workfolder, cfg_dict, add_args):
     model_sample = sf_cfg.DATA.SAMPLING_RATE
     slowfast_alpha = sf_cfg.SLOWFAST.ALPHA
 
-    if model_str == 'slowfast':
-        _POOL_SIZE = [[1, 1, 1], [1, 1, 1]]
-        pool_size = [
-            [model_nframes//slowfast_alpha//_POOL_SIZE[0][0], 1, 1],
-            [model_nframes//_POOL_SIZE[1][0], 1, 1]]
-        resolution = [[xform_resolution] * 2] * 2
-        scale_factor = [32] * 2
-    elif model_str == 'i3d':
-        _POOL_SIZE = [[2, 1, 1]]
-        pool_size = [
-                [model_nframes//_POOL_SIZE[0][0], 1, 1]]
-        resolution = [[xform_resolution] * 2]
-        scale_factor= [32]
-        is_slowfast = False
-    else:
-        raise RuntimeError()
-
     # Load model
     model = slowfast.models.build_model(sf_cfg)
     model.eval()
@@ -455,9 +488,40 @@ def extract_sf_feats(workfolder, cfg_dict, add_args):
 
     keyframes = create_keyframelist(dataset)
 
-    extractor_roi = Extractor_roi(
-        model, headless_forward_func,
-        pool_size, resolution, scale_factor)
+    if cf['extraction_mode'] == 'roi':
+        if model_str == 'slowfast':
+            head_pool_size = [
+                [model_nframes//slowfast_alpha//_POOL_SIZE[0][0], 1, 1],
+                [model_nframes//_POOL_SIZE[1][0], 1, 1]]
+            resolution = [[xform_resolution] * 2] * 2
+            scale_factor = [32] * 2
+        elif model_str == 'i3d':
+            head_pool_size = [
+                    [model_nframes//_POOL_SIZE[0][0], 1, 1]]
+            resolution = [[xform_resolution] * 2]
+            scale_factor= [32]
+        else:
+            raise RuntimeError()
+        extractor = Extractor_roi(
+            model, headless_forward_func,
+            head_pool_size, resolution, scale_factor)
+    elif cf['extraction_mode'] == 'fullframe':
+        if model_str == 'slowfast':
+            temp_pool_size = [
+                model_nframes//slowfast_alpha//_POOL_SIZE[0][0],
+                model_nframes//_POOL_SIZE[1][0]]
+            spat_pool_size = [test_crop_size//32, test_crop_size//32]
+        elif model_str == 'i3d':
+            temp_pool_size = [
+                    model_nframes//_POOL_SIZE[0][0], ]
+            spat_pool_size = [test_crop_size//32]
+        else:
+            raise RuntimeError()
+        extractor = Extractor_fullframe(
+            model, headless_forward_func,
+            temp_pool_size, spat_pool_size)
+    else:
+        raise RuntimeError()
 
     BATCH_SIZE = 8
     NUM_WORKERS = 12
@@ -478,21 +542,111 @@ def extract_sf_feats(workfolder, cfg_dict, add_args):
 
     def func(data_input):
         II, Xts, bboxes = data_input
-        Xts_f32c = [to_gpu_normalize_permute(x, norm_mean_t, norm_std_t) for x in Xts]
+        Xts_f32c = [to_gpu_normalize_permute(
+            x, norm_mean_t, norm_std_t) for x in Xts]
         bboxes_c = bboxes.type(torch.cuda.FloatTensor)
         with torch.no_grad():
-            Y = extractor_roi.forward(Xts_f32c, bboxes_c)
+            result = extractor.forward(Xts_f32c, bboxes_c)
+        result_np = {k: v.cpu().numpy()
+                for k, v in result.items()}
         II_np = II.cpu().numpy()
-        Y_np = Y.cpu().numpy()
-        return II_np, Y_np
+        return II_np, result_np
 
     disaver_fold = small.mkdir(out/'disaver')
     total = len(keyframes)
     disaver = Dataloader_isaver(disaver_fold, total, func, prepare_func,
             save_interval=60)
     outputs = disaver.run()
-    sq_outputs = np.vstack(outputs)
-    small.save_pkl(out/'sq_outputs.pkl', sq_outputs)
+    keys = next(iter(outputs)).keys()
+    dict_outputs = {}
+    for k in keys:
+        stacked = np.vstack([o[k] for o in outputs])
+        dict_outputs[k] = stacked
+    small.save_pkl(out/'dict_outputs.pkl', dict_outputs)
+    small.save_pkl(out/'keyframes.pkl', keyframes)
+
+
+from thes.caffe import (nicolas_net, model_test_get_image_blob)
+
+
+def _caffe_feat_extract_func(net, keyframe):
+    PIXEL_MEANS = [102.9801, 115.9465, 122.7717]
+    TEST_SCALES = [600, ]
+    TEST_MAX_SIZE = 1000
+
+    i0 = keyframe['frame0']
+    video_path = keyframe['video_path']
+
+    boxes = keyframe['bbox'][None]
+
+    with vt_cv.video_capture_open(video_path) as vcap:
+        frame_u8 = vt_cv.video_sample(vcap, [i0])[0]
+
+    blob_, im_scale_factors = model_test_get_image_blob(
+            frame_u8, PIXEL_MEANS, TEST_SCALES, TEST_MAX_SIZE)
+    blob = blob_.transpose(0, 3, 1, 2)  # 1, H, W, 3 --> 1, 3, H, W
+    im_scale_factor = im_scale_factors[0]
+
+    net.blobs['data'].reshape(*blob.shape)
+    net.blobs['data'].data[...] = blob
+    sc_boxes = boxes * im_scale_factor
+    boxes5 = np.c_[np.zeros(len(sc_boxes)), sc_boxes]
+
+    net.blobs['rois'].reshape(len(boxes5), 5)
+    net.blobs['rois'].data[...] = boxes5
+    net_forwarded = net.forward()
+
+    # 11
+    cls_prob = net_forwarded['cls_prob']
+    cls_prob_copy = cls_prob.copy().squeeze()
+
+    # 4096
+    fc7_feats = net.blobs['fc7'].data.copy().squeeze()
+
+    # pool5 (spatial max-pool), 5012
+    pool5_feats = net.blobs['pool5'].data.copy().squeeze()
+    pool5_feats = pool5_feats.max(axis=(1, 2))
+
+    feats = {
+            'cls_prob': cls_prob_copy,
+            'fc7': fc7_feats,
+            'pool5_maxpool': pool5_feats}
+    return feats
+
+
+def extract_caffe_rcnn_feats(workfolder, cfg_dict, add_args):
+    out, = snippets.get_subfolders(workfolder, ['out'])
+    cfg = snippets.YConfig(cfg_dict)
+    cfg.set_deftype("""
+    seed: [42, int]
+    dataset:
+        name: ['daly', ['daly']]
+        cache_folder: [~, str]
+    """)
+    cf = cfg.parse()
+
+    # DALY Dataset
+    dataset = Dataset_daly_ocv()
+    dataset.populate_from_folder(cf['dataset.cache_folder'])
+
+    net = nicolas_net()
+
+    keyframes = create_keyframelist(dataset)
+
+    def extract(i):
+        keyframe = keyframes[i]
+        feats = _caffe_feat_extract_func(net, keyframe)
+        return feats
+
+    isaver = snippets.Isaver_simple(
+        small.mkdir(out/'isaver_extract'), range(len(keyframes)), extract)
+    outputs = isaver.run()
+    keys = next(iter(outputs)).keys()
+    dict_outputs = {}
+    for k in keys:
+        stacked = np.vstack([o[k] for o in outputs])
+        dict_outputs[k] = stacked
+    small.save_pkl(out/'dict_outputs.pkl', dict_outputs)
     small.save_pkl(out/'keyframes.pkl', keyframes)
 
 
@@ -634,7 +788,9 @@ class Ncfg_mlp:
                 nsamplings: [20, int]
                 seed: [42, int]
         tubes_dwein: [~, str]
-        computed_featfold: [~, str]
+        inputs:
+            featfold: [~, str]
+            featname: [~, ~]
         """)
         cfg.set_defaults("""
         net:
@@ -644,6 +800,7 @@ class Ncfg_mlp:
             weight_decay: 5e-2
             niters: 2000
         n_trials: 5
+        log_period: '::'
         """)
 
     @staticmethod
@@ -786,9 +943,10 @@ def torchmlp_feat_classify_validate(workfolder, cfg_dict, add_args):
     dataset = Dataset_daly_ocv()
     dataset.populate_from_folder(cf['dataset.cache_folder'])
     Vgroup = Ncfg_mlp.get_vids(cf, dataset)
-    computed_featfold = Path(cf['computed_featfold'])
+    computed_featfold = Path(cf['inputs.featfold'])
+    featname = cf['inputs.featname']
     keyframes = small.load_pkl(computed_featfold/'keyframes.pkl')
-    outputs = small.load_pkl(computed_featfold/'sq_outputs.pkl')
+    outputs = small.load_pkl(computed_featfold/'dict_outputs.pkl')[featname]
     D_trainval, D_train, D_val, D_test = \
             Ncfg_mlp.split_features(outputs, keyframes, Vgroup)
 
@@ -810,16 +968,18 @@ def torchmlp_feat_classify_test(workfolder, cfg_dict, add_args):
     dataset = Dataset_daly_ocv()
     dataset.populate_from_folder(cf['dataset.cache_folder'])
     Vgroup = Ncfg_mlp.get_vids(cf, dataset)
-    computed_featfold = Path(cf['computed_featfold'])
+    computed_featfold = Path(cf['inputs.featfold'])
+    featname = cf['inputs.featname']
+    log_period = cf['log_period']
     keyframes = small.load_pkl(computed_featfold/'keyframes.pkl')
-    outputs = small.load_pkl(computed_featfold/'sq_outputs.pkl')
+    outputs = small.load_pkl(computed_featfold/'dict_outputs.pkl')[featname]
     D_trainval, D_train, D_val, D_test = \
             Ncfg_mlp.split_features(outputs, keyframes, Vgroup)
 
     def experiment(i):
         torch.manual_seed(initial_seed+i)
         model, loss_fn = Ncfg_mlp.create_model(dataset, outputs, cf['net.H'])
-        Ncfg_mlp.optimize(cf, model, loss_fn, D_trainval)
+        Ncfg_mlp.optimize(cf, model, loss_fn, D_trainval, log_period)
         Y_test_np_softmax, acc, roc_auc = Ncfg_mlp.evaluate_acc(model, D_test)
         df_recall_s_nodiff, df_ap_s_nodiff = Ncfg_mlp.evaluate_tubes(
                 cf, Vgroup, D_test, dataset, Y_test_np_softmax)
