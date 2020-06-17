@@ -996,3 +996,39 @@ def torchmlp_feat_classify_test(workfolder, cfg_dict, add_args):
         log.info('Roc_auc; mean: {:.2f} all: {} '.format(np.mean(roc_auc), roc_auc))
     log.info(f'Mean Recall\n{recall}')
     log.info(f'mean AP:\n{ap}')
+
+def torchmlp_hack_around_rcnn_features(workfolder, cfg_dict, add_args):
+    out, = snippets.get_subfolders(workfolder, ['out'])
+    cfg = snippets.YConfig(cfg_dict)
+    Ncfg_mlp.set_defcfg(cfg)
+    cf = cfg.parse()
+
+    # Inputs
+    dataset = Dataset_daly_ocv()
+    dataset.populate_from_folder(cf['dataset.cache_folder'])
+    Vgroup = Ncfg_mlp.get_vids(cf, dataset)
+    computed_featfold = Path(cf['inputs.featfold'])
+    featname = cf['inputs.featname']
+    keyframes = small.load_pkl(computed_featfold/'keyframes.pkl')
+    outputs = small.load_pkl(computed_featfold/'dict_outputs.pkl')[featname]
+
+    # Check test perf via raw predictions
+    global_kf_vids = [kf['vid'] for kf in keyframes]
+    X = split_off(outputs, global_kf_vids, Vgroup.test)
+    kf = split_off(keyframes, global_kf_vids, Vgroup.test)
+    Y = np.array([kf['action_id'] for kf in kf])
+
+    Y_test_preds = X[:, 1:].argmax(1)
+    acc = accuracy_score(Y, Y_test_preds)
+    Y_test_np_softmax = softmax(X[:, 1:], axis=1)
+    Y_test_np_softmax = Y_test_np_softmax.copy()
+    roc_auc = roc_auc_score(Y, Y_test_np_softmax, multi_class='ovr')
+    log.info(f'{acc*100=:.2f}, {roc_auc*100=:.2f}')
+
+    class D_test:
+        pass
+
+    D_test.kf = kf
+    df_recall_s_nodiff, df_ap_s_nodiff = Ncfg_mlp.evaluate_tubes(
+            cf, Vgroup, D_test, dataset, X[:, 1:])
+    log.info(f'AP=\n{df_ap_s_nodiff}')
