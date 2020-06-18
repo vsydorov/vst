@@ -103,6 +103,7 @@ class Ncfg_mlp:
         dataset:
             name: ['daly', ['daly']]
             cache_folder: [~, str]
+            mirror: ['scratch2', ~]
             val_split:
                 fraction: [0.1, float]
                 nsamplings: [20, int]
@@ -260,7 +261,7 @@ def torchmlp_feat_classify_validate(workfolder, cfg_dict, add_args):
 
     # Inputs
     initial_seed = cf['seed']
-    dataset = Dataset_daly_ocv()
+    dataset = Dataset_daly_ocv(cf['dataset.mirror'])
     dataset.populate_from_folder(cf['dataset.cache_folder'])
     Vgroup = Ncfg_mlp.get_vids(cf, dataset)
     computed_featfold = Path(cf['inputs.featfold'])
@@ -285,7 +286,7 @@ def torchmlp_feat_classify_test(workfolder, cfg_dict, add_args):
     # Inputs
     initial_seed = cf['seed']
     n_trials = cf['n_trials']
-    dataset = Dataset_daly_ocv()
+    dataset = Dataset_daly_ocv(cf['dataset.mirror'])
     dataset.populate_from_folder(cf['dataset.cache_folder'])
     Vgroup = Ncfg_mlp.get_vids(cf, dataset)
     computed_featfold = Path(cf['inputs.featfold'])
@@ -324,7 +325,7 @@ def torchmlp_hack_around_rcnn_features(workfolder, cfg_dict, add_args):
     cf = cfg.parse()
 
     # Inputs
-    dataset = Dataset_daly_ocv()
+    dataset = Dataset_daly_ocv(cf['dataset.mirror'])
     dataset.populate_from_folder(cf['dataset.cache_folder'])
     Vgroup = Ncfg_mlp.get_vids(cf, dataset)
     computed_featfold = Path(cf['inputs.featfold'])

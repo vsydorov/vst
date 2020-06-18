@@ -21,11 +21,13 @@ def precompute_cache(workfolder, cfg_dict, add_args):
     charades:
         mirror: ['gpuhost7', str]
         resolution: ['480', str]
+    daly:
+        mirror: [~, str]
     """)
     cf = cfg.parse()
 
     if cf['dataset'] == 'daly':
-        dataset = Dataset_daly_ocv()
+        dataset = Dataset_daly_ocv(cf['daly.mirror'])
     elif cf['dataset'] == 'charades':
         dataset = Dataset_charades_ocv(
                 cf['charades.mirror'], cf['charades.resolution'])

@@ -110,7 +110,7 @@ class Extractor_roi(nn.Module):
             spool = nn.MaxPool2d(resolution[pi], stride=1)
             self.add_module(f's{pi}_spool', spool)
 
-    def forward(self, X, bboxes):
+    def forward(self, X, bboxes0):
         # Forward through model
         x = self._model(X)
         # / Roi_Pooling
@@ -121,8 +121,9 @@ class Extractor_roi(nn.Module):
             assert out.shape[2] == 1
             out = torch.squeeze(out, 2)
 
+            # Roi, assuming 1 box per 1 batch_ind
             roi_align = getattr(self, f's{pi}_roi')
-            out = roi_align(out, bboxes)
+            out = roi_align(out, bboxes0)
 
             s_pool = getattr(self, f's{pi}_spool')
             out = s_pool(out)
@@ -337,9 +338,9 @@ class TDataset_over_keyframes(torch.utils.data.Dataset):
             frame_list = [Xt]
 
         # Bboxes
-        bbox_tldr = prepare_box(keyframe['bbox'], resize_params, ccrop_params)
-        bbox_tldr0 = np.r_[0, bbox_tldr]
-        return index, frame_list, bbox_tldr0
+        bbox_tldr = prepare_box(
+                keyframe['bbox'], resize_params, ccrop_params)
+        return index, frame_list, bbox_tldr
 
     def __len__(self) -> int:
         return len(self.keyframes)
@@ -439,13 +440,17 @@ def extract_sf_feats(workfolder, cfg_dict, add_args):
     dataset:
         name: ['daly', ['daly']]
         cache_folder: [~, str]
+        mirror: ['scratch2', ~]
     model: [~, ['slowfast', 'i3d']]
     extraction_mode: ['roi', ['roi', 'fullframe']]
+    extraction:
+        batch_size: [8, int]
+        num_workers: [12, int]
     """)
     cf = cfg.parse()
 
     # DALY Dataset
-    dataset = Dataset_daly_ocv()
+    dataset = Dataset_daly_ocv(cf['dataset.mirror'])
     dataset.populate_from_folder(cf['dataset.cache_folder'])
 
     model_str = cf['model']
@@ -482,7 +487,7 @@ def extract_sf_feats(workfolder, cfg_dict, add_args):
             CHECKPOINT_FILE_PATH, model, False, None,
             inflation=False, convert_from_caffe2=True,)
 
-    keyframes = create_keyframelist(dataset)
+    keyframes = create_keyframelist(dataset)[:256]
 
     if cf['extraction_mode'] == 'roi':
         if model_str == 'slowfast':
@@ -519,8 +524,8 @@ def extract_sf_feats(workfolder, cfg_dict, add_args):
     else:
         raise RuntimeError()
 
-    BATCH_SIZE = 8
-    NUM_WORKERS = 12
+    BATCH_SIZE = cf['extraction.batch_size']
+    NUM_WORKERS = cf['extraction.num_workers']
     # NUM_WORKERS = 0
 
     norm_mean_t = np_to_gpu(norm_mean)
@@ -536,13 +541,18 @@ def extract_sf_feats(workfolder, cfg_dict, add_args):
                 num_workers=NUM_WORKERS, pin_memory=True)
         return loader
 
+    bboxes_batch_index = torch.arange(
+        BATCH_SIZE).type(torch.DoubleTensor)[:, None]
+
     def func(data_input):
         II, Xts, bboxes = data_input
         Xts_f32c = [to_gpu_normalize_permute(
             x, norm_mean_t, norm_std_t) for x in Xts]
-        bboxes_c = bboxes.type(torch.cuda.FloatTensor)
+
+        bboxes0 = torch.cat((bboxes_batch_index, bboxes), axis=1)
+        bboxes0_c = bboxes0.type(torch.cuda.FloatTensor)
         with torch.no_grad():
-            result = extractor.forward(Xts_f32c, bboxes_c)
+            result = extractor.forward(Xts_f32c, bboxes0_c)
         result_np = {k: v.cpu().numpy()
                 for k, v in result.items()}
         II_np = II.cpu().numpy()
@@ -618,11 +628,12 @@ def extract_caffe_rcnn_feats(workfolder, cfg_dict, add_args):
     dataset:
         name: ['daly', ['daly']]
         cache_folder: [~, str]
+        mirror: ['scratch2', ~]
     """)
     cf = cfg.parse()
 
     # DALY Dataset
-    dataset = Dataset_daly_ocv()
+    dataset = Dataset_daly_ocv(cf['dataset.mirror'])
     dataset.populate_from_folder(cf['dataset.cache_folder'])
 
     net = nicolas_net()
@@ -646,68 +657,15 @@ def extract_caffe_rcnn_feats(workfolder, cfg_dict, add_args):
     small.save_pkl(out/'keyframes.pkl', keyframes)
 
 
-def _perframe_detection_display(out, test_kfs, Y_conf_scores_sm, dataset):
-    # Display our detections
-    det2_fold = small.mkdir(out/'det2')
-    state = np.random.RandomState(400)
-    iter_index = state.permutation(np.arange(len(test_kfs)))[:400]
-    for i, ii in enumerate(tqdm(iter_index)):
-        kf = test_kfs[ii]
-        scores = Y_conf_scores_sm[ii]
-        vid = kf['vid']
-        frame0 = kf['frame0']
-        pred_box = kf['bbox']
-        video_path = dataset.videos[vid]['path']
-        with vt_cv.video_capture_open(video_path) as vcap:
-            frames_u8 = vt_cv.video_sample(
-                    vcap, [frame0], debug_filename=video_path)
-        frame_u8 = frames_u8[0]
-        act_scores = pd.Series(dict(zip(dataset.action_names, scores)))
-        act_scores = act_scores.sort_values(ascending=False)[:3]
-        stract = ' '.join([f'{x[:5]}: {y:.2f}' for x, y in act_scores.items()])
-        rec_color = (0, 0, 80)
-        good = kf['action_name'] == act_scores.index[0]
-        if good:
-            rec_color = (0, 80, 0)
-        snippets.cv_put_box_with_text(frame_u8, pred_box,
-            text='{}'.format(stract), rec_color=rec_color)
-        cv2.imwrite(str(det2_fold/f'{i:05d}_{vid}_frame{frame0:05d}.jpg'), frame_u8)
-
-
-def _tube_detection_display(out, av_stubes_, dataset):
-    action = 'Drinking'
-    vfold = small.mkdir(out/'det3_tube'/action)
-    v_stubes = av_stubes_[action]
-    flat_tubes = []
-    for vid, stubes in v_stubes.items():
-        for i_stube, stube in enumerate(stubes):
-            flat_tubes.append({'tube': stube, 'ind': (vid, i_stube)})
-    sorted_flat_tubes = sorted(flat_tubes,
-            key=lambda x: x['tube']['score'], reverse=True)
-    sorted_flat_tubes = sorted_flat_tubes[:10]
-
-    for i_sorted, flat_tube in enumerate(tqdm(sorted_flat_tubes)):
-        vid, i_stube = flat_tube['ind']
-        tube = flat_tube['tube']
-        score = tube['score']
-        sf, ef = tube['start_frame'], tube['end_frame']
-        frame_inds = tube['frame_inds']
-        video_fold = small.mkdir(vfold/f'{i_sorted:04d}_vid{vid}_{sf}_to_{ef}_score{score:02f}')
-        video_path = dataset.videos[vid]['path']
-
-        # Extract
-        with vt_cv.video_capture_open(video_path) as vcap:
-            frames_u8 = vt_cv.video_sample(
-                    vcap, frame_inds, debug_filename=video_path)
-        # Draw
-        drawn_frames_u8 = []
-        for i, (find, frame_BGR) in enumerate(zip(frame_inds, frames_u8)):
-            image = frame_BGR.copy()
-            box = tube['boxes'][i]
-            snippets.cv_put_box_with_text(image, box,
-                text='{} {} {:.2f}'.format(
-                    i, action, score))
-            drawn_frames_u8.append(image)
-
-        snippets.qsave_video(video_fold/'overlaid.mp4', drawn_frames_u8)
-        break
+def probe_philtubes_for_extraction(workfolder, cfg_dict, add_args):
+    out, = snippets.get_subfolders(workfolder, ['out'])
+    cfg = snippets.YConfig(cfg_dict)
+    cfg.set_deftype("""
+    seed: [42, int]
+    dataset:
+        name: ['daly', ['daly']]
+        cache_folder: [~, str]
+    model: [~, ['slowfast', 'i3d']]
+    extraction_mode: ['roi', ['roi', 'fullframe']]
+    """)
+    cf = cfg.parse()

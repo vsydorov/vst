@@ -133,13 +133,14 @@ class Dataset_daly(object):
     provided_metas: Dict[Vid_daly, ProvidedMetadata_daly]
     videos: Dict[Vid_daly, Video_daly]
 
-    def __init__(self):
+    def __init__(self, mirror):
         super().__init__()
-        self.root_path = get_dataset_path('action/DALY')
+        self.root_path = get_dataset_path('action/daly_take2')
+        self.mirror = mirror
         self._load_pkl()
 
     def _load_pkl(self):
-        pkl_path = self.root_path/'daly1.1.0.pkl'
+        pkl_path = self.root_path/'annotations/daly1.1.0.pkl'
         info = small.load_py2_pkl(pkl_path)
         assert self.action_names == info['labels']
         assert self.object_names == info['objectList']
@@ -151,7 +152,8 @@ class Dataset_daly(object):
             video_meta = info['metadata'][video_name]
             video: Video_daly = {
                 'vid': vid,
-                'path': self.root_path/f'videos/{vid}.mp4',
+                'path': (self.root_path/
+                    f'mirrors/{self.mirror}/{vid}.mp4'),
                 'suggestedClass': v['suggestedClass'],
                 'instances': v['annot']}
             meta: ProvidedMetadata_daly = {
@@ -265,8 +267,8 @@ class Dataset_daly_ocv(Dataset_daly):
     rstats: Dict[Vid_daly, OCV_rstats]
     videos_ocv: Dict[Vid_daly, Video_daly_ocv]
 
-    def __init__(self):
-        super().__init__()
+    def __init__(self, mirror):
+        super().__init__(mirror)
 
     def _compute_videos_ocv(self, rstats):
         videos_ocv = {}
@@ -326,16 +328,17 @@ class Dataset_daly_ocv(Dataset_daly):
     def precompute_to_folder(self, fold):
         fold = Path(fold)
         vids = list(self.videos.keys())
+        vids_to_path = {k: v['path'] for k, v in self.videos.items()}
         isaver = snippets.Isaver_threading(
             small.mkdir(fold/'isave_rstats'), vids,
-            lambda vid: compute_ocv_rstats(
-                self.root_path/f'videos/{vid}.mp4'), 4, 8)
+            lambda vid: compute_ocv_rstats(vids_to_path[vid]), 4, 8)
         isaver_items = isaver.run()
         rstats: Dict[Vid_daly, OCV_rstats] = dict(zip(vids, isaver_items))
         videos_ocv = self._compute_videos_ocv(rstats)
         precomputed_stats = {
             'rstats': rstats,
             'videos_ocv': videos_ocv,
+            'mirror': self.mirror,
         }
         small.save_pkl(fold/'precomputed_stats.pkl', precomputed_stats)
 
@@ -344,6 +347,13 @@ class Dataset_daly_ocv(Dataset_daly):
         precomputed_stats = small.load_pkl(fold/'precomputed_stats.pkl')
         self.rstats = precomputed_stats['rstats']
         self.videos_ocv = precomputed_stats['videos_ocv']
+        # If mirror in precomputed stats was different - brute replace
+        if self.mirror != precomputed_stats['mirror']:
+            log.info(('Mirror mismatch in precomputed stats. '
+                'We replace {} -> {}').format(
+                    precomputed_stats['mirror'], self.mirror))
+            for k, v in self.videos_ocv.items():
+                v['path'] = self.videos[k]['path']
 
 
 Vid_char = NewType('Vid_char', Vid)
@@ -428,10 +438,14 @@ class Dataset_charades(object):
                 d[xs[0]] = (xs[1], xs[2])
             return d
 
-        _action_labels = _get1(self._anno_fold/'Charades_v1_classes.txt')
-        _object_labels = _get1(self._anno_fold/'Charades_v1_objectclasses.txt')
-        _verb_labels = _get1(self._anno_fold/'Charades_v1_verbclasses.txt')
-        _action_mapping_labels = _get3(self._anno_fold/'Charades_v1_mapping.txt')
+        _action_labels = _get1(
+                self._anno_fold/'Charades_v1_classes.txt')
+        _object_labels = _get1(
+                self._anno_fold/'Charades_v1_objectclasses.txt')
+        _verb_labels = _get1(
+                self._anno_fold/'Charades_v1_verbclasses.txt')
+        _action_mapping_labels = _get3(
+                self._anno_fold/'Charades_v1_mapping.txt')
         self._action_labels = _action_labels
         self._object_labels = _object_labels
         self._verb_labels = _verb_labels
