@@ -487,7 +487,7 @@ def extract_sf_feats(workfolder, cfg_dict, add_args):
             CHECKPOINT_FILE_PATH, model, False, None,
             inflation=False, convert_from_caffe2=True,)
 
-    keyframes = create_keyframelist(dataset)[:256]
+    keyframes = create_keyframelist(dataset)
 
     if cf['extraction_mode'] == 'roi':
         if model_str == 'slowfast':
