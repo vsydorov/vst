@@ -8,6 +8,7 @@ from types import MethodType
 from typing import (Dict, Any)
 from tqdm import tqdm
 import cv2
+import av
 import concurrent.futures
 from sklearn.preprocessing import (StandardScaler)
 from sklearn.metrics import (
@@ -241,9 +242,12 @@ def tfm_video_center_crop(first64, th, tw):
     return first64, params
 
 
-def prepare_video(frames_u8):
+def prepare_video(frames_u8, flip=True):
     # frames_u8 is N,H,W,C (BGR)
-    frames_rgb = np.flip(frames_u8, -1)
+    if flip:
+        frames_rgb = np.flip(frames_u8, -1)
+    else:
+        frames_rgb = frames_u8
     # Resize
     X, resize_params = tfm_video_resize_threaded(
             frames_rgb, test_crop_size)
@@ -296,6 +300,56 @@ def _vis_boxes(out, bbox, frames_u8, X_f32c, bbox_tldr):
     snippets.qsave_video(out/'small_w_boxes.mp4', small_w_boxes)
 
 
+def sample_via_pyav(video_path, finds_to_sample):
+    container = av.open(str(video_path))
+
+    # Try to fetch the decoding information from the video head. Some of the
+    # videos does not support fetching the decoding information, for that case
+    # it will get None duration.
+    frames_length = container.streams.video[0].frames
+    duration = container.streams.video[0].duration  # how many time_base units
+
+    timebase = int(duration/frames_length)
+    pts_to_sample = timebase * finds_to_sample
+    start_pts = int(pts_to_sample[0])
+    end_pts = int(pts_to_sample[-1])
+
+    margin = 1024
+    seek_offset = max(start_pts - margin, 0)
+    stream_name = {"video": 0}
+    buffer_size = 0
+
+    stream = container.streams.video[0]
+    container.seek(seek_offset, any_frame=False, backward=True, stream=stream)
+    container.streams.video[0].thread_type = 'AUTO'
+    frames = {}
+    buffer_count = 0
+    max_pts = 0
+    for frame in container.decode(**stream_name):
+        max_pts = max(max_pts, frame.pts)
+        if frame.pts < start_pts:
+            continue
+        if frame.pts <= end_pts:
+            frames[frame.pts] = frame
+        else:
+            buffer_count += 1
+            frames[frame.pts] = frame
+            if buffer_count >= buffer_size:
+                break
+    pts_we_got = np.array(sorted(frames))
+    ssorted_indices = np.searchsorted(pts_we_got, pts_to_sample)
+
+    sampled_frames = []
+    for pts in pts_we_got[ssorted_indices]:
+        sampled_frames.append(frames[pts])
+    container.close()
+
+    sampled_frames_np = [frame.to_rgb().to_ndarray()
+            for frame in sampled_frames]
+    sampled_frames_np = np.stack(sampled_frames_np)
+    return sampled_frames_np
+
+
 class TDataset_over_keyframes(torch.utils.data.Dataset):
     def __init__(self, keyframes, model_nframes, model_sample,
             is_slowfast: bool, slowfast_alpha: int):
@@ -316,9 +370,13 @@ class TDataset_over_keyframes(torch.utils.data.Dataset):
         with vt_cv.video_capture_open(video_path) as vcap:
             frames_u8 = vt_cv.video_sample(vcap, finds_to_sample)
         frames_u8 = np.array(frames_u8)
+        frames_u8_rgb = np.flip(frames_u8, -1)
+        
+        frames_u8_pyav_rgb = sample_via_pyav(video_path, finds_to_sample)
 
         # Resize video, convert to torch tensor
-        Xt, resize_params, ccrop_params = prepare_video(frames_u8)
+        Xt, resize_params, ccrop_params = prepare_video(
+                frames_u8_pyav_rgb, flip=False)
 
         # Resolve pathways
         if self._is_slowfast:
