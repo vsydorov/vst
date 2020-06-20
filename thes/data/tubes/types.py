@@ -156,7 +156,7 @@ def dtindex_filter_split(
         ) -> Dict[TV_I, TV]:
     dwt_index_fdict = {}
     for dwt_index, v in dtindex_dict.items():
-        (vid, bunch_id, tube_id) = dwt_index
+        (vid, _, _) = dwt_index
         if vid in split_vids:
             dwt_index_fdict[dwt_index] = v
     return dwt_index_fdict

@@ -425,49 +425,6 @@ def _len_rescore_avstubes(av_stubes):
     return norm_av_stubes
 
 
-def _vis_scoresorted_tubes(out, dataset, wnms_av_stubes):
-    action = 'Drinking'
-    vfold = small.mkdir(out/action)
-    v_stubes = wnms_av_stubes[action]
-    flat_tubes = []
-    for vid, stubes in v_stubes.items():
-        for i_stube, stube in enumerate(stubes):
-            flat_tubes.append({'tube': stube, 'ind': (vid, i_stube)})
-    sorted_flat_tubes = sorted(flat_tubes,
-            key=lambda x: x['tube']['score'], reverse=True)
-
-    for i_sorted, flat_tube in enumerate(sorted_flat_tubes):
-        vid, i_stube = flat_tube['ind']
-        tube = flat_tube['tube']
-        score = tube['score']
-        sf, ef = tube['start_frame'], tube['end_frame']
-        frame_inds = tube['frame_inds']
-        video_fold = small.mkdir(vfold/f'{i_sorted:04d}_vid{vid}_{sf}_to_{ef}_score{score:02f}')
-        video_path = dataset.videos[vid]['path']
-
-        # Extract
-        with vt_cv.video_capture_open(video_path) as vcap:
-            frames_u8 = vt_cv.video_sample(
-                    vcap, frame_inds, debug_filename=video_path)
-        # Draw
-        drawn_frames_u8 = []
-        for i, (find, frame_BGR) in enumerate(zip(frame_inds, frames_u8)):
-            image = frame_BGR.copy()
-            box = tube['boxes'][i]
-            snippets.cv_put_box_with_text(image, box,
-                text='{} {} {:.2f}'.format(
-                    i, action, score))
-            drawn_frames_u8.append(image)
-
-        # # Save as images
-        # for find, image in zip(frame_inds, drawn_frames_u8):
-        #     cv2.imwrite(str(
-        #         video_fold/'Fr{:05d}.png'.format(find)), image)
-
-        # Save as video
-        snippets.qsave_video(video_fold/'overlaid.mp4', drawn_frames_u8)
-
-
 from thes.evaluation.ap.convert import (
         _convert_to_flat_representation,
         _compute_eligible_tubes_for_eval_weingroup

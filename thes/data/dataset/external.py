@@ -1,6 +1,7 @@
 """
 Basic classes that allow working with external datasets
 """
+import platform
 import copy
 import xml.etree.ElementTree as ET
 import subprocess
@@ -136,6 +137,15 @@ class Dataset_daly(object):
     def __init__(self, mirror):
         super().__init__()
         self.root_path = get_dataset_path('action/daly_take2')
+        if mirror == 'uname':
+            GOOD_NODES = ['gpuhost6', 'gpuhost7', 'gpuhost9']
+            fallback_mirror = 'scratch2'
+            node_name = platform.uname().node
+            if node_name in GOOD_NODES:
+                mirror = node_name
+            else:
+                mirror = fallback_mirror
+            log.info(f'{mirror=} set according to uname')
         self.mirror = mirror
         self._load_pkl()
 

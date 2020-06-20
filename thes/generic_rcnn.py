@@ -113,7 +113,8 @@ class Ncfg_generic_rcnn_eval:
             v = dataset.videos_ocv[vid]
             for action_name, instances in v['instances'].items():
                 for ins_ind, instance in enumerate(instances):
-                    frames = [kf['frame'] for kf in instance['keyframes']]
+                    frames = [kf['frame']
+                            for kf in instance['keyframes']]
                     to_cover_[vid] = \
                             to_cover_.get(vid, set()) | set(list(frames))
         frames_to_cover = \
