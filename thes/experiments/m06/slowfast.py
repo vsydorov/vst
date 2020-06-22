@@ -558,8 +558,8 @@ class Dataloader_isaver(
         loader = self.prepare_func(i_last)
         pbar = tqdm(loader, total=len(loader))
         for i_batch, data_input in enumerate(pbar):
-            result_dict, last_i = self.func(data_input)
-            result_cache.append(result_cache)
+            result_dict, i_last = self.func(data_input)
+            result_cache.append(result_dict)
             SAVE = False
             if self._save_every > 0:
                 SAVE |= (i_last - self._i_last_saved) >= self._save_every
@@ -923,6 +923,7 @@ def probe_philtubes_for_extraction(workfolder, cfg_dict, add_args):
     extraction:
         batch_size: [8, int]
         num_workers: [12, int]
+        save_interval: [300, int]
     frame_coverage:
         keyframes: [True, bool]
         subsample: [16, int]
@@ -1075,7 +1076,7 @@ def probe_philtubes_for_extraction(workfolder, cfg_dict, add_args):
     disaver_fold = small.mkdir(out/'disaver')
     total = len(connections_f)
     disaver = Dataloader_isaver(disaver_fold, total, func, prepare_func,
-            save_interval=300, log_interval=300)
+            save_interval=cf['extraction.save_interval'], log_interval=300)
     outputs = disaver.run()
     keys = next(iter(outputs)).keys()
     dict_outputs = {}
