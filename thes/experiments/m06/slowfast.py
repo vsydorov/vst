@@ -9,18 +9,17 @@ from types import MethodType
 from typing import (  # NOQA
         Dict, Any, List, Optional, Tuple, TypedDict, Set)
 from tqdm import tqdm
+import collections
+import concurrent.futures
+
 import cv2
 import av
-import concurrent.futures
-from sklearn.preprocessing import (StandardScaler)
-from sklearn.metrics import (
-    accuracy_score, roc_auc_score)
-from scipy.special import softmax
 
 import torch
 import torch.nn as nn
 import torch.utils.data
 import torch.nn.functional as F
+from torch.utils.data.dataloader import default_collate
 
 import slowfast.models
 import slowfast.utils.checkpoint as cu
@@ -417,23 +416,26 @@ class TDataset_over_keyframes(torch.utils.data.Dataset):
 
 
 class TDataset_over_connections(torch.utils.data.Dataset):
-    def __init__(self, connections_flist, dataset,
+    def __init__(self, dict_f, dataset,
             model_nframes, model_sample,
             is_slowfast: bool, slowfast_alpha: int,
             load_method='opencv'):
-        self.connections_flist = connections_flist
+        self.dict_f = dict_f
         self.dataset = dataset
         center_frame = (model_nframes-1)//2
-        self.sample_grid0 = (np.arange(model_nframes)-center_frame)*model_sample
+        self.sample_grid0 = (
+                np.arange(model_nframes)-center_frame)*model_sample
         self._is_slowfast = is_slowfast
         self._slowfast_alpha = slowfast_alpha
         self._load_method = load_method
 
     def __getitem__(self, index):
         # Extract frames
-        connections = self.connections_flist[index]
+        ckey, connections = list(self.dict_f.items())[index]
         vid = connections['vid']
         i0 = connections['frame_ind']
+        bboxes_ltrd = connections['boxes']
+        assert ckey == (vid, i0)
 
         video_path = str(self.dataset.videos_ocv[vid]['path'])
         nframes = self.dataset.videos_ocv[vid]['nframes']
@@ -473,18 +475,20 @@ class TDataset_over_connections(torch.utils.data.Dataset):
             frame_list = [Xt]
 
         # Bboxes
-        bboxes_tldr = []
-        for box_ltrd in connections['boxes']:
+        prepared_bboxes = []
+        for box_ltrd in bboxes_ltrd:
             prepared_bbox_tldr = prepare_box(
                 box_ltrd, resize_params, ccrop_params)
-            bboxes_tldr.append(prepared_bbox_tldr)
-        bboxes_tldr = {
-                'boxes': np.stack(bboxes_tldr, axis=0),
+            prepared_bboxes.append(prepared_bbox_tldr)
+        meta = {
+                'index': index,
+                'ckey': ckey,
+                'bboxes_tldr': np.stack(prepared_bboxes, axis=0),
                 'do_not_collate': True}
-        return index, frame_list, bboxes_tldr
+        return frame_list, meta
 
     def __len__(self) -> int:
-        return len(self.connections_flist)
+        return len(self.dict_f)
 
 
 def create_keyframelist(dataset):
@@ -542,11 +546,11 @@ class Dataloader_isaver(
         self._time_last_log = time.perf_counter()
         self._i_last_saved = 0
 
-        Ys_np = []
+        result_cache = []
 
         def flush_purge():
-            self.result.extend(Ys_np)
-            Ys_np.clear()
+            self.result.extend(result_cache)
+            result_cache.clear()
             with small.QTimer('saving pkl'):
                 self._save(i_last)
             self._purge_intermediate_files()
@@ -554,18 +558,18 @@ class Dataloader_isaver(
         loader = self.prepare_func(i_last)
         pbar = tqdm(loader, total=len(loader))
         for i_batch, data_input in enumerate(pbar):
-            II_np, Y_np = self.func(data_input)
-            Ys_np.append(Y_np)
-            i_last = II_np[-1]
-            PURGE = False
+            result_dict, last_i = self.func(data_input)
+            result_cache.append(result_cache)
+            SAVE = False
             if self._save_every > 0:
-                PURGE |= (i_last - self._i_last_saved) >= self._save_every
+                SAVE |= (i_last - self._i_last_saved) >= self._save_every
             if self._save_interval:
                 since_last_save = time.perf_counter() - self._time_last_save
-                PURGE |= since_last_save > self._save_interval
-            if PURGE:
+                SAVE |= since_last_save > self._save_interval
+            if SAVE:
                 flush_purge()
                 self._time_last_save = time.perf_counter()
+                self._i_last_saved = i_last
             if self._log_interval:
                 since_last_log = time.perf_counter() - self._time_last_log
                 if since_last_log > self._log_interval:
@@ -829,11 +833,12 @@ def group_tubes_on_frame_level(
             if len(common_finds) == 0:
                 continue
             good_tube_boxes = tube['boxes'][comm1]
-        for find, box in zip(common_finds, good_tube_boxes):
-            c = connections.setdefault((vid, find),
-                    Box_connections_dwti(
-                        vid=vid, frame_ind=find,
-                        dwti_sources=[], boxes=[]))
+        for frame_ind, box in zip(common_finds, good_tube_boxes):
+            frame_ind = int(frame_ind)
+            c = connections.setdefault((vid, frame_ind),
+                Box_connections_dwti(
+                    vid=vid, frame_ind=frame_ind,
+                    dwti_sources=[], boxes=[]))
             c['dwti_sources'].append(dwt_index)
             c['boxes'].append(box)
     return connections
@@ -863,10 +868,6 @@ def get_daly_keyframes_to_cover(
     return frames_to_cover
 
 
-from torch.utils.data.dataloader import default_collate
-import collections
-
-
 def sequence_batch_collate_v2(batch):
     assert isinstance(batch[0], collections.abc.Sequence), \
             'Only sequences supported'
@@ -887,7 +888,8 @@ def sequence_batch_collate_v2(batch):
 
 def _perform_connections_split(connections_f, cc, ct):
     ckeys = list(connections_f.keys())
-    weights_dict = {k: len(v['boxes']) for k, v in connections_f.items()}
+    weights_dict = {k: len(v['boxes'])
+            for k, v in connections_f.items()}
     weights = np.array(list(weights_dict.values()))
     ii_ckeys_split = snippets.weighted_array_split(
             np.arange(len(ckeys)), weights, ct)
@@ -898,14 +900,10 @@ def _perform_connections_split(connections_f, cc, ct):
         weight = np.sum([ktw[ckey] for ckey in ckeys_])
         weights_split.append(weight)
     chunk_ckeys = ckeys_split[cc]
-    log.info(f'Quick split stats [{cc,ct=}]: ''Frames(boxes): {}({}) -> {}({})'.format(
-        len(ckeys), np.sum(weights),
-        len(chunk_ckeys), weights_split[cc]))
-    log.debug(f'Full stats [{cc,ct=}]:\n'
-            f'ckeys_split={pprint.pformat(ckeys_split)}\n'
-            f'{weights_split=}\n'
-            f'{chunk_ckeys=}\n'
-            f'{weights_split[cc]=}')
+    log.info(f'Quick split stats [{cc,ct=}]: '
+        'Frames(boxes): {}({}) -> {}({})'.format(
+            len(ckeys), np.sum(weights),
+            len(chunk_ckeys), weights_split[cc]))
     chunk_connections_f = {k: connections_f[k] for k in chunk_ckeys}
     return chunk_connections_f
 
@@ -1028,29 +1026,30 @@ def probe_philtubes_for_extraction(workfolder, cfg_dict, add_args):
 
     BATCH_SIZE = cf['extraction.batch_size']
     NUM_WORKERS = cf['extraction.num_workers']
+    # NUM_WORKERS = 0
 
     norm_mean_t = np_to_gpu(norm_mean)
     norm_std_t = np_to_gpu(norm_std)
 
     def prepare_func(start_i):
-        connections_flist = list(connections_f.values())
-        remaining_connections = connections_flist[start_i+1:]
+        # start_i defined wrt keys in connections_f
+        remaining_dict = dict(list(
+            connections_f.items())[start_i+1:])
         tdataset_kf = TDataset_over_connections(
-                remaining_connections, dataset,
-                model_nframes, model_sample,
-                is_slowfast, slowfast_alpha)
+            remaining_dict, dataset, model_nframes,
+            model_sample, is_slowfast, slowfast_alpha)
         loader = torch.utils.data.DataLoader(tdataset_kf,
-                batch_size=BATCH_SIZE, shuffle=False,
-                num_workers=NUM_WORKERS, pin_memory=True,
-                collate_fn=sequence_batch_collate_v2)
+            batch_size=BATCH_SIZE, shuffle=False,
+            num_workers=NUM_WORKERS, pin_memory=True,
+            collate_fn=sequence_batch_collate_v2)
         return loader
 
     def func(data_input):
-        II, Xts, bbox_dicts = data_input
+        Xts, metas = data_input
         Xts_f32c = [to_gpu_normalize_permute(
             x, norm_mean_t, norm_std_t) for x in Xts]
         # bbox transformations
-        bboxes_np = [b['boxes'] for b in bbox_dicts]
+        bboxes_np = [m['bboxes_tldr'] for m in metas]
         counts = np.array([len(x) for x in bboxes_np])
         batch_indices = np.repeat(np.arange(len(counts)), counts)
         bboxes0 = np.c_[batch_indices, np.vstack(bboxes_np)]
@@ -1059,20 +1058,24 @@ def probe_philtubes_for_extraction(workfolder, cfg_dict, add_args):
 
         with torch.no_grad():
             result = extractor.forward(Xts_f32c, bboxes0_c)
-        result_np = {k: v.cpu().numpy()
-                for k, v in result.items()}
-        result_np = {k: np.split(
-            result_np['roipooled'],
-            np.cumsum(counts), axis=0)[:-1]
-            for k, v in result_np.items()}
-        # Split by batch size
-        II_np = II.cpu().numpy()
-        return II_np, result_np
+        result_dict = {}
+        for k, v in result.items():
+            out_np = v.cpu().numpy()
+            out_split = np.split(out_np,
+                np.cumsum(counts), axis=0)[:-1]
+            result_dict[k] = out_split
+
+        # Find last index over global structure
+        # back to tuple, since dataloader casts to list
+        ckey = tuple(metas[-1]['ckey'])
+        ckeys = list(connections_f.keys())
+        last_i = ckeys.index(ckey)
+        return result_dict, last_i
 
     disaver_fold = small.mkdir(out/'disaver')
     total = len(connections_f)
     disaver = Dataloader_isaver(disaver_fold, total, func, prepare_func,
-            save_interval=60)
+            save_interval=300, log_interval=300)
     outputs = disaver.run()
     keys = next(iter(outputs)).keys()
     dict_outputs = {}
