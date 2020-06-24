@@ -323,8 +323,8 @@ def torchmlp_feat_classify_test(workfolder, cfg_dict, add_args):
     with small.np_printoptions(precision=2):
         log.info('Accuracy; mean: {:.2f}, all: {} '.format(np.mean(acc), acc))
         log.info('Roc_auc; mean: {:.2f} all: {} '.format(np.mean(roc_auc), roc_auc))
-    log.info(f'Mean Recall\n{recall}')
-    log.info(f'mean AP:\n{ap}')
+    log.info(f'Mean Recall\n{recall_}')
+    log.info(f'mean AP:\n{ap_}')
 
 def torchmlp_hack_around_rcnn_features(workfolder, cfg_dict, add_args):
     out, = snippets.get_subfolders(workfolder, ['out'])
@@ -583,4 +583,4 @@ def tubefeats_train_mlp(workfolder, cfg_dict, add_args):
     train_lr = 1.0e-05
     weight_decay = 5.0e-2
     optimizer = torch.optim.AdamW(model.parameters(),
-        lr=train_lr, weight_decay=weight_decay)
+            lr=train_lr, weight_decay=weight_decay)
