@@ -1,3 +1,4 @@
+import h5py
 import numpy as np
 import pprint
 import pandas as pd
@@ -1086,3 +1087,116 @@ def probe_philtubes_for_extraction(workfolder, cfg_dict, add_args):
 
     small.save_pkl(out/'dict_outputs.pkl', dict_outputs)
     small.save_pkl(out/'connections_f.pkl', connections_f)
+
+
+# from thes.experiments.m02.tubes import _gather_check_all_present
+
+
+def _gather_check_all_present(gather_paths, filenames):
+    # Check missing
+    missing_paths = []
+    for path in gather_paths:
+        for filename in filenames:
+            fpath = Path(path)/filename
+            if not fpath.exists():
+                missing_paths.append(fpath)
+    if len(missing_paths):
+        log.error('Some paths are MISSING:\n{}'.format(
+            pprint.pformat(missing_paths)))
+        return False
+    return True
+
+
+def combine_probed_philtubes(workfolder, cfg_dict, add_args):
+    out, = snippets.get_subfolders(workfolder, ['out'])
+    cfg = snippets.YConfig(cfg_dict)
+    cfg.set_defaults_handling(['inputs.cfolders'])
+    cfg.set_deftype("""
+    inputs:
+        cfolders: [~, ~]
+    dataset:
+        name: ['daly', ['daly']]
+        cache_folder: [~, str]
+        mirror: ['uname', ~]
+    tubes_dwein: [~, str]
+    frame_coverage:
+        keyframes: [True, bool]
+        subsample: [16, int]
+    """)
+    cf = cfg.parse()
+
+    # DALY Dataset
+    dataset = Dataset_daly_ocv(cf['dataset.mirror'])
+    dataset.populate_from_folder(cf['dataset.cache_folder'])
+
+    # Load tubes
+    tubes_dwein: Dict[I_dwein, T_dwein] = \
+            loadconvert_tubes_dwein(cf['tubes_dwein'])
+    # Frames to cover: keyframes and every 16th frame
+    vids = list(dataset.videos_ocv.keys())
+    frames_to_cover: Dict[Vid_daly, np.ndarray] = \
+            get_daly_keyframes_to_cover(dataset, vids,
+                    cf['frame_coverage.keyframes'],
+                    cf['frame_coverage.subsample'])
+    connections_f: Dict[Tuple[Vid_daly, int], Box_connections_dwti]
+    connections_f = group_tubes_on_frame_level(
+            tubes_dwein, frames_to_cover)
+
+    # Load inputs now
+    input_cfolders = cf['inputs.cfolders']
+    if not _gather_check_all_present(input_cfolders, [
+            'dict_outputs.pkl', 'connections_f.pkl']):
+        return
+
+    # Loading all piecemeal connections
+    i_cons = {}
+    for i, path in enumerate(input_cfolders):
+        path = Path(path)
+        local_connections_f = small.load_pkl(path/'connections_f.pkl')
+        i_cons[i] = local_connections_f
+    # Check consistency
+    grouped_cons = {}
+    for c in i_cons.values():
+        grouped_cons.update(c)
+    if grouped_cons.keys() != connections_f.keys():
+        log.error('Loaded connections inconsistent with expected ones')
+
+    partbox_numbering = []
+    for lc in i_cons.values():
+        nboxes = np.sum([len(c['boxes']) for c in lc.values()])
+        partbox_numbering.append(nboxes)
+    partbox_numbering = np.r_[0, np.cumsum(partbox_numbering)]
+
+    # Drop the pretense, we gonna use roipool feats here
+    hf = h5py.File(out/"feats.h5", "a", libver="latest")
+    dset = hf.create_dataset("roipooled_feats",
+            (partbox_numbering[-1], 2304), dtype=np.float16)
+
+    # Piecemeal conversion
+    for i, path in enumerate(input_cfolders):
+        success_file = out/f'{i}.merged'
+        if success_file.exists():
+            continue
+        log.info(f'Merging chunk {i=} at {path=}')
+        path = Path(path)
+        with small.QTimer('Unpickling'):
+            local_dict_outputs = small.load_pkl(path/'dict_outputs.pkl')
+        roipooled_feats = local_dict_outputs['roipooled']
+        with small.QTimer('Vstack'):
+            cat_roipooled_feats = np.vstack(roipooled_feats)
+        with small.QTimer('to float16'):
+            feats16 = cat_roipooled_feats.astype(np.float16)
+        b, e = partbox_numbering[i], partbox_numbering[i+1]
+        assert e-b == feats16.shape[0]
+        dset[b:e] = feats16
+        success_file.touch()
+
+    # Create mapping of indices
+    box_inds = [0]
+    for c in connections_f.values():
+        box_inds.append(len(c['boxes']))
+    box_inds = np.cumsum(box_inds)
+    box_inds2 = np.c_[box_inds[:-1], box_inds[1:]]
+
+    small.save_pkl(out/'connections_f.pkl', connections_f)
+    small.save_pkl(out/'box_inds2.pkl', box_inds2)

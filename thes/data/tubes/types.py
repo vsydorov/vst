@@ -12,9 +12,10 @@ from thes.data.dataset.external import (
 log = logging.getLogger(__name__)
 
 # Index of DALY weinzaepful tube (as it was in py2 .pkl)
+# (vid, bunch_id, tube_id)
 I_dwein = Tuple[Vid_daly, int, int]
 
-# Index of DALY ground truth tube
+# Index of DALY ground truth tube (vid, action_name, ins_id)
 I_dgt = Tuple[Vid_daly, Action_name_daly, int]
 
 I_tube = Union[I_dwein, I_dgt]
@@ -130,6 +131,17 @@ def get_daly_gt_tubes(
                     'boxes': np.array(boxes)}
                 dgt_tubes[index] = tube
     return dgt_tubes
+
+
+def remove_hard_dgt_tubes(tubes_dgt):
+    tubes_dgt_nonhard = {}
+    for index_dgt, tube_gt in tubes_dgt.items():
+        fl = tube_gt['flags']
+        diff = fl['isReflection'] or fl['isAmbiguous']
+        if diff:
+            continue
+        tubes_dgt_nonhard[index_dgt] = tube_gt
+    return tubes_dgt_nonhard
 
 
 def push_into_avdict(dgt_tubes: Dict[I_dgt, TV]) -> AV_dict[TV]:
