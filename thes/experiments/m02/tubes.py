@@ -690,7 +690,7 @@ def merge_scores_avstubes(workfolder, cfg_dict, add_args):
         comb_dfdicts[comb_name] = dfdict
 
     log.info('Individual results:')
-    for comb, dfdict in comb_dfdicts.items():
+    for comb_name, dfdict in comb_dfdicts.items():
         log.info(f'Results for {comb_name}:')
         _print_quick_evaluation_stats(dfdict)
 

@@ -493,7 +493,7 @@ def hack_w_tubefeats(workfolder, cfg_dict, add_args):
     dwti_binds = {k: np.array(sorted(v)) for k, v in dwti_binds.items()}
 
     # Separate out the test tube features
-    tubes_dwein_test = dtindex_filter_split(tubes_dwein, Vgroup.trainval)
+    tubes_dwein_test = dtindex_filter_split(tubes_dwein, Vgroup.test)
     test_binds = []
     for t in tubes_dwein_test:
         test_binds.append(dwti_binds[t])
@@ -540,7 +540,7 @@ def hack_w_tubefeats(workfolder, cfg_dict, add_args):
         for i, b in enumerate(np.r_[0, counts[:-1]]):
             e = counts[i]
             preds = flat_test_preds_sm_np[b:e]
-            test_preds_avg.append(preds.sum(0))
+            test_preds_avg.append(preds.mean(0))
         test_preds_avg = np.vstack(test_preds_avg)
 
         # assign scores to the test tubes
@@ -561,23 +561,22 @@ def hack_w_tubefeats(workfolder, cfg_dict, add_args):
     isaver = snippets.Isaver_simple(
             small.mkdir(out/'isaver_ntrials'), range(n_trials), experiment)
     trial_results = isaver.run()
-    import pudb; pudb.set_trace()  # XXX BREAKPOINT
-    pass
 
-    # av_stubes_ = av_stubes_above_score(
-    #         av_stubes, 0.0)
-    # av_stubes_ = compute_nms_for_av_stubes(
-    #         av_stubes_, 0.3)
-    # iou_thresholds = [.3, .5, .7]
-    # tubes_dgt_test = dtindex_filter_split(tubes_dgt_nh, Vgroup.trainval)
-    # av_gt_tubes_test: AV_dict[T_dgt] = push_into_avdict(tubes_dgt_test)
-    # df_recall_s_nodiff = compute_recall_for_avtubes_as_dfs(
-    #         av_gt_tubes_test, av_stubes_, iou_thresholds, False)[0]
-    # df_ap_s_nodiff = compute_ap_for_avtubes_as_df(
-    #         av_gt_tubes_test, av_stubes_, iou_thresholds, False, False)
-    # return df_ap_s_nodiff
-    # ap = zip(*trial_results)
-    # mean_ap = pd.concat(
+    ap = []
+    for av_stubes in trial_results:
+        av_stubes_ = av_stubes_above_score(av_stubes, 0.0)
+        av_stubes_ = compute_nms_for_av_stubes(av_stubes_, 0.3)
+        iou_thresholds = [.3, .5, .7]
+        tubes_dgt_test = dtindex_filter_split(tubes_dgt_nh, Vgroup.test)
+        av_gt_tubes_test: AV_dict[T_dgt] = push_into_avdict(tubes_dgt_test)
+        df_ap_s_nodiff = compute_ap_for_avtubes_as_df(
+                av_gt_tubes_test, av_stubes_, iou_thresholds, False, False)
+        ap.append(df_ap_s_nodiff)
+    ap = zip(*trial_results)
+    ap_ = pd.concat(ap, keys=range(len(ap)), axis=1).mean(axis=1, level=1)
+    ap_ = (ap_*100).round(2)
+    log.info(f'mean AP:\n{ap_}')
+
 
 def tubefeats_train_mlp(workfolder, cfg_dict, add_args):
     train_lr = 1.0e-05
