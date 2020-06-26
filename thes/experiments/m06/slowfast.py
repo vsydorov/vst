@@ -10,7 +10,6 @@ from types import MethodType
 from typing import (  # NOQA
         Dict, Any, List, Optional, Tuple, TypedDict, Set)
 from tqdm import tqdm
-import collections
 import concurrent.futures
 
 import cv2
@@ -20,7 +19,6 @@ import torch
 import torch.nn as nn
 import torch.utils.data
 import torch.nn.functional as F
-from torch.utils.data.dataloader import default_collate
 
 import slowfast.models
 import slowfast.utils.checkpoint as cu
@@ -38,7 +36,8 @@ from thes.data.tubes.types import (
     I_dwein, T_dwein, T_dwein_scored, I_dgt, T_dgt,
     get_daly_gt_tubes, push_into_avdict,
     AV_dict, loadconvert_tubes_dwein, Objaction_dets,
-    dtindex_filter_split, av_stubes_above_score)
+    dtindex_filter_split, av_stubes_above_score,
+    Box_connections_dwti)
 from thes.data.tubes.nms import (
     compute_nms_for_av_stubes,)
 from thes.evaluation.recall import (
@@ -48,6 +47,7 @@ from thes.evaluation.ap.convert import (
 from thes.tools import snippets
 from thes.slowfast.cfg import (basic_sf_cfg)
 from thes.caffe import (nicolas_net, model_test_get_image_blob)
+from thes.pytorch import sequence_batch_collate_v2
 from thes.data.tubes.routines import (
         score_ftubes_via_objaction_overlap_aggregation)
 
@@ -802,13 +802,6 @@ def extract_caffe_rcnn_feats(workfolder, cfg_dict, add_args):
     small.save_pkl(out/'keyframes.pkl', keyframes)
 
 
-class Box_connections_dwti(TypedDict):
-    vid: Vid_daly
-    frame_ind: int
-    dwti_sources: List[I_dwein]  # N
-    boxes: List[np.ndarray]  # N, 4
-
-
 def group_tubes_on_frame_level(
         tubes_dwein: Dict[I_dwein, T_dwein],
         frames_to_cover: Optional[Dict[Vid_daly, np.ndarray]]
@@ -867,24 +860,6 @@ def get_daly_keyframes_to_cover(
                 good |= set(range(s, e+1, every_n))
         frames_to_cover[vid] = np.array(sorted(good))
     return frames_to_cover
-
-
-def sequence_batch_collate_v2(batch):
-    assert isinstance(batch[0], collections.abc.Sequence), \
-            'Only sequences supported'
-    # From gunnar code
-    transposed = zip(*batch)
-    collated = []
-    for samples in transposed:
-        if isinstance(samples[0], collections.abc.Mapping) \
-               and 'do_not_collate' in samples[0]:
-            c_samples = samples
-        elif getattr(samples[0], 'do_not_collate', False) is True:
-            c_samples = samples
-        else:
-            c_samples = default_collate(samples)
-        collated.append(c_samples)
-    return collated
 
 
 def _perform_connections_split(connections_f, cc, ct):
@@ -1077,7 +1052,7 @@ def probe_philtubes_for_extraction(workfolder, cfg_dict, add_args):
     disaver_fold = small.mkdir(out/'disaver')
     total = len(connections_f)
     disaver = Dataloader_isaver(disaver_fold, total, func, prepare_func,
-            save_interval=cf['extraction.save_interval'], log_interval=300)
+        save_interval=cf['extraction.save_interval'], log_interval=300)
     outputs = disaver.run()
     keys = next(iter(outputs)).keys()
     dict_outputs = {}
@@ -1122,6 +1097,7 @@ def combine_probed_philtubes(workfolder, cfg_dict, add_args):
     frame_coverage:
         keyframes: [True, bool]
         subsample: [16, int]
+    output_type: ['h5', ['h5', 'np', 'h5_chunked']]
     """)
     cf = cfg.parse()
 
@@ -1167,10 +1143,33 @@ def combine_probed_philtubes(workfolder, cfg_dict, add_args):
         partbox_numbering.append(nboxes)
     partbox_numbering = np.r_[0, np.cumsum(partbox_numbering)]
 
+    # Create mapping of indices
+    box_inds = [0]
+    for c in connections_f.values():
+        box_inds.append(len(c['boxes']))
+    box_inds = np.cumsum(box_inds)
+    box_inds2 = np.c_[box_inds[:-1], box_inds[1:]]
+
+    small.save_pkl(out/'connections_f.pkl', connections_f)
+    small.save_pkl(out/'box_inds2.pkl', box_inds2)
+
     # Drop the pretense, we gonna use roipool feats here
-    hf = h5py.File(out/"feats.h5", "a", libver="latest")
-    dset = hf.create_dataset("roipooled_feats",
-            (partbox_numbering[-1], 2304), dtype=np.float16)
+    output_type = cf['output_type']
+    if output_type == 'h5':
+        hf = h5py.File(out/"feats.h5", "a", libver="latest")
+        dset = hf.create_dataset("roipooled_feats",
+                (partbox_numbering[-1], 2304), dtype=np.float16)
+    elif output_type == 'h5_chunked':
+        hf = h5py.File(out/"feats.h5", "a", libver="latest")
+        dset = hf.create_dataset("roipooled_feats",
+                (partbox_numbering[-1], 2304),
+                chunks=True, dtype=np.float16)
+    elif output_type == 'np':
+        np_filename = str(out/'feats.npy')
+        dset = np.lib.format.open_memmap(np_filename, 'w+',
+                dtype=np.float16, shape=(partbox_numbering[-1], 2304))
+    else:
+        raise RuntimeError()
 
     # Piecemeal conversion
     for i, path in enumerate(input_cfolders):
@@ -1188,15 +1187,13 @@ def combine_probed_philtubes(workfolder, cfg_dict, add_args):
             feats16 = cat_roipooled_feats.astype(np.float16)
         b, e = partbox_numbering[i], partbox_numbering[i+1]
         assert e-b == feats16.shape[0]
-        dset[b:e] = feats16
+        with small.QTimer('Saving to disk chunk {i=}'):
+            dset[b:e] = feats16
         success_file.touch()
 
-    # Create mapping of indices
-    box_inds = [0]
-    for c in connections_f.values():
-        box_inds.append(len(c['boxes']))
-    box_inds = np.cumsum(box_inds)
-    box_inds2 = np.c_[box_inds[:-1], box_inds[1:]]
-
-    small.save_pkl(out/'connections_f.pkl', connections_f)
-    small.save_pkl(out/'box_inds2.pkl', box_inds2)
+    if output_type in ['h5', 'h5_chunked']:
+        hf.close()
+    elif output_type == 'np':
+        dset.close()
+    else:
+        raise RuntimeError()

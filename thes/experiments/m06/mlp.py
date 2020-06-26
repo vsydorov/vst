@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import logging
 from pathlib import Path
-from typing import (Dict, Any, Optional, List, cast)
+from typing import (Dict, Any, Optional, List, cast, Tuple)
 from sklearn.preprocessing import (StandardScaler)
 from sklearn.metrics import (
     accuracy_score, roc_auc_score)
@@ -24,7 +24,8 @@ from thes.data.tubes.types import (
     I_dwein, T_dwein, T_dwein_scored, I_dgt, T_dgt,
     get_daly_gt_tubes, remove_hard_dgt_tubes, push_into_avdict,
     AV_dict, loadconvert_tubes_dwein, Objaction_dets,
-    dtindex_filter_split, av_stubes_above_score)
+    dtindex_filter_split, av_stubes_above_score,
+    Box_connections_dwti)
 from thes.data.tubes.nms import (
     compute_nms_for_av_stubes,)
 from thes.evaluation.recall import (
@@ -37,6 +38,7 @@ from thes.data.tubes.routines import (
 from thes.data.tubes.routines import (
     spatial_tube_iou_v3,
     temporal_ious_where_positive)
+from thes.pytorch import (sequence_batch_collate_v2, default_collate)
 
 log = logging.getLogger(__name__)
 
@@ -171,7 +173,7 @@ class Ncfg_mlp:
             Y = np.array([kf['action_id'] for kf in kf])
             X = scaler.transform(X)
 
-        return D_trainval, D_train, D_val, D_test
+        return D_trainval, D_train, D_val, D_test, scaler
 
     @classmethod
     def create_model(self, dataset, outputs, H):
@@ -258,6 +260,133 @@ class Ncfg_mlp:
         return df_recall_s_nodiff, df_ap_s_nodiff
 
 
+class Net_mlp_featcls2(nn.Module):
+    def __init__(self, D_in, D_out, H, dropout_rate=0.5):
+        super().__init__()
+        self.linear1 = nn.Linear(D_in, H)
+        self.linear2 = nn.Linear(H, D_out)
+        self.dropout = nn.Dropout(dropout_rate)
+        # self.bn = nn.BatchNorm1d(H, momentum=0.1)
+
+    def forward(self, x):
+        x = self.linear1(x)
+        x = F.relu(x)
+        x = self.dropout(x)
+        # x = self.bn(x)
+        x = self.linear2(x)
+        return x
+
+
+def record_overlaps(tubes_dgt, tubes_dwein):
+    overlap_hits = {}
+    for dgt_index, gt_tube in tqdm(tubes_dgt.items(),
+            total=len(tubes_dgt)):
+        vid, action_name, ins_id = dgt_index
+        dwt_vid = {k: v for k, v in tubes_dwein.items()
+                if k[0] == vid}
+        dwt_vid_keys = list(dwt_vid.keys())
+        dwt_vid_values = list(dwt_vid.values())
+        dwt_frange = np.array([
+            (x['start_frame'], x['end_frame']) for x in dwt_vid_values])
+        # Temporal
+        t_ious, pids = temporal_ious_where_positive(
+            gt_tube['start_frame'], gt_tube['end_frame'], dwt_frange)
+        # Spatial (where temporal >0)
+        dwt_intersect = [dwt_vid_values[pid] for pid in pids]
+        sp_mious = [spatial_tube_iou_v3(p, gt_tube)
+                for p in dwt_intersect]
+        for p, t_iou, sp_miou in zip(pids, t_ious, sp_mious):
+            st_iou = t_iou * sp_miou
+            if st_iou > 0:
+                dwt_vid = dwt_vid_keys[p]
+                overlap_hits.setdefault(dwt_vid, []).append(
+                        [action_name, (t_iou, sp_miou, st_iou)])
+    best_ious = {}
+    for k, v in overlap_hits.items():
+        vsorted_last = sorted(v, key=lambda x: x[1][0])[-1]
+        action_name = vsorted_last[0]
+        st_miou = vsorted_last[1][2]
+        best_ious[k] = (action_name, st_miou)
+    return best_ious
+
+
+def create_synthetic_tube_labels(tubes_dwein, best_ious):
+    # Assign to classes
+    POS_THRESH = 0.5
+    HN_THRESH = 0.3
+    labels: Dict[I_dgt, str] = {}
+    for dwt_index in tubes_dwein.keys():
+        label = 'background'
+        if dwt_index in best_ious:
+            best_cls, best_iou = best_ious[dwt_index]
+            if best_iou > POS_THRESH:
+                label = best_cls
+            elif 0 < best_iou < HN_THRESH:
+                label = 'background_hard'
+            else:
+                label = 'none'
+        labels[dwt_index] = label
+    return labels
+
+
+def _quick_keyframe_datasets(cf, Vgroup):
+    # Produce keyframe datasets realquick
+    keyframes_featfold = Path(cf['inputs.keyframes_featfold'])
+    keyframes = small.load_pkl(keyframes_featfold/'keyframes.pkl')
+    outputs = small.load_pkl(keyframes_featfold/'dict_outputs.pkl')['roipooled']
+    D_trainval, D_train, D_val, D_test, scaler = \
+            Ncfg_mlp.split_features(outputs, keyframes, Vgroup)
+    return D_trainval, D_train, D_val, D_test, scaler
+
+
+def get_dwti_h5_mapping(
+        connections_f, box_inds2
+        ) -> Dict[I_dwein, np.ndarray]:
+    dwti_h5_inds: Dict[I_dwein, np.ndarray] = {}
+    for con, bi2 in zip(connections_f.values(), box_inds2):
+        bi_range = np.arange(bi2[0], bi2[1])
+        for dwti, bi in zip(con['dwti_sources'], bi_range):
+            dwti_h5_inds.setdefault(dwti, []).append(bi)
+    dwti_h5_inds = {k: np.array(sorted(v)) for k, v in dwti_h5_inds.items()}
+    return dwti_h5_inds
+
+
+class TD_over_h5(torch.utils.data.Dataset):
+    def __init__(self, h5_path, dwti_h5_inds, ilabels, np_seed,
+            labels_border, scaler):
+        self.hf = h5py.File(h5_path, 'r', libver="latest")
+        self.dwti_h5_inds = dwti_h5_inds
+        self.ilabels_kv = list(ilabels.items())
+        self.rstate = np.random.RandomState(np_seed)
+        self.labels_border = labels_border
+        self.scaler = scaler
+
+    def __getitem__(self, index):
+        linds = self.labels_border[index]
+        # Choose h5 inds (1 frame per tube)
+        chosen_h5_inds = []
+        labels = []
+        for li in linds:
+            dwti, label = self.ilabels_kv[li]
+            binds = self.dwti_h5_inds[dwti]
+            chosen_h5_inds.append(self.rstate.choice(binds))
+            labels.append(label)
+        chosen_h5_inds = np.array(chosen_h5_inds)
+        labels = np.array(labels)
+        # Perform h5 feature extraction
+        dset = self.hf["roipooled_feats"]
+        as_ind = np.argsort(chosen_h5_inds)
+        ras_ind = np.argsort(as_ind)
+        h5_inds_asorted = chosen_h5_inds[as_ind]
+        feats_asorted = dset[h5_inds_asorted, :]
+        feats = feats_asorted[ras_ind].astype(np.float32)
+        sc_feats = self.scaler.transform(feats)
+        return sc_feats, labels
+
+    def __len__(self):
+        return len(self.labels_border)
+
+
 # Experiments
 
 
@@ -276,7 +405,7 @@ def torchmlp_feat_classify_validate(workfolder, cfg_dict, add_args):
     featname = cf['inputs.featname']
     keyframes = small.load_pkl(computed_featfold/'keyframes.pkl')
     outputs = small.load_pkl(computed_featfold/'dict_outputs.pkl')[featname]
-    D_trainval, D_train, D_val, D_test = \
+    D_trainval, D_train, D_val, D_test, _ = \
             Ncfg_mlp.split_features(outputs, keyframes, Vgroup)
 
     torch.manual_seed(initial_seed)
@@ -302,7 +431,7 @@ def torchmlp_feat_classify_test(workfolder, cfg_dict, add_args):
     log_period = cf['log_period']
     keyframes = small.load_pkl(computed_featfold/'keyframes.pkl')
     outputs = small.load_pkl(computed_featfold/'dict_outputs.pkl')[featname]
-    D_trainval, D_train, D_val, D_test = \
+    D_trainval, D_train, D_val, D_test, _ = \
             Ncfg_mlp.split_features(outputs, keyframes, Vgroup)
 
     def experiment(i):
@@ -363,23 +492,6 @@ def torchmlp_hack_around_rcnn_features(workfolder, cfg_dict, add_args):
     log.info(f'AP=\n{df_ap_s_nodiff}')
 
 
-class Net_mlp_featcls2(nn.Module):
-    def __init__(self, D_in, D_out, H, dropout_rate=0.5):
-        super().__init__()
-        self.linear1 = nn.Linear(D_in, H)
-        self.linear2 = nn.Linear(H, D_out)
-        self.dropout = nn.Dropout(dropout_rate)
-        # self.bn = nn.BatchNorm1d(H, momentum=0.1)
-
-    def forward(self, x):
-        x = self.linear1(x)
-        x = F.relu(x)
-        x = self.dropout(x)
-        # x = self.bn(x)
-        x = self.linear2(x)
-        return x
-
-
 def hack_w_tubefeats(workfolder, cfg_dict, add_args):
     out, = snippets.get_subfolders(workfolder, ['out'])
     cfg = snippets.YConfig(cfg_dict)
@@ -416,96 +528,37 @@ def hack_w_tubefeats(workfolder, cfg_dict, add_args):
     dataset.populate_from_folder(cf['dataset.cache_folder'])
     Vgroup = Ncfg_mlp.get_vids(cf, dataset)
 
-    tubes_featfold = Path(cf['inputs.featfold'])
-
-    # // Load tubes
+    # / Load tubes
+    # // Weintubes
     tubes_dwein: Dict[I_dwein, T_dwein] = \
             loadconvert_tubes_dwein(cf['tubes_dwein'])
+    tubes_dwein_test = dtindex_filter_split(tubes_dwein, Vgroup.test)
+    # // GT tubes
     tubes_dgt: Dict[I_dgt, T_dgt] = get_daly_gt_tubes(dataset)
     tubes_dgt_nh = remove_hard_dgt_tubes(tubes_dgt)
 
-    # // Divide trainval tubes into classes (intersection with GT tubes)
-    tubes_dwein_trainval = dtindex_filter_split(tubes_dwein, Vgroup.trainval)
-    tubes_dgt_trainval = dtindex_filter_split(tubes_dgt_nh, Vgroup.trainval)
-    overlap_hits = {}
-    for dgt_index, gt_tube in tqdm(tubes_dgt_trainval.items(),
-            total=len(tubes_dgt_trainval)):
-        vid, action_name, ins_id = dgt_index
-        dwt_vid = {k: v for k, v in tubes_dwein_trainval.items()
-                if k[0] == vid}
-        dwt_vid_keys = list(dwt_vid.keys())
-        dwt_vid_values = list(dwt_vid.values())
-        dwt_frange = np.array([
-            (x['start_frame'], x['end_frame']) for x in dwt_vid_values])
-        # Temporal
-        t_ious, pids = temporal_ious_where_positive(
-            gt_tube['start_frame'], gt_tube['end_frame'], dwt_frange)
-        # Spatial (where temporal >0)
-        dwt_intersect = [dwt_vid_values[pid] for pid in pids]
-        sp_mious = [spatial_tube_iou_v3(p, gt_tube) for p in dwt_intersect]
-        for p, t_iou, sp_miou in zip(pids, t_ious, sp_mious):
-            st_iou = t_iou * sp_miou
-            if st_iou > 0:
-                dwt_vid = dwt_vid_keys[p]
-                overlap_hits.setdefault(dwt_vid, []).append(
-                        [action_name, (t_iou, sp_miou, st_iou)])
-
-    best_ious = {}
-    for k, v in overlap_hits.items():
-        vsorted_last = sorted(v, key=lambda x: x[1][0])[-1]
-        action_name = vsorted_last[0]
-        st_miou = vsorted_last[1][2]
-        best_ious[k] = (action_name, st_miou)
-
-    # Assign to classes
-    tubes_dwein_train = dtindex_filter_split(tubes_dwein, Vgroup.trainval)
-    POS_THRESH = 0.5
-    HN_THRESH = 0.3
-    labels = {}
-    for dwt_index in tubes_dwein_train.keys():
-        label = 'background'
-        if dwt_index in best_ious:
-            best_cls, best_iou = best_ious[dwt_index]
-            if best_iou > POS_THRESH:
-                label = best_cls
-            elif 0 < best_iou < HN_THRESH:
-                label = 'background_hard'
-            else:
-                label = 'none'
-        labels[dwt_index] = label
-
-    # Produce keyframe datasets realquick
-    keyframes_featfold = Path(cf['inputs.keyframes_featfold'])
-    keyframes = small.load_pkl(keyframes_featfold/'keyframes.pkl')
-    outputs = small.load_pkl(keyframes_featfold/'dict_outputs.pkl')['roipooled']
-    D_trainval, D_train, D_val, D_test = \
-            Ncfg_mlp.split_features(outputs, keyframes, Vgroup)
+    D_trainval, D_train, D_val, D_test, scaler = \
+            _quick_keyframe_datasets(cf, Vgroup)
 
     # Load connections, arrange back into dwt_index based structure
+    tubes_featfold = Path(cf['inputs.featfold'])
     connections_f = small.load_pkl(tubes_featfold/'connections_f.pkl')
     box_inds2 = small.load_pkl(tubes_featfold/'box_inds2.pkl')
-    dwti_binds = {}
-    for con, bi2 in tqdm(zip(connections_f.values(), box_inds2),
-            total=len(connections_f)):
-        bi_range = np.arange(bi2[0], bi2[1])
-        for dwti, bi in zip(con['dwti_sources'], bi_range):
-            dwti_binds.setdefault(dwti, []).append(bi)
-    dwti_binds = {k: np.array(sorted(v)) for k, v in dwti_binds.items()}
+    dwti_h5_inds = get_dwti_h5_mapping(connections_f, box_inds2)
 
     # Separate out the test tube features
-    tubes_dwein_test = dtindex_filter_split(tubes_dwein, Vgroup.test)
     test_binds = []
     for t in tubes_dwein_test:
-        test_binds.append(dwti_binds[t])
+        test_binds.append(dwti_h5_inds[t])
     counts = np.cumsum(np.array([len(x) for x in test_binds]))
     flat_test_binds = np.hstack(test_binds)
+    as_ind = np.argsort(flat_test_binds)
+    rev_as_ind = np.argsort(as_ind)
+    flat_test_binds_asorted = flat_test_binds[as_ind]
 
     # Gather these features (as float 16)
     hf = h5py.File(tubes_featfold/"feats.h5", 'r', libver="latest")
     dset = hf["roipooled_feats"]
-    as_ind = np.argsort(flat_test_binds)
-    rev_as_ind = np.argsort(as_ind)
-    flat_test_binds_asorted = flat_test_binds[as_ind]
     flat_test_feats_asorted = dset[flat_test_binds_asorted, :]
 
     def experiment(exp_ind):
@@ -562,7 +615,7 @@ def hack_w_tubefeats(workfolder, cfg_dict, add_args):
             small.mkdir(out/'isaver_ntrials'), range(n_trials), experiment)
     trial_results = isaver.run()
 
-    ap = []
+    aps = []
     for av_stubes in trial_results:
         av_stubes_ = av_stubes_above_score(av_stubes, 0.0)
         av_stubes_ = compute_nms_for_av_stubes(av_stubes_, 0.3)
@@ -571,15 +624,448 @@ def hack_w_tubefeats(workfolder, cfg_dict, add_args):
         av_gt_tubes_test: AV_dict[T_dgt] = push_into_avdict(tubes_dgt_test)
         df_ap_s_nodiff = compute_ap_for_avtubes_as_df(
                 av_gt_tubes_test, av_stubes_, iou_thresholds, False, False)
-        ap.append(df_ap_s_nodiff)
-    ap = zip(*trial_results)
-    ap_ = pd.concat(ap, keys=range(len(ap)), axis=1).mean(axis=1, level=1)
+        aps.append(df_ap_s_nodiff)
+    ap_ = pd.concat(aps, keys=range(len(aps)), axis=1).mean(axis=1, level=1)
     ap_ = (ap_*100).round(2)
     log.info(f'mean AP:\n{ap_}')
 
 
 def tubefeats_train_mlp(workfolder, cfg_dict, add_args):
+    out, = snippets.get_subfolders(workfolder, ['out'])
+    cfg = snippets.YConfig(cfg_dict)
+    cfg.set_deftype("""
+    seed: [42, int]
+    dataset:
+        name: ['daly', ['daly']]
+        cache_folder: [~, str]
+        mirror: ['uname', ~]
+        val_split:
+            fraction: [0.1, float]
+            nsamplings: [20, int]
+            seed: [42, int]
+    tubes_dwein: [~, str]
+    inputs:
+        featfold: [~, str]
+        keyframes_featfold: [~, ~]
+    """)
+    cfg.set_defaults("""
+    net:
+        H: 32
+    train:
+        lr: 1.0e-5
+        weight_decay: 5.0e-2
+        niters: 2000
+    n_trials: 5
+    log_period: '::'
+    """)
+    cf = cfg.parse()
+
+    # Inputs
+    initial_seed = cf['seed']
+    dataset = Dataset_daly_ocv(cf['dataset.mirror'])
+    dataset.populate_from_folder(cf['dataset.cache_folder'])
+    Vgroup = Ncfg_mlp.get_vids(cf, dataset)
+
+    # / Load tubes
+    # // Weintubes
+    tubes_dwein: Dict[I_dwein, T_dwein] = \
+            loadconvert_tubes_dwein(cf['tubes_dwein'])
+    tubes_dwein_trainval = dtindex_filter_split(tubes_dwein, Vgroup.trainval)
+    tubes_dwein_test = dtindex_filter_split(tubes_dwein, Vgroup.test)
+    # // GT tubes
+    tubes_dgt: Dict[I_dgt, T_dgt] = get_daly_gt_tubes(dataset)
+    tubes_dgt_nh = remove_hard_dgt_tubes(tubes_dgt)
+    tubes_dgt_trainval = dtindex_filter_split(tubes_dgt_nh, Vgroup.trainval)
+
+    # / Divide trainval tubes into classes (intersection with GT tubes)
+    best_ious_trainval = record_overlaps(
+            tubes_dgt_trainval, tubes_dwein_trainval)
+    labels_train: Dict[I_dgt, str] = create_synthetic_tube_labels(
+            tubes_dwein_trainval, best_ious_trainval)
+    # / Create classification dataset
+    labels = dataset.action_names + ['background']
+    ilabels_train = {}
+    for dwti, label in labels_train.items():
+        if label == 'none':
+            continue
+        elif label in ('background', 'background_hard'):
+            ilabel = len(dataset.action_names)
+        else:
+            ilabel = dataset.action_names.index(label)
+        ilabels_train[dwti] = ilabel
+
+    D_trainval, D_train, D_val, D_test, scaler = \
+            _quick_keyframe_datasets(cf, Vgroup)
+
+    # Load connections, arrange back into dwt_index based structure
+    tubes_featfold = Path(cf['inputs.featfold'])
+    connections_f: Dict[Tuple[Vid_daly, int], Box_connections_dwti] = \
+            small.load_pkl(tubes_featfold/'connections_f.pkl')
+    # (N_frames, 2) ndarray of h5 indices
+    box_inds2 = small.load_pkl(tubes_featfold/'box_inds2.pkl')
+    # Mapping dwti -> 1D ndarray of h5 indices
+    dwti_h5_inds = get_dwti_h5_mapping(connections_f, box_inds2)
+
+    # Define model
+    torch.manual_seed(initial_seed)
+    D_in = 2304
+    D_out = len(labels)
+    H = 32
+    model = Net_mlp_featcls2(D_in, D_out, H)
+    loss_fn = torch.nn.CrossEntropyLoss(reduction='mean')
     train_lr = 1.0e-05
     weight_decay = 5.0e-2
     optimizer = torch.optim.AdamW(model.parameters(),
             lr=train_lr, weight_decay=weight_decay)
+
+    h5_path = tubes_featfold/"feats.h5"
+    # hf = h5py.File(h5_path, 'r', libver="latest")
+    # dset = hf["roipooled_feats"]
+
+    # Batch tubes together (11k labeled trainval tubes)
+    rgen = np.random.default_rng(42)
+    ilabels_order = rgen.permutation(np.arange(len(ilabels_train)))
+    TUBE_BSIZE = 500
+    labels_border = snippets.leqn_split(ilabels_order, TUBE_BSIZE)
+
+    td_h5 = TD_over_h5(h5_path, dwti_h5_inds,
+        ilabels_train, initial_seed, labels_border, scaler)
+
+    BATCH_SIZE = 512
+    NUM_WORKERS = 0
+    loader = torch.utils.data.DataLoader(td_h5,
+        batch_size=None, num_workers=NUM_WORKERS,
+        collate_fn=None)
+
+    log_period = '::1'
+    X_to_train = torch.from_numpy(D_trainval.X)
+    Y_to_train = torch.from_numpy(D_trainval.Y)
+    model.train()
+    for i_batch, data_input in enumerate(loader):
+        feats, labels = data_input
+        pred_train = model(feats)
+        loss = loss_fn(pred_train, labels)
+        if snippets.check_step_sslice(i_batch, log_period):
+            model.eval()
+            with torch.no_grad():
+                pred = model(X_to_train)
+            acc_trainval = pred[:, :-1].argmax(1).eq(
+                Y_to_train).sum().item()/len(Y_to_train) * 100
+            model.train()
+            log.info(f'{i_batch}: {loss.item()} {acc_trainval=:.2f}')
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+
+def tubefeats_train_mlp_in_ram(workfolder, cfg_dict, add_args):
+    out, = snippets.get_subfolders(workfolder, ['out'])
+    cfg = snippets.YConfig(cfg_dict)
+    cfg.set_deftype("""
+    seed: [42, int]
+    dataset:
+        name: ['daly', ['daly']]
+        cache_folder: [~, str]
+        mirror: ['uname', ~]
+        val_split:
+            fraction: [0.1, float]
+            nsamplings: [20, int]
+            seed: [42, int]
+    tubes_dwein: [~, str]
+    inputs:
+        featfold: [~, str]
+        keyframes_featfold: [~, ~]
+    """)
+    cfg.set_defaults("""
+    net:
+        H: 32
+    train:
+        lr: 1.0e-5
+        weight_decay: 5.0e-2
+        niters: 2000
+    n_trials: 5
+    log_period: '::'
+    """)
+    cf = cfg.parse()
+
+    # Inputs
+    initial_seed = cf['seed']
+    dataset = Dataset_daly_ocv(cf['dataset.mirror'])
+    dataset.populate_from_folder(cf['dataset.cache_folder'])
+    Vgroup = Ncfg_mlp.get_vids(cf, dataset)
+
+    # / Load tubes
+    # // Weintubes
+    tubes_dwein: Dict[I_dwein, T_dwein] = \
+            loadconvert_tubes_dwein(cf['tubes_dwein'])
+    tubes_dwein_trainval = dtindex_filter_split(tubes_dwein, Vgroup.trainval)
+    tubes_dwein_test = dtindex_filter_split(tubes_dwein, Vgroup.test)
+    # // GT tubes
+    tubes_dgt: Dict[I_dgt, T_dgt] = get_daly_gt_tubes(dataset)
+    tubes_dgt_nh = remove_hard_dgt_tubes(tubes_dgt)
+    tubes_dgt_trainval = dtindex_filter_split(tubes_dgt_nh, Vgroup.trainval)
+
+    # / Divide trainval tubes into classes (intersection with GT tubes)
+    best_ious_trainval = record_overlaps(
+            tubes_dgt_trainval, tubes_dwein_trainval)
+    labels_train: Dict[I_dgt, str] = create_synthetic_tube_labels(
+            tubes_dwein_trainval, best_ious_trainval)
+    # / Create classification dataset
+    labels = dataset.action_names + ['background']
+    ilabels_train = {}
+    for dwti, label in labels_train.items():
+        if label == 'none':
+            continue
+        elif label in ('background', 'background_hard'):
+            ilabel = len(dataset.action_names)
+        else:
+            ilabel = dataset.action_names.index(label)
+        ilabels_train[dwti] = ilabel
+
+    D_trainval, D_train, D_val, D_test, scaler = \
+            _quick_keyframe_datasets(cf, Vgroup)
+
+    # Load connections, arrange back into dwt_index based structure
+    tubes_featfold = Path(cf['inputs.featfold'])
+    connections_f: Dict[Tuple[Vid_daly, int], Box_connections_dwti] = \
+            small.load_pkl(tubes_featfold/'connections_f.pkl')
+    # (N_frames, 2) ndarray of h5 indices
+    box_inds2 = small.load_pkl(tubes_featfold/'box_inds2.pkl')
+    # Mapping dwti -> 1D ndarray of h5 indices
+    dwti_to_inds_h5 = get_dwti_h5_mapping(connections_f, box_inds2)
+
+    # / Load useful features to RAM
+    # // Prepare indices
+    dwtis = list(ilabels_train.keys())
+    inds_h5 = []
+    for dwti in dwtis:
+        inds_h5.append(dwti_to_inds_h5[dwti])
+    counts = np.cumsum([len(x) for x in inds_h5])
+    flat_inds_h5 = np.hstack(inds_h5)
+    as_ind = np.argsort(flat_inds_h5)
+    rev_as_ind = np.argsort(as_ind)
+    flat_sorted_inds_h5 = flat_inds_h5[as_ind]
+    # /// MAPPING: dwtis -> index over flat_sorted_feats
+    # flat_sorted_inds_h5[irange[X]] == inds_h5[X]
+    flsorted_irange = np.arange(len(flat_sorted_inds_h5))
+    fl_irange = flsorted_irange[rev_as_ind]
+    irange = np.split(fl_irange, counts[:-1])
+    dwti_to_flsi_h5 = dict(zip(dwtis, irange))
+    # Features
+    with small.QTimer('big h5py load'):
+        hf = h5py.File(tubes_featfold/"feats.h5", 'r', libver="latest")
+        dset = hf["roipooled_feats"]
+        flat_sorted_feats = dset[flat_sorted_inds_h5]
+        hf.close()
+
+    import pudb; pudb.set_trace()  # XXX BREAKPOINT
+
+    # Define model
+    torch.manual_seed(initial_seed)
+    D_in = 2304
+    D_out = len(labels)
+    H = 32
+    model = Net_mlp_featcls2(D_in, D_out, H)
+    loss_fn = torch.nn.CrossEntropyLoss(reduction='mean')
+    train_lr = 1.0e-05
+    weight_decay = 5.0e-2
+    optimizer = torch.optim.AdamW(model.parameters(),
+            lr=train_lr, weight_decay=weight_decay)
+
+    # Load
+
+    h5_path = tubes_featfold/"feats.h5"
+    # hf = h5py.File(h5_path, 'r', libver="latest")
+    # dset = hf["roipooled_feats"]
+
+    # Batch tubes together (11k labeled trainval tubes)
+    rgen = np.random.default_rng(42)
+    ilabels_order = rgen.permutation(np.arange(len(ilabels_train)))
+    TUBE_BSIZE = 500
+    labels_border = snippets.leqn_split(ilabels_order, TUBE_BSIZE)
+
+    td_h5 = TD_over_h5(h5_path, dwti_h5_inds,
+        ilabels_train, initial_seed, labels_border, scaler)
+
+    BATCH_SIZE = 512
+    NUM_WORKERS = 0
+    loader = torch.utils.data.DataLoader(td_h5,
+        batch_size=None, num_workers=NUM_WORKERS,
+        collate_fn=None)
+
+    log_period = '::1'
+    X_to_train = torch.from_numpy(D_trainval.X)
+    Y_to_train = torch.from_numpy(D_trainval.Y)
+    model.train()
+    for i_batch, data_input in enumerate(loader):
+        feats, labels = data_input
+        pred_train = model(feats)
+        loss = loss_fn(pred_train, labels)
+        if snippets.check_step_sslice(i_batch, log_period):
+            model.eval()
+            with torch.no_grad():
+                pred = model(X_to_train)
+            acc_trainval = pred[:, :-1].argmax(1).eq(
+                Y_to_train).sum().item()/len(Y_to_train) * 100
+            model.train()
+            log.info(f'{i_batch}: {loss.item()} {acc_trainval=:.2f}')
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+
+def tubefeats_train_mlp_in_ram_npy(workfolder, cfg_dict, add_args):
+    out, = snippets.get_subfolders(workfolder, ['out'])
+    cfg = snippets.YConfig(cfg_dict)
+    cfg.set_deftype("""
+    seed: [42, int]
+    dataset:
+        name: ['daly', ['daly']]
+        cache_folder: [~, str]
+        mirror: ['uname', ~]
+        val_split:
+            fraction: [0.1, float]
+            nsamplings: [20, int]
+            seed: [42, int]
+    tubes_dwein: [~, str]
+    inputs:
+        featfold: [~, str]
+        keyframes_featfold: [~, ~]
+    """)
+    cfg.set_defaults("""
+    net:
+        H: 32
+    train:
+        lr: 1.0e-5
+        weight_decay: 5.0e-2
+        niters: 2000
+    n_trials: 5
+    log_period: '::'
+    """)
+    cf = cfg.parse()
+
+    # Inputs
+    initial_seed = cf['seed']
+    dataset = Dataset_daly_ocv(cf['dataset.mirror'])
+    dataset.populate_from_folder(cf['dataset.cache_folder'])
+    Vgroup = Ncfg_mlp.get_vids(cf, dataset)
+
+    # Load whole npy file
+    # Load connections, arrange back into dwt_index based structure
+    tubes_featfold = Path(cf['inputs.featfold'])
+    connections_f: Dict[Tuple[Vid_daly, int], Box_connections_dwti] = \
+            small.load_pkl(tubes_featfold/'connections_f.pkl')
+    # (N_frames, 2) ndarray of h5 indices
+    box_inds2 = small.load_pkl(tubes_featfold/'box_inds2.pkl')
+    # Mapping dwti -> 1D ndarray of h5 indices
+    dwti_to_inds_h5 = get_dwti_h5_mapping(connections_f, box_inds2)
+    with small.QTimer('big numpy load'):
+        # Features
+        big_features = np.load(str(tubes_featfold/"feats.npy"))
+
+    import pudb; pudb.set_trace()  # XXX BREAKPOINT
+    pass
+
+    # / Load tubes
+    # // Weintubes
+    tubes_dwein: Dict[I_dwein, T_dwein] = \
+            loadconvert_tubes_dwein(cf['tubes_dwein'])
+    tubes_dwein_trainval = dtindex_filter_split(tubes_dwein, Vgroup.trainval)
+    tubes_dwein_test = dtindex_filter_split(tubes_dwein, Vgroup.test)
+    # // GT tubes
+    tubes_dgt: Dict[I_dgt, T_dgt] = get_daly_gt_tubes(dataset)
+    tubes_dgt_nh = remove_hard_dgt_tubes(tubes_dgt)
+    tubes_dgt_trainval = dtindex_filter_split(tubes_dgt_nh, Vgroup.trainval)
+
+    # / Divide trainval tubes into classes (intersection with GT tubes)
+    best_ious_trainval = record_overlaps(
+            tubes_dgt_trainval, tubes_dwein_trainval)
+    labels_train: Dict[I_dgt, str] = create_synthetic_tube_labels(
+            tubes_dwein_trainval, best_ious_trainval)
+    # / Create classification dataset
+    labels = dataset.action_names + ['background']
+    ilabels_train = {}
+    for dwti, label in labels_train.items():
+        if label == 'none':
+            continue
+        elif label in ('background', 'background_hard'):
+            ilabel = len(dataset.action_names)
+        else:
+            ilabel = dataset.action_names.index(label)
+        ilabels_train[dwti] = ilabel
+
+    D_trainval, D_train, D_val, D_test, scaler = \
+            _quick_keyframe_datasets(cf, Vgroup)
+
+
+    # / Load useful features to RAM
+    # // Prepare indices
+    dwtis = list(ilabels_train.keys())
+    inds_h5 = []
+    for dwti in dwtis:
+        inds_h5.append(dwti_to_inds_h5[dwti])
+    counts = np.cumsum([len(x) for x in inds_h5])
+    flat_inds_h5 = np.hstack(inds_h5)
+    as_ind = np.argsort(flat_inds_h5)
+    rev_as_ind = np.argsort(as_ind)
+    flat_sorted_inds_h5 = flat_inds_h5[as_ind]
+    # /// MAPPING: dwtis -> index over flat_sorted_feats
+    # flat_sorted_inds_h5[irange[X]] == inds_h5[X]
+    flsorted_irange = np.arange(len(flat_sorted_inds_h5))
+    fl_irange = flsorted_irange[rev_as_ind]
+    irange = np.split(fl_irange, counts[:-1])
+    dwti_to_flsi_h5 = dict(zip(dwtis, irange))
+
+
+    # Define model
+    torch.manual_seed(initial_seed)
+    D_in = 2304
+    D_out = len(labels)
+    H = 32
+    model = Net_mlp_featcls2(D_in, D_out, H)
+    loss_fn = torch.nn.CrossEntropyLoss(reduction='mean')
+    train_lr = 1.0e-05
+    weight_decay = 5.0e-2
+    optimizer = torch.optim.AdamW(model.parameters(),
+            lr=train_lr, weight_decay=weight_decay)
+
+    # Load
+
+    h5_path = tubes_featfold/"feats.h5"
+    # hf = h5py.File(h5_path, 'r', libver="latest")
+    # dset = hf["roipooled_feats"]
+
+    # Batch tubes together (11k labeled trainval tubes)
+    rgen = np.random.default_rng(42)
+    ilabels_order = rgen.permutation(np.arange(len(ilabels_train)))
+    TUBE_BSIZE = 500
+    labels_border = snippets.leqn_split(ilabels_order, TUBE_BSIZE)
+
+    td_h5 = TD_over_h5(h5_path, dwti_h5_inds,
+        ilabels_train, initial_seed, labels_border, scaler)
+
+    BATCH_SIZE = 512
+    NUM_WORKERS = 0
+    loader = torch.utils.data.DataLoader(td_h5,
+        batch_size=None, num_workers=NUM_WORKERS,
+        collate_fn=None)
+
+    log_period = '::1'
+    X_to_train = torch.from_numpy(D_trainval.X)
+    Y_to_train = torch.from_numpy(D_trainval.Y)
+    model.train()
+    for i_batch, data_input in enumerate(loader):
+        feats, labels = data_input
+        pred_train = model(feats)
+        loss = loss_fn(pred_train, labels)
+        if snippets.check_step_sslice(i_batch, log_period):
+            model.eval()
+            with torch.no_grad():
+                pred = model(X_to_train)
+            acc_trainval = pred[:, :-1].argmax(1).eq(
+                Y_to_train).sum().item()/len(Y_to_train) * 100
+            model.train()
+            log.info(f'{i_batch}: {loss.item()} {acc_trainval=:.2f}')
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()

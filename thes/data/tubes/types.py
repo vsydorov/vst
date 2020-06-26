@@ -73,11 +73,17 @@ V_dict = Dict[Vid_daly, List[TV]]
 AV_dict = Dict[Action_name_daly, Dict[Vid_daly, List[TV]]]
 
 
-Objaction_dets = TypedDict('Objaction_dets', {
-    'pred_boxes': np.ndarray,
-    'scores': np.ndarray,
-    'pred_classes': np.ndarray  # strings
-})
+class Objaction_dets(TypedDict):
+    pred_boxes: np.ndarray
+    scores: np.ndarray
+    pred_classes: np.ndarray  # strings
+
+
+class Box_connections_dwti(TypedDict):
+    vid: Vid_daly
+    frame_ind: int
+    dwti_sources: List[I_dwein]  # N
+    boxes: List[np.ndarray]  # N, 4
 
 
 def _reconvert_dwein_tube(

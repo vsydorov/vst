@@ -16,7 +16,7 @@ from thes.data.tubes.types import (
     push_into_avdict, dtindex_filter_split,
     Objaction_dets, Frametube,
     av_filter_split, av_stubes_above_score,
-    AV_dict,)
+    AV_dict, Box_connections_dwti)
 from thes.data.dataset.external import (
     Dataset_daly_ocv, Vid_daly)
 from thes.tools import snippets
@@ -32,13 +32,6 @@ def sample_dict(dct: Dict, N=10, NP_SEED=0) -> Dict:
     some_keys = [key_list[i] for i in prm_key_indices[:N]]
     some_tubes = {k: dct[k] for k in some_keys}
     return some_tubes
-
-
-class Box_connections_dwti(TypedDict):
-    vid: Vid_daly
-    frame_ind: int
-    dwti_sources: List[I_dwein]  # N
-    boxes: List[np.ndarray]  # N, 4
 
 
 class Ncfg_generic_rcnn_eval:
