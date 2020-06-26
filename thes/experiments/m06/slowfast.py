@@ -1194,6 +1194,6 @@ def combine_probed_philtubes(workfolder, cfg_dict, add_args):
     if output_type in ['h5', 'h5_chunked']:
         hf.close()
     elif output_type == 'np':
-        dset.close()
+        del dset
     else:
         raise RuntimeError()
