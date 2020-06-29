@@ -85,8 +85,51 @@ def split_off(X, linked_vids, good_vids):
         raise RuntimeError()
     return result
 
-class Ncfg_mlp:
 
+def split_off_D(outputs, keyframes, vids):
+    global_kf_vids = [kf['vid'] for kf in keyframes]
+    d = dict()
+    d['X'] = split_off(outputs, global_kf_vids, vids)
+    d['kf'] = split_off(keyframes, global_kf_vids, vids)
+    d['Y'] = np.array([kf['action_id'] for kf in d['kf']])
+    return d
+
+
+class Ncfg_daly:
+    @staticmethod
+    def set_defcfg(cfg):
+        cfg.set_deftype("""
+        dataset:
+            name: ['daly', ['daly']]
+            cache_folder: [~, str]
+            mirror: ['uname', ~]
+            val_split:
+                fraction: [0.1, float]
+                nsamplings: [20, int]
+                seed: [42, int]
+        """)
+
+    @staticmethod
+    def get_dataset(cf):
+        dataset = Dataset_daly_ocv(cf['dataset.mirror'])
+        dataset.populate_from_folder(cf['dataset.cache_folder'])
+        return dataset
+
+    @staticmethod
+    def get_vids(cf, dataset):
+        v_fraction = cf['dataset.val_split.fraction']
+        v_nsamplings = cf['dataset.val_split.nsamplings']
+        v_seed = cf['dataset.val_split.seed']
+
+        class Vgroup:
+            val, train = split_off_validation_set(
+                    dataset, v_fraction, v_nsamplings, v_seed)
+            trainval = get_daly_split_vids(dataset, 'train')
+            test = get_daly_split_vids(dataset, 'test')
+        return Vgroup
+
+
+class Ncfg_keyframe_mlp:
     class Net_mlp_featcls(nn.Module):
         def __init__(self, D_in, D_out, H, dropout_rate=0.5):
             super().__init__()
@@ -107,14 +150,6 @@ class Ncfg_mlp:
     def set_defcfg(cfg):
         cfg.set_deftype("""
         seed: [42, int]
-        dataset:
-            name: ['daly', ['daly']]
-            cache_folder: [~, str]
-            mirror: ['scratch2', ~]
-            val_split:
-                fraction: [0.1, float]
-                nsamplings: [20, int]
-                seed: [42, int]
         tubes_dwein: [~, str]
         inputs:
             featfold: [~, str]
@@ -130,19 +165,6 @@ class Ncfg_mlp:
         n_trials: 5
         log_period: '::'
         """)
-
-    @staticmethod
-    def get_vids(cf, dataset):
-        v_fraction = cf['dataset.val_split.fraction']
-        v_nsamplings = cf['dataset.val_split.nsamplings']
-        v_seed = cf['dataset.val_split.seed']
-
-        class Vgroup:
-            val, train = split_off_validation_set(
-                    dataset, v_fraction, v_nsamplings, v_seed)
-            trainval = get_daly_split_vids(dataset, 'train')
-            test = get_daly_split_vids(dataset, 'test')
-        return Vgroup
 
     @staticmethod
     def split_features(outputs, keyframes, Vgroup):
@@ -260,7 +282,7 @@ class Ncfg_mlp:
         return df_recall_s_nodiff, df_ap_s_nodiff
 
 
-class Net_mlp_featcls2(nn.Module):
+class Net_mlp_onelayer(nn.Module):
     def __init__(self, D_in, D_out, H, dropout_rate=0.5):
         super().__init__()
         self.linear1 = nn.Linear(D_in, H)
@@ -329,17 +351,59 @@ def create_synthetic_tube_labels(tubes_dwein, best_ious):
     return labels
 
 
-def _quick_keyframe_datasets(cf, Vgroup):
+def _stuff():
+    # / Load only useful features to RAM, to be sent to
+    # // Prepare indices
+    dwtis = list(ilabels_train.keys())
+    inds_h5 = []
+    for dwti in dwtis:
+        inds_h5.append(dwti_to_inds_h5[dwti])
+    counts = np.cumsum([len(x) for x in inds_h5])
+    flat_inds_h5 = np.hstack(inds_h5)
+    as_ind = np.argsort(flat_inds_h5)
+    rev_as_ind = np.argsort(as_ind)
+    flat_sorted_inds_h5 = flat_inds_h5[as_ind]
+    # /// MAPPING: dwtis -> index over flat_sorted_feats
+    # flat_sorted_inds_h5[irange[X]] == inds_h5[X]
+    flsorted_irange = np.arange(len(flat_sorted_inds_h5))
+    fl_irange = flsorted_irange[rev_as_ind]
+    irange = np.split(fl_irange, counts[:-1])
+    dwti_to_flsi_h5 = dict(zip(dwtis, irange))
+
+
+def _qload_keyframe_datasets(cf, Vgroup):
     # Produce keyframe datasets realquick
     keyframes_featfold = Path(cf['inputs.keyframes_featfold'])
     keyframes = small.load_pkl(keyframes_featfold/'keyframes.pkl')
-    outputs = small.load_pkl(keyframes_featfold/'dict_outputs.pkl')['roipooled']
-    D_trainval, D_train, D_val, D_test, scaler = \
-            Ncfg_mlp.split_features(outputs, keyframes, Vgroup)
-    return D_trainval, D_train, D_val, D_test, scaler
+    outputs = small.load_pkl(
+            keyframes_featfold/'dict_outputs.pkl')['roipooled']
+    d = {}
+    for sset in ['train', 'val', 'trainval', 'test']:
+        vids = getattr(Vgroup, sset)
+        d[sset] = split_off_D(outputs, keyframes, vids)
+    return d
 
 
-def get_dwti_h5_mapping(
+def _kf_feature_scale(kfeats):
+    # Optional standard scaling on trianval
+    scaler = StandardScaler()
+    scaler.fit(kfeats['trainval']['X'])
+    for sset, kfeat in kfeats.items():
+        kfeat['X'] = scaler.transform(kfeat['X'])
+    return scaler
+
+
+def kf_features_to_torch(kfeats):
+    kfeats_t = {}
+    for sset, kfeat in kfeats.items():
+        kfeat_t = kfeat.copy()
+        kfeat_t['X'] = torch.from_numpy(kfeat_t['X'])
+        kfeat_t['Y'] = torch.from_numpy(kfeat_t['Y'])
+        kfeats_t[sset] = kfeat_t
+    return kfeats_t
+
+
+def get_dwti_big_mapping(
         connections_f, box_inds2
         ) -> Dict[I_dwein, np.ndarray]:
     dwti_h5_inds: Dict[I_dwein, np.ndarray] = {}
@@ -347,44 +411,179 @@ def get_dwti_h5_mapping(
         bi_range = np.arange(bi2[0], bi2[1])
         for dwti, bi in zip(con['dwti_sources'], bi_range):
             dwti_h5_inds.setdefault(dwti, []).append(bi)
-    dwti_h5_inds = {k: np.array(sorted(v)) for k, v in dwti_h5_inds.items()}
+    dwti_h5_inds = {k: np.array(sorted(v))
+            for k, v in dwti_h5_inds.items()}
     return dwti_h5_inds
 
 
-class TD_over_h5(torch.utils.data.Dataset):
-    def __init__(self, h5_path, dwti_h5_inds, ilabels, np_seed,
-            labels_border, scaler):
-        self.hf = h5py.File(h5_path, 'r', libver="latest")
-        self.dwti_h5_inds = dwti_h5_inds
-        self.ilabels_kv = list(ilabels.items())
-        self.rstate = np.random.RandomState(np_seed)
-        self.labels_border = labels_border
+def _qload_tube_to_frame_mapping(tubes_featfold):
+    """Load whole npy file"""
+    # Load connections, arrange back into dwt_index based structure
+    connections_f: Dict[Tuple[Vid_daly, int], Box_connections_dwti] = \
+            small.load_pkl(tubes_featfold/'connections_f.pkl')
+    # (N_frames, 2) ndarray of BIG indices
+    box_inds2 = small.load_pkl(tubes_featfold/'box_inds2.pkl')
+    # Mapping dwti -> 1D ndarray of BIG indices
+    dwti_to_inds_big = get_dwti_big_mapping(connections_f, box_inds2)
+    # Features
+    with small.QTimer('big numpy load'):
+        BIG = np.load(str(tubes_featfold/"feats.npy"))
+    return BIG, dwti_to_inds_big
+
+
+def _qload_tubes(cf, dataset, Vgroup):
+    # / Load tubes
+    tubes_dwein_all: Dict[I_dwein, T_dwein] = \
+            loadconvert_tubes_dwein(cf['tubes_dwein'])
+    tubes_dgt_all: Dict[I_dgt, T_dgt] = get_daly_gt_tubes(dataset)
+    tubes_dgt_all = remove_hard_dgt_tubes(tubes_dgt_all)
+    # // Per subset
+    tubes_dwein_d = {}
+    tubes_dgt_d = {}
+    for sset in ['train', 'val']:
+        vgroup = getattr(Vgroup, sset)
+        tubes_dwein_d[sset] = \
+                dtindex_filter_split(tubes_dwein_all, vgroup)
+        tubes_dgt_d[sset] = \
+                dtindex_filter_split(tubes_dgt_all, vgroup)
+    return tubes_dwein_d, tubes_dgt_d
+
+
+def _qload_synthetic_tube_labels(tubes_dgt, tubes_dwein, dataset):
+    # / Divide trainval tubes into classes (intersection with GT tubes)
+    best_ious = record_overlaps(tubes_dgt, tubes_dwein)
+    labels_train: Dict[I_dgt, str] = create_synthetic_tube_labels(
+            tubes_dwein, best_ious)
+    # / Create classification dataset
+    cls_labels = dataset.action_names + ['background']
+    dwti_to_label = {}
+    for dwti, label in labels_train.items():
+        if label == 'none':
+            continue
+        elif label in ('background', 'background_hard'):
+            ilabel = len(dataset.action_names)
+        else:
+            ilabel = dataset.action_names.index(label)
+        dwti_to_label[dwti] = ilabel
+    return cls_labels, dwti_to_label
+
+
+def _create_quick_model(cls_labels):
+    # Define model
+    train_lr = 1.0e-05
+    weight_decay = 5.0e-2
+    D_in = 2304
+    D_out = len(cls_labels)
+    H = 32
+    model = Net_mlp_onelayer(D_in, D_out, H)
+    loss_fn = torch.nn.CrossEntropyLoss(reduction='mean')
+    optimizer = torch.optim.AdamW(model.parameters(),
+            lr=train_lr, weight_decay=weight_decay)
+    return loss_fn, optimizer, model
+
+
+class TD_thin_over_BIG(torch.utils.data.Dataset):
+    def __init__(self, BIG, batches, scaler):
+        self.BIG = BIG
+        self.batches = batches
         self.scaler = scaler
 
     def __getitem__(self, index):
-        linds = self.labels_border[index]
-        # Choose h5 inds (1 frame per tube)
-        chosen_h5_inds = []
-        labels = []
-        for li in linds:
-            dwti, label = self.ilabels_kv[li]
-            binds = self.dwti_h5_inds[dwti]
-            chosen_h5_inds.append(self.rstate.choice(binds))
-            labels.append(label)
-        chosen_h5_inds = np.array(chosen_h5_inds)
-        labels = np.array(labels)
+        binds, labels = self.batches[index]
         # Perform h5 feature extraction
-        dset = self.hf["roipooled_feats"]
-        as_ind = np.argsort(chosen_h5_inds)
-        ras_ind = np.argsort(as_ind)
-        h5_inds_asorted = chosen_h5_inds[as_ind]
-        feats_asorted = dset[h5_inds_asorted, :]
-        feats = feats_asorted[ras_ind].astype(np.float32)
-        sc_feats = self.scaler.transform(feats)
-        return sc_feats, labels
+        feats = self.BIG[binds]
+        feats = feats.astype(np.float32)
+        if self.scaler is not None:
+            feats = self.scaler.transform(feats)
+        return feats, labels
 
     def __len__(self):
-        return len(self.labels_border)
+        return len(self.batches)
+
+
+def _quick_shuffle_batches(dwti_to_inds_big, rgen, dwti_to_label,
+        TUBES_PER_BATCH, FRAMES_PER_TUBE):
+    # / Prepare dataset and data loader
+    # // Batch tubes together (via their linds)
+    # 11k labeled trainval tubes
+    linds_order = rgen.permutation(np.arange(len(dwti_to_label)))
+    b = np.arange(0, len(linds_order), TUBES_PER_BATCH)[1:]
+    batched_linds = np.split(linds_order, b)
+
+    dwti_to_label_kv = list(dwti_to_label.items())
+
+    batches = []
+    for linds in batched_linds:
+        batch_binds = []
+        batch_labels = []
+        for li in linds:
+            dwti, label = dwti_to_label_kv[li]
+            binds = dwti_to_inds_big[dwti]
+            replace = FRAMES_PER_TUBE > len(binds)
+            chosen_binds = rgen.choice(binds, FRAMES_PER_TUBE, replace)
+            batch_binds.extend(chosen_binds)
+            batch_labels.extend([label]*FRAMES_PER_TUBE)
+        batch_binds = np.array(batch_binds)
+        batch_labels = np.array(batch_labels)
+        batches.append([batch_binds, batch_labels])
+    return batches
+
+
+def _quick_dataloader(BIG, batches, scaler):
+    # // torch dataset
+    td_h5 = TD_thin_over_BIG(BIG, batches, scaler)
+    loader = torch.utils.data.DataLoader(td_h5,
+        batch_size=None, num_workers=0,
+        collate_fn=None)
+    return loader
+
+
+def _quick_kf_eval(kfeat_t, model):
+    def _qacc(pred, Y):
+        return pred.argmax(1).eq(Y).sum().item()/len(Y) * 100
+    with torch.no_grad():
+        pred_trainval = model(kfeat_t['X'])
+    acc = _qacc(pred_trainval[:, :-1], kfeat_t['Y'])
+    return acc
+
+
+def _quick_fulltube_assign(
+        BIG, dwti_to_inds_big, tubes_dwein, model, scaler, dataset):
+    test_preds_avg = []
+    with torch.no_grad():
+        for i, dwti in enumerate(tubes_dwein.keys()):
+            inds_big = dwti_to_inds_big[dwti]
+            feats = BIG[inds_big]
+            feats = feats.astype(np.float32)
+            if scaler is not None:
+                feats = scaler.transform(feats)
+            feats = torch.from_numpy(feats)
+            preds = model(feats)
+            preds = softmax(preds, axis=-1)
+            preds = preds[:, :-1].mean(0).numpy()
+            test_preds_avg.append(preds)
+
+    av_stubes: AV_dict[T_dwein_scored] = {}
+    for (dwt_index, tube), scores in zip(
+            tubes_dwein.items(), test_preds_avg):
+        (vid, bunch_id, tube_id) = dwt_index
+        for action_name, score in zip(dataset.action_names, scores):
+            stube = tube.copy()
+            stube['score'] = score
+            stube = cast(T_dwein_scored, stube)
+            (av_stubes
+                    .setdefault(action_name, {})
+                    .setdefault(vid, []).append(stube))
+    return av_stubes
+
+def _quick_tubeval(av_stubes, tubes_dgt):
+    av_stubes_ = av_stubes_above_score(av_stubes, 0.0)
+    av_stubes_ = compute_nms_for_av_stubes(av_stubes_, 0.3)
+    iou_thresholds = [.3, .5, .7]
+    av_gt_tubes_test: AV_dict[T_dgt] = push_into_avdict(tubes_dgt)
+    df_ap_s_nodiff = compute_ap_for_avtubes_as_df(
+            av_gt_tubes_test, av_stubes_, iou_thresholds, False, False)
+    return (df_ap_s_nodiff*100).round(2)
 
 
 # Experiments
@@ -393,31 +592,33 @@ class TD_over_h5(torch.utils.data.Dataset):
 def torchmlp_feat_classify_validate(workfolder, cfg_dict, add_args):
     out, = snippets.get_subfolders(workfolder, ['out'])
     cfg = snippets.YConfig(cfg_dict)
-    Ncfg_mlp.set_defcfg(cfg)
+    Ncfg_daly.set_defcfg(cfg)
+    Ncfg_keyframe_mlp.set_defcfg(cfg)
     cf = cfg.parse()
 
     # Inputs
     initial_seed = cf['seed']
     dataset = Dataset_daly_ocv(cf['dataset.mirror'])
     dataset.populate_from_folder(cf['dataset.cache_folder'])
-    Vgroup = Ncfg_mlp.get_vids(cf, dataset)
+    Vgroup = Ncfg_daly.get_vids(cf, dataset)
     computed_featfold = Path(cf['inputs.featfold'])
     featname = cf['inputs.featname']
     keyframes = small.load_pkl(computed_featfold/'keyframes.pkl')
     outputs = small.load_pkl(computed_featfold/'dict_outputs.pkl')[featname]
     D_trainval, D_train, D_val, D_test, _ = \
-            Ncfg_mlp.split_features(outputs, keyframes, Vgroup)
+            Ncfg_keyframe_mlp.split_features(outputs, keyframes, Vgroup)
 
     torch.manual_seed(initial_seed)
-    model, loss_fn = Ncfg_mlp.create_model(dataset, outputs, cf['net.H'])
+    model, loss_fn = Ncfg_keyframe_mlp.create_model(dataset, outputs, cf['net.H'])
 
-    # model, loss_fn = Ncfg_mlp.create_model(cf['net.H'])
+    # model, loss_fn = Ncfg_keyframe_mlp.create_model(cf['net.H'])
 
 
 def torchmlp_feat_classify_test(workfolder, cfg_dict, add_args):
     out, = snippets.get_subfolders(workfolder, ['out'])
     cfg = snippets.YConfig(cfg_dict)
-    Ncfg_mlp.set_defcfg(cfg)
+    Ncfg_daly.set_defcfg(cfg)
+    Ncfg_keyframe_mlp.set_defcfg(cfg)
     cf = cfg.parse()
 
     # Inputs
@@ -425,21 +626,21 @@ def torchmlp_feat_classify_test(workfolder, cfg_dict, add_args):
     n_trials = cf['n_trials']
     dataset = Dataset_daly_ocv(cf['dataset.mirror'])
     dataset.populate_from_folder(cf['dataset.cache_folder'])
-    Vgroup = Ncfg_mlp.get_vids(cf, dataset)
+    Vgroup = Ncfg_daly.get_vids(cf, dataset)
     computed_featfold = Path(cf['inputs.featfold'])
     featname = cf['inputs.featname']
     log_period = cf['log_period']
     keyframes = small.load_pkl(computed_featfold/'keyframes.pkl')
     outputs = small.load_pkl(computed_featfold/'dict_outputs.pkl')[featname]
     D_trainval, D_train, D_val, D_test, _ = \
-            Ncfg_mlp.split_features(outputs, keyframes, Vgroup)
+            Ncfg_keyframe_mlp.split_features(outputs, keyframes, Vgroup)
 
     def experiment(i):
         torch.manual_seed(initial_seed+i)
-        model, loss_fn = Ncfg_mlp.create_model(dataset, outputs, cf['net.H'])
-        Ncfg_mlp.optimize(cf, model, loss_fn, D_trainval, log_period)
-        Y_test_np_softmax, acc, roc_auc = Ncfg_mlp.evaluate_acc(model, D_test)
-        df_recall_s_nodiff, df_ap_s_nodiff = Ncfg_mlp.evaluate_tubes(
+        model, loss_fn = Ncfg_keyframe_mlp.create_model(dataset, outputs, cf['net.H'])
+        Ncfg_keyframe_mlp.optimize(cf, model, loss_fn, D_trainval, log_period)
+        Y_test_np_softmax, acc, roc_auc = Ncfg_keyframe_mlp.evaluate_acc(model, D_test)
+        df_recall_s_nodiff, df_ap_s_nodiff = Ncfg_keyframe_mlp.evaluate_tubes(
                 cf, Vgroup, D_test, dataset, Y_test_np_softmax)
         return [acc, roc_auc, df_recall_s_nodiff, df_ap_s_nodiff]
 
@@ -455,16 +656,17 @@ def torchmlp_feat_classify_test(workfolder, cfg_dict, add_args):
     log.info(f'Mean Recall\n{recall_}')
     log.info(f'mean AP:\n{ap_}')
 
+
 def torchmlp_hack_around_rcnn_features(workfolder, cfg_dict, add_args):
     out, = snippets.get_subfolders(workfolder, ['out'])
     cfg = snippets.YConfig(cfg_dict)
-    Ncfg_mlp.set_defcfg(cfg)
+    Ncfg_keyframe_mlp.set_defcfg(cfg)
     cf = cfg.parse()
 
     # Inputs
     dataset = Dataset_daly_ocv(cf['dataset.mirror'])
     dataset.populate_from_folder(cf['dataset.cache_folder'])
-    Vgroup = Ncfg_mlp.get_vids(cf, dataset)
+    Vgroup = Ncfg_keyframe_mlp.get_vids(cf, dataset)
     computed_featfold = Path(cf['inputs.featfold'])
     featname = cf['inputs.featname']
     keyframes = small.load_pkl(computed_featfold/'keyframes.pkl')
@@ -487,290 +689,17 @@ def torchmlp_hack_around_rcnn_features(workfolder, cfg_dict, add_args):
         pass
 
     D_test.kf = kf
-    df_recall_s_nodiff, df_ap_s_nodiff = Ncfg_mlp.evaluate_tubes(
+    df_recall_s_nodiff, df_ap_s_nodiff = Ncfg_keyframe_mlp.evaluate_tubes(
             cf, Vgroup, D_test, dataset, X[:, 1:])
     log.info(f'AP=\n{df_ap_s_nodiff}')
-
-
-def hack_w_tubefeats(workfolder, cfg_dict, add_args):
-    out, = snippets.get_subfolders(workfolder, ['out'])
-    cfg = snippets.YConfig(cfg_dict)
-    cfg.set_deftype("""
-    seed: [42, int]
-    dataset:
-        name: ['daly', ['daly']]
-        cache_folder: [~, str]
-        mirror: ['uname', ~]
-        val_split:
-            fraction: [0.1, float]
-            nsamplings: [20, int]
-            seed: [42, int]
-    tubes_dwein: [~, str]
-    inputs:
-        featfold: [~, str]
-        keyframes_featfold: [~, ~]
-    """)
-    cfg.set_defaults("""
-    net:
-        H: 32
-    train:
-        lr: 1.0e-5
-        weight_decay: 5.0e-2
-        niters: 2000
-    n_trials: 5
-    log_period: '::'
-    """)
-    cf = cfg.parse()
-
-    # Inputs
-    initial_seed = cf['seed']
-    dataset = Dataset_daly_ocv(cf['dataset.mirror'])
-    dataset.populate_from_folder(cf['dataset.cache_folder'])
-    Vgroup = Ncfg_mlp.get_vids(cf, dataset)
-
-    # / Load tubes
-    # // Weintubes
-    tubes_dwein: Dict[I_dwein, T_dwein] = \
-            loadconvert_tubes_dwein(cf['tubes_dwein'])
-    tubes_dwein_test = dtindex_filter_split(tubes_dwein, Vgroup.test)
-    # // GT tubes
-    tubes_dgt: Dict[I_dgt, T_dgt] = get_daly_gt_tubes(dataset)
-    tubes_dgt_nh = remove_hard_dgt_tubes(tubes_dgt)
-
-    D_trainval, D_train, D_val, D_test, scaler = \
-            _quick_keyframe_datasets(cf, Vgroup)
-
-    # Load connections, arrange back into dwt_index based structure
-    tubes_featfold = Path(cf['inputs.featfold'])
-    connections_f = small.load_pkl(tubes_featfold/'connections_f.pkl')
-    box_inds2 = small.load_pkl(tubes_featfold/'box_inds2.pkl')
-    dwti_h5_inds = get_dwti_h5_mapping(connections_f, box_inds2)
-
-    # Separate out the test tube features
-    test_binds = []
-    for t in tubes_dwein_test:
-        test_binds.append(dwti_h5_inds[t])
-    counts = np.cumsum(np.array([len(x) for x in test_binds]))
-    flat_test_binds = np.hstack(test_binds)
-    as_ind = np.argsort(flat_test_binds)
-    rev_as_ind = np.argsort(as_ind)
-    flat_test_binds_asorted = flat_test_binds[as_ind]
-
-    # Gather these features (as float 16)
-    hf = h5py.File(tubes_featfold/"feats.h5", 'r', libver="latest")
-    dset = hf["roipooled_feats"]
-    flat_test_feats_asorted = dset[flat_test_binds_asorted, :]
-
-    def experiment(exp_ind):
-        # Quickly train a fast one
-        torch.manual_seed(initial_seed+exp_ind)
-        D_in = 2304
-        D_out = len(dataset.action_names)
-        H = 32
-        model = Net_mlp_featcls2(D_in, D_out, H)
-        loss_fn = torch.nn.CrossEntropyLoss(reduction='mean')
-        Ncfg_mlp.optimize(cf, model, loss_fn, D_trainval, '1999::500')
-        Y_test_np_softmax, acc, roc_auc = Ncfg_mlp.evaluate_acc(model, D_test)
-        df_recall_s_nodiff, df_ap_s_nodiff = Ncfg_mlp.evaluate_tubes(
-            cf, Vgroup, D_test, dataset, Y_test_np_softmax)
-
-        # // Quick evaluation over flat_feats
-        # iterating over proper indices right away
-        batched_inds = snippets.leqn_split(rev_as_ind, 25_000)
-        model.eval()
-        flat_test_preds_sm = []
-        for b_inds in tqdm(batched_inds):
-            b_feats = flat_test_feats_asorted[b_inds]
-            X_to_test = torch.from_numpy(b_feats.astype(np.float32))
-            with torch.no_grad():
-                Y_test = model(X_to_test)
-            flat_test_preds_sm.append(softmax(Y_test, axis=1))
-        flat_test_preds_sm_np = np.vstack([
-            x.numpy() for x in flat_test_preds_sm])
-
-        # Merge predictions according to counts
-        test_preds_avg = []
-        for i, b in enumerate(np.r_[0, counts[:-1]]):
-            e = counts[i]
-            preds = flat_test_preds_sm_np[b:e]
-            test_preds_avg.append(preds.mean(0))
-        test_preds_avg = np.vstack(test_preds_avg)
-
-        # assign scores to the test tubes
-        av_stubes: AV_dict[T_dwein_scored] = {}
-        for (dwt_index, tube), scores in zip(
-                tubes_dwein_test.items(), test_preds_avg):
-            (vid, bunch_id, tube_id) = dwt_index
-            for action_name, score in zip(dataset.action_names, scores):
-                stube = tube.copy()
-                stube['score'] = score
-                stube = cast(T_dwein_scored, stube)
-                (av_stubes
-                        .setdefault(action_name, {})
-                        .setdefault(vid, []).append(stube))
-        return av_stubes
-
-    n_trials = 5
-    isaver = snippets.Isaver_simple(
-            small.mkdir(out/'isaver_ntrials'), range(n_trials), experiment)
-    trial_results = isaver.run()
-
-    aps = []
-    for av_stubes in trial_results:
-        av_stubes_ = av_stubes_above_score(av_stubes, 0.0)
-        av_stubes_ = compute_nms_for_av_stubes(av_stubes_, 0.3)
-        iou_thresholds = [.3, .5, .7]
-        tubes_dgt_test = dtindex_filter_split(tubes_dgt_nh, Vgroup.test)
-        av_gt_tubes_test: AV_dict[T_dgt] = push_into_avdict(tubes_dgt_test)
-        df_ap_s_nodiff = compute_ap_for_avtubes_as_df(
-                av_gt_tubes_test, av_stubes_, iou_thresholds, False, False)
-        aps.append(df_ap_s_nodiff)
-    ap_ = pd.concat(aps, keys=range(len(aps)), axis=1).mean(axis=1, level=1)
-    ap_ = (ap_*100).round(2)
-    log.info(f'mean AP:\n{ap_}')
-
-
-def tubefeats_train_mlp(workfolder, cfg_dict, add_args):
-    out, = snippets.get_subfolders(workfolder, ['out'])
-    cfg = snippets.YConfig(cfg_dict)
-    cfg.set_deftype("""
-    seed: [42, int]
-    dataset:
-        name: ['daly', ['daly']]
-        cache_folder: [~, str]
-        mirror: ['uname', ~]
-        val_split:
-            fraction: [0.1, float]
-            nsamplings: [20, int]
-            seed: [42, int]
-    tubes_dwein: [~, str]
-    inputs:
-        featfold: [~, str]
-        keyframes_featfold: [~, ~]
-    """)
-    cfg.set_defaults("""
-    net:
-        H: 32
-    train:
-        lr: 1.0e-5
-        weight_decay: 5.0e-2
-        niters: 2000
-    n_trials: 5
-    log_period: '::'
-    """)
-    cf = cfg.parse()
-
-    # Inputs
-    initial_seed = cf['seed']
-    dataset = Dataset_daly_ocv(cf['dataset.mirror'])
-    dataset.populate_from_folder(cf['dataset.cache_folder'])
-    Vgroup = Ncfg_mlp.get_vids(cf, dataset)
-
-    # / Load tubes
-    # // Weintubes
-    tubes_dwein: Dict[I_dwein, T_dwein] = \
-            loadconvert_tubes_dwein(cf['tubes_dwein'])
-    tubes_dwein_trainval = dtindex_filter_split(tubes_dwein, Vgroup.trainval)
-    tubes_dwein_test = dtindex_filter_split(tubes_dwein, Vgroup.test)
-    # // GT tubes
-    tubes_dgt: Dict[I_dgt, T_dgt] = get_daly_gt_tubes(dataset)
-    tubes_dgt_nh = remove_hard_dgt_tubes(tubes_dgt)
-    tubes_dgt_trainval = dtindex_filter_split(tubes_dgt_nh, Vgroup.trainval)
-
-    # / Divide trainval tubes into classes (intersection with GT tubes)
-    best_ious_trainval = record_overlaps(
-            tubes_dgt_trainval, tubes_dwein_trainval)
-    labels_train: Dict[I_dgt, str] = create_synthetic_tube_labels(
-            tubes_dwein_trainval, best_ious_trainval)
-    # / Create classification dataset
-    labels = dataset.action_names + ['background']
-    ilabels_train = {}
-    for dwti, label in labels_train.items():
-        if label == 'none':
-            continue
-        elif label in ('background', 'background_hard'):
-            ilabel = len(dataset.action_names)
-        else:
-            ilabel = dataset.action_names.index(label)
-        ilabels_train[dwti] = ilabel
-
-    D_trainval, D_train, D_val, D_test, scaler = \
-            _quick_keyframe_datasets(cf, Vgroup)
-
-    # Load connections, arrange back into dwt_index based structure
-    tubes_featfold = Path(cf['inputs.featfold'])
-    connections_f: Dict[Tuple[Vid_daly, int], Box_connections_dwti] = \
-            small.load_pkl(tubes_featfold/'connections_f.pkl')
-    # (N_frames, 2) ndarray of h5 indices
-    box_inds2 = small.load_pkl(tubes_featfold/'box_inds2.pkl')
-    # Mapping dwti -> 1D ndarray of h5 indices
-    dwti_h5_inds = get_dwti_h5_mapping(connections_f, box_inds2)
-
-    # Define model
-    torch.manual_seed(initial_seed)
-    D_in = 2304
-    D_out = len(labels)
-    H = 32
-    model = Net_mlp_featcls2(D_in, D_out, H)
-    loss_fn = torch.nn.CrossEntropyLoss(reduction='mean')
-    train_lr = 1.0e-05
-    weight_decay = 5.0e-2
-    optimizer = torch.optim.AdamW(model.parameters(),
-            lr=train_lr, weight_decay=weight_decay)
-
-    h5_path = tubes_featfold/"feats.h5"
-    # hf = h5py.File(h5_path, 'r', libver="latest")
-    # dset = hf["roipooled_feats"]
-
-    # Batch tubes together (11k labeled trainval tubes)
-    rgen = np.random.default_rng(42)
-    ilabels_order = rgen.permutation(np.arange(len(ilabels_train)))
-    TUBE_BSIZE = 500
-    labels_border = snippets.leqn_split(ilabels_order, TUBE_BSIZE)
-
-    td_h5 = TD_over_h5(h5_path, dwti_h5_inds,
-        ilabels_train, initial_seed, labels_border, scaler)
-
-    BATCH_SIZE = 512
-    NUM_WORKERS = 0
-    loader = torch.utils.data.DataLoader(td_h5,
-        batch_size=None, num_workers=NUM_WORKERS,
-        collate_fn=None)
-
-    log_period = '::1'
-    X_to_train = torch.from_numpy(D_trainval.X)
-    Y_to_train = torch.from_numpy(D_trainval.Y)
-    model.train()
-    for i_batch, data_input in enumerate(loader):
-        feats, labels = data_input
-        pred_train = model(feats)
-        loss = loss_fn(pred_train, labels)
-        if snippets.check_step_sslice(i_batch, log_period):
-            model.eval()
-            with torch.no_grad():
-                pred = model(X_to_train)
-            acc_trainval = pred[:, :-1].argmax(1).eq(
-                Y_to_train).sum().item()/len(Y_to_train) * 100
-            model.train()
-            log.info(f'{i_batch}: {loss.item()} {acc_trainval=:.2f}')
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
 
 
 def tubefeats_train_mlp_in_ram_npy(workfolder, cfg_dict, add_args):
     out, = snippets.get_subfolders(workfolder, ['out'])
     cfg = snippets.YConfig(cfg_dict)
+    Ncfg_daly.set_defcfg(cfg)
     cfg.set_deftype("""
     seed: [42, int]
-    dataset:
-        name: ['daly', ['daly']]
-        cache_folder: [~, str]
-        mirror: ['uname', ~]
-        val_split:
-            fraction: [0.1, float]
-            nsamplings: [20, int]
-            seed: [42, int]
     tubes_dwein: [~, str]
     inputs:
         featfold: [~, str]
@@ -787,129 +716,65 @@ def tubefeats_train_mlp_in_ram_npy(workfolder, cfg_dict, add_args):
     log_period: '::'
     """)
     cf = cfg.parse()
+    initial_seed = cf['seed']
 
     # Inputs
-    initial_seed = cf['seed']
-    dataset = Dataset_daly_ocv(cf['dataset.mirror'])
-    dataset.populate_from_folder(cf['dataset.cache_folder'])
-    Vgroup = Ncfg_mlp.get_vids(cf, dataset)
+    dataset = Ncfg_daly.get_dataset(cf)
+    Vgroup = Ncfg_daly.get_vids(cf, dataset)
+    kfeats = _qload_keyframe_datasets(cf, Vgroup)
+    scaler = _kf_feature_scale(kfeats)
 
-    # Load whole npy file
-    # Load connections, arrange back into dwt_index based structure
+    tubes_dwein_d, tubes_dgt_d = _qload_tubes(cf, dataset, Vgroup)
     tubes_featfold = Path(cf['inputs.featfold'])
-    connections_f: Dict[Tuple[Vid_daly, int], Box_connections_dwti] = \
-            small.load_pkl(tubes_featfold/'connections_f.pkl')
-    # (N_frames, 2) ndarray of h5 indices
-    box_inds2 = small.load_pkl(tubes_featfold/'box_inds2.pkl')
-    # Mapping dwti -> 1D ndarray of h5 indices
-    dwti_to_inds_h5 = get_dwti_h5_mapping(connections_f, box_inds2)
-    with small.QTimer('big numpy load'):
-        # Features
-        big_features = np.load(str(tubes_featfold/"feats.npy"))
+    BIG, dwti_to_inds_big = _qload_tube_to_frame_mapping(tubes_featfold)
 
-    import pudb; pudb.set_trace()  # XXX BREAKPOINT
-    pass
+    cls_labels, dwti_to_label = _qload_synthetic_tube_labels(
+            tubes_dgt_d['train'], tubes_dwein_d['train'], dataset)
 
-    # / Load tubes
-    # // Weintubes
-    tubes_dwein: Dict[I_dwein, T_dwein] = \
-            loadconvert_tubes_dwein(cf['tubes_dwein'])
-    tubes_dwein_trainval = dtindex_filter_split(tubes_dwein, Vgroup.trainval)
-    tubes_dwein_test = dtindex_filter_split(tubes_dwein, Vgroup.test)
-    # // GT tubes
-    tubes_dgt: Dict[I_dgt, T_dgt] = get_daly_gt_tubes(dataset)
-    tubes_dgt_nh = remove_hard_dgt_tubes(tubes_dgt)
-    tubes_dgt_trainval = dtindex_filter_split(tubes_dgt_nh, Vgroup.trainval)
-
-    # / Divide trainval tubes into classes (intersection with GT tubes)
-    best_ious_trainval = record_overlaps(
-            tubes_dgt_trainval, tubes_dwein_trainval)
-    labels_train: Dict[I_dgt, str] = create_synthetic_tube_labels(
-            tubes_dwein_trainval, best_ious_trainval)
-    # / Create classification dataset
-    labels = dataset.action_names + ['background']
-    ilabels_train = {}
-    for dwti, label in labels_train.items():
-        if label == 'none':
-            continue
-        elif label in ('background', 'background_hard'):
-            ilabel = len(dataset.action_names)
-        else:
-            ilabel = dataset.action_names.index(label)
-        ilabels_train[dwti] = ilabel
-
-    D_trainval, D_train, D_val, D_test, scaler = \
-            _quick_keyframe_datasets(cf, Vgroup)
-
-
-    # / Load useful features to RAM
-    # // Prepare indices
-    dwtis = list(ilabels_train.keys())
-    inds_h5 = []
-    for dwti in dwtis:
-        inds_h5.append(dwti_to_inds_h5[dwti])
-    counts = np.cumsum([len(x) for x in inds_h5])
-    flat_inds_h5 = np.hstack(inds_h5)
-    as_ind = np.argsort(flat_inds_h5)
-    rev_as_ind = np.argsort(as_ind)
-    flat_sorted_inds_h5 = flat_inds_h5[as_ind]
-    # /// MAPPING: dwtis -> index over flat_sorted_feats
-    # flat_sorted_inds_h5[irange[X]] == inds_h5[X]
-    flsorted_irange = np.arange(len(flat_sorted_inds_h5))
-    fl_irange = flsorted_irange[rev_as_ind]
-    irange = np.split(fl_irange, counts[:-1])
-    dwti_to_flsi_h5 = dict(zip(dwtis, irange))
-
-
-    # Define model
+    # / Torch section
+    kfeats_t = kf_features_to_torch(kfeats)
     torch.manual_seed(initial_seed)
-    D_in = 2304
-    D_out = len(labels)
-    H = 32
-    model = Net_mlp_featcls2(D_in, D_out, H)
-    loss_fn = torch.nn.CrossEntropyLoss(reduction='mean')
-    train_lr = 1.0e-05
-    weight_decay = 5.0e-2
-    optimizer = torch.optim.AdamW(model.parameters(),
-            lr=train_lr, weight_decay=weight_decay)
-
-    # Load
-
-    h5_path = tubes_featfold/"feats.h5"
-    # hf = h5py.File(h5_path, 'r', libver="latest")
-    # dset = hf["roipooled_feats"]
-
-    # Batch tubes together (11k labeled trainval tubes)
     rgen = np.random.default_rng(42)
-    ilabels_order = rgen.permutation(np.arange(len(ilabels_train)))
-    TUBE_BSIZE = 500
-    labels_border = snippets.leqn_split(ilabels_order, TUBE_BSIZE)
-
-    td_h5 = TD_over_h5(h5_path, dwti_h5_inds,
-        ilabels_train, initial_seed, labels_border, scaler)
-
-    BATCH_SIZE = 512
-    NUM_WORKERS = 0
-    loader = torch.utils.data.DataLoader(td_h5,
-        batch_size=None, num_workers=NUM_WORKERS,
-        collate_fn=None)
+    loss_fn, optimizer, model = _create_quick_model(cls_labels)
 
     log_period = '::1'
-    X_to_train = torch.from_numpy(D_trainval.X)
-    Y_to_train = torch.from_numpy(D_trainval.Y)
+    map_eval_period = '0::10'
     model.train()
-    for i_batch, data_input in enumerate(loader):
-        feats, labels = data_input
-        pred_train = model(feats)
-        loss = loss_fn(pred_train, labels)
-        if snippets.check_step_sslice(i_batch, log_period):
+    N_epochs = 120
+    TUBES_PER_BATCH = 500
+    FRAMES_PER_TUBE = 2
+    for epoch in range(N_epochs):
+        batches = _quick_shuffle_batches(
+            dwti_to_inds_big, rgen, dwti_to_label,
+            TUBES_PER_BATCH, FRAMES_PER_TUBE)
+        loader = _quick_dataloader(BIG, batches, scaler)
+        for i_batch, (feats, labels) in enumerate(loader):
+            pred_train = model(feats)
+            loss = loss_fn(pred_train, labels)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+        if snippets.check_step_sslice(epoch, log_period):
             model.eval()
-            with torch.no_grad():
-                pred = model(X_to_train)
-            acc_trainval = pred[:, :-1].argmax(1).eq(
-                Y_to_train).sum().item()/len(Y_to_train) * 100
+            acc_train = _quick_kf_eval(kfeats_t['train'], model)
+            acc_val = _quick_kf_eval(kfeats_t['val'], model)
             model.train()
-            log.info(f'{i_batch}: {loss.item()} {acc_trainval=:.2f}')
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+            log.info(f'{epoch}: {loss.item()} '
+                    f'{acc_train=:.2f} {acc_val=:.2f}')
+        if snippets.check_step_sslice(epoch, map_eval_period):
+            model.eval()
+            with small.QTimer() as t:
+                av_stubes_val = _quick_fulltube_assign(
+                    BIG, dwti_to_inds_big, tubes_dwein_d['val'], model, scaler, dataset)
+                df_ap = _quick_tubeval(av_stubes_val, tubes_dgt_d['val'])
+            apline = '/'.join(df_ap.loc['all'].values.astype(str))
+            log.info(f'val AP: {apline}, took {t.time:.2f}s')
+            model.train()
+
+    # proper map evaluation
+    model.eval()
+    av_stubes_val = _quick_fulltube_assign(
+        BIG, dwti_to_inds_big, tubes_dwein_d['val'], model, scaler, dataset)
+    df_ap = _quick_tubeval(av_stubes_val, tubes_dgt_d['val'])
+    apline = '/'.join(df_ap.loc['all'].values.astype(str))
+    log.info(f'Final val perf: {apline}')
