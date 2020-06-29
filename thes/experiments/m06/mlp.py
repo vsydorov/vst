@@ -299,6 +299,30 @@ class Net_mlp_onelayer(nn.Module):
         return x
 
 
+class Ncfg_onelayer_mlp:
+    def set_defcfg(cfg):
+        cfg.set_defaults("""
+        net:
+            H: 32
+        optim:
+            lr: 1.0e-5
+            weight_decay: 5.0e-2
+        """)
+
+    def model_define(cf):
+        # Define model
+        D_in = 2304
+        D_out = 11
+        H = cf['net.H']
+        train_lr = cf['optim.lr']
+        weight_decay = cf['optim.weight_decay']
+        model = Net_mlp_onelayer(D_in, D_out, H)
+        loss_fn = torch.nn.CrossEntropyLoss(reduction='mean')
+        optimizer = torch.optim.AdamW(model.parameters(),
+                lr=train_lr, weight_decay=weight_decay)
+        return loss_fn, optimizer, model
+
+
 def record_overlaps(tubes_dgt, tubes_dwein):
     overlap_hits = {}
     for dgt_index, gt_tube in tqdm(tubes_dgt.items(),
@@ -349,26 +373,6 @@ def create_synthetic_tube_labels(tubes_dwein, best_ious):
                 label = 'none'
         labels[dwt_index] = label
     return labels
-
-
-def _stuff():
-    # / Load only useful features to RAM, to be sent to
-    # // Prepare indices
-    dwtis = list(ilabels_train.keys())
-    inds_h5 = []
-    for dwti in dwtis:
-        inds_h5.append(dwti_to_inds_h5[dwti])
-    counts = np.cumsum([len(x) for x in inds_h5])
-    flat_inds_h5 = np.hstack(inds_h5)
-    as_ind = np.argsort(flat_inds_h5)
-    rev_as_ind = np.argsort(as_ind)
-    flat_sorted_inds_h5 = flat_inds_h5[as_ind]
-    # /// MAPPING: dwtis -> index over flat_sorted_feats
-    # flat_sorted_inds_h5[irange[X]] == inds_h5[X]
-    flsorted_irange = np.arange(len(flat_sorted_inds_h5))
-    fl_irange = flsorted_irange[rev_as_ind]
-    irange = np.split(fl_irange, counts[:-1])
-    dwti_to_flsi_h5 = dict(zip(dwtis, irange))
 
 
 def _qload_keyframe_datasets(cf, Vgroup):
@@ -468,20 +472,6 @@ def _qload_synthetic_tube_labels(tubes_dgt, tubes_dwein, dataset):
     return cls_labels, dwti_to_label
 
 
-def _create_quick_model(cls_labels):
-    # Define model
-    train_lr = 1.0e-05
-    weight_decay = 5.0e-2
-    D_in = 2304
-    D_out = len(cls_labels)
-    H = 32
-    model = Net_mlp_onelayer(D_in, D_out, H)
-    loss_fn = torch.nn.CrossEntropyLoss(reduction='mean')
-    optimizer = torch.optim.AdamW(model.parameters(),
-            lr=train_lr, weight_decay=weight_decay)
-    return loss_fn, optimizer, model
-
-
 class TD_thin_over_BIG(torch.utils.data.Dataset):
     def __init__(self, BIG, batches, scaler):
         self.BIG = BIG
@@ -547,11 +537,10 @@ def _quick_kf_eval(kfeat_t, model):
     return acc
 
 
-def _quick_fulltube_assign(
-        BIG, dwti_to_inds_big, tubes_dwein, model, scaler, dataset):
-    test_preds_avg = []
+def _eval_full_tubes(BIG, dwti_to_inds_big, dwtis, model, scaler):
+    tube_sofmaxes = {}
     with torch.no_grad():
-        for i, dwti in enumerate(tubes_dwein.keys()):
+        for dwti in dwtis:
             inds_big = dwti_to_inds_big[dwti]
             feats = BIG[inds_big]
             feats = feats.astype(np.float32)
@@ -560,12 +549,27 @@ def _quick_fulltube_assign(
             feats = torch.from_numpy(feats)
             preds = model(feats)
             preds = softmax(preds, axis=-1)
-            preds = preds[:, :-1].mean(0).numpy()
-            test_preds_avg.append(preds)
+            tube_sofmaxes[dwti] = preds.numpy()
+    return tube_sofmaxes
 
+
+def _compute_tube_full_acc(tube_softmaxes, dwti_to_label):
+    flat_sm = []
+    flat_label = []
+    for dwti, label in dwti_to_label.items():
+        softmaxes = tube_softmaxes[dwti]
+        flat_sm.append(softmaxes)
+        flat_label.append(np.repeat(label, len(softmaxes)))
+    flat_sm = np.vstack(flat_sm)
+    flat_label = np.hstack(flat_label)
+    return accuracy_score(flat_label, flat_sm.argmax(axis=1))
+
+
+def _quick_fulltube_assign(tubes_dwein, tube_softmaxes, dataset):
     av_stubes: AV_dict[T_dwein_scored] = {}
-    for (dwt_index, tube), scores in zip(
-            tubes_dwein.items(), test_preds_avg):
+    for dwt_index, tube in tubes_dwein.items():
+        softmaxes = tube_softmaxes[dwt_index]
+        scores = softmaxes[:, :-1].mean(axis=0)
         (vid, bunch_id, tube_id) = dwt_index
         for action_name, score in zip(dataset.action_names, scores):
             stube = tube.copy()
@@ -705,15 +709,17 @@ def tubefeats_train_mlp_in_ram_npy(workfolder, cfg_dict, add_args):
         featfold: [~, str]
         keyframes_featfold: [~, ~]
     """)
+    Ncfg_onelayer_mlp.set_defcfg(cfg)
     cfg.set_defaults("""
-    net:
-        H: 32
     train:
-        lr: 1.0e-5
-        weight_decay: 5.0e-2
-        niters: 2000
+        tubes_per_batch: 500
+        frames_per_tube: 2
+        n_epochs: 120
+        period:
+            log: '::1'
+            full_eval: '0::10'
+
     n_trials: 5
-    log_period: '::'
     """)
     cf = cfg.parse()
     initial_seed = cf['seed']
@@ -723,30 +729,31 @@ def tubefeats_train_mlp_in_ram_npy(workfolder, cfg_dict, add_args):
     Vgroup = Ncfg_daly.get_vids(cf, dataset)
     kfeats = _qload_keyframe_datasets(cf, Vgroup)
     scaler = _kf_feature_scale(kfeats)
-
     tubes_dwein_d, tubes_dgt_d = _qload_tubes(cf, dataset, Vgroup)
     tubes_featfold = Path(cf['inputs.featfold'])
     BIG, dwti_to_inds_big = _qload_tube_to_frame_mapping(tubes_featfold)
 
-    cls_labels, dwti_to_label = _qload_synthetic_tube_labels(
+    cls_labels, dwti_to_label_train = _qload_synthetic_tube_labels(
             tubes_dgt_d['train'], tubes_dwein_d['train'], dataset)
+    _, dwti_to_label_val = _qload_synthetic_tube_labels(
+            tubes_dgt_d['val'], tubes_dwein_d['val'], dataset)
 
     # / Torch section
     kfeats_t = kf_features_to_torch(kfeats)
     torch.manual_seed(initial_seed)
-    rgen = np.random.default_rng(42)
-    loss_fn, optimizer, model = _create_quick_model(cls_labels)
+    rgen = np.random.default_rng(initial_seed)
+    loss_fn, optimizer, model = Ncfg_onelayer_mlp.model_define(cf)
 
-    log_period = '::1'
-    map_eval_period = '0::10'
+    period_log = cf['train.period.log']
+    period_full_eval = cf['train.period.full_eval']
+    N_epochs = cf['train.n_epochs']
+    tubes_per_batch = cf['train.tubes_per_batch']
+    frames_per_tube = cf['train.frames_per_tube']
     model.train()
-    N_epochs = 120
-    TUBES_PER_BATCH = 500
-    FRAMES_PER_TUBE = 2
     for epoch in range(N_epochs):
         batches = _quick_shuffle_batches(
-            dwti_to_inds_big, rgen, dwti_to_label,
-            TUBES_PER_BATCH, FRAMES_PER_TUBE)
+            dwti_to_inds_big, rgen, dwti_to_label_train,
+            tubes_per_batch, frames_per_tube)
         loader = _quick_dataloader(BIG, batches, scaler)
         for i_batch, (feats, labels) in enumerate(loader):
             pred_train = model(feats)
@@ -754,21 +761,31 @@ def tubefeats_train_mlp_in_ram_npy(workfolder, cfg_dict, add_args):
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-        if snippets.check_step_sslice(epoch, log_period):
+        if snippets.check_step_sslice(epoch, period_log):
             model.eval()
             acc_train = _quick_kf_eval(kfeats_t['train'], model)
             acc_val = _quick_kf_eval(kfeats_t['val'], model)
             model.train()
             log.info(f'{epoch}: {loss.item()} '
                     f'{acc_train=:.2f} {acc_val=:.2f}')
-        if snippets.check_step_sslice(epoch, map_eval_period):
+        if snippets.check_step_sslice(epoch, period_full_eval):
             model.eval()
-            with small.QTimer() as t:
-                av_stubes_val = _quick_fulltube_assign(
-                    BIG, dwti_to_inds_big, tubes_dwein_d['val'], model, scaler, dataset)
+            with small.QTimer('full tube train eval') as t:
+                tube_sofmaxes_train = _eval_full_tubes(
+                    BIG, dwti_to_inds_big, dwti_to_label_train.keys(), model, scaler)
+                acc_full_train = _compute_tube_full_acc(tube_sofmaxes_train, dwti_to_label_train)
+            # flat accuracy operates only on some tubes (according to our synthetic labels)
+            with small.QTimer('full tube val eval') as t:
+                tube_sofmaxes_val = _eval_full_tubes(
+                    BIG, dwti_to_inds_big, tubes_dwein_d['val'].keys(), model, scaler)
+                acc_full_val = _compute_tube_full_acc(tube_sofmaxes_val, dwti_to_label_val)
+            # map operates over all tubes in val set (according to GT map labels)
+            with small.QTimer('ap assign/eval') as t:
+                av_stubes_val = _quick_fulltube_assign(tubes_dwein_d['val'], tube_sofmaxes_val, dataset)
                 df_ap = _quick_tubeval(av_stubes_val, tubes_dgt_d['val'])
             apline = '/'.join(df_ap.loc['all'].values.astype(str))
-            log.info(f'val AP: {apline}, took {t.time:.2f}s')
+            log.info('Full acc: Train {:.2f}, val {:.2f}; AP: val {}'.format(
+                acc_full_train*100, acc_full_val*100, apline))
             model.train()
 
     # proper map evaluation
