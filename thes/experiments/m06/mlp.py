@@ -708,6 +708,7 @@ def tubefeats_train_mlp_in_ram_npy(workfolder, cfg_dict, add_args):
     inputs:
         featfold: [~, str]
         keyframes_featfold: [~, ~]
+    data_scaler: ['keyframes', ['keyframes', 'no']]
     """)
     Ncfg_onelayer_mlp.set_defcfg(cfg)
     cfg.set_defaults("""
@@ -718,6 +719,17 @@ def tubefeats_train_mlp_in_ram_npy(workfolder, cfg_dict, add_args):
         period:
             log: '::1'
             full_eval: '0::10'
+            eval:
+                full_train: '::'
+                full_val: '0::20'
+    kf_pretrain:
+        enabled: False
+        train:
+            lr: 1.0e-5
+            weight_decay: 5.0e-2
+            niters: 2001
+        period:
+            log: '0::500'
 
     n_trials: 5
     """)
@@ -728,7 +740,12 @@ def tubefeats_train_mlp_in_ram_npy(workfolder, cfg_dict, add_args):
     dataset = Ncfg_daly.get_dataset(cf)
     Vgroup = Ncfg_daly.get_vids(cf, dataset)
     kfeats = _qload_keyframe_datasets(cf, Vgroup)
-    scaler = _kf_feature_scale(kfeats)
+    if cf['data_scaler'] == 'keyframes':
+        scaler = _kf_feature_scale(kfeats)
+    elif cf['data_scaler'] == 'no':
+        scaler = None
+    else:
+        raise RuntimeError()
     tubes_dwein_d, tubes_dgt_d = _qload_tubes(cf, dataset, Vgroup)
     tubes_featfold = Path(cf['inputs.featfold'])
     BIG, dwti_to_inds_big = _qload_tube_to_frame_mapping(tubes_featfold)
@@ -744,8 +761,32 @@ def tubefeats_train_mlp_in_ram_npy(workfolder, cfg_dict, add_args):
     rgen = np.random.default_rng(initial_seed)
     loss_fn, optimizer, model = Ncfg_onelayer_mlp.model_define(cf)
 
+    # pretraining
+    if cf['kf_pretrain.enabled']:
+        pretrain_lr = cf['kf_pretrain.train.lr']
+        pretrain_weight_decay = cf['kf_pretrain.train.weight_decay']
+        pretrain_niters = cf['kf_pretrain.train.niters']
+        pretrain_optimizer = torch.optim.AdamW(model.parameters(),
+                lr=pretrain_lr, weight_decay=pretrain_weight_decay)
+        pretrain_period_log = cf['kf_pretrain.period.log']
+        model.train()
+        for t in range(pretrain_niters):
+            pred_train = model(kfeats_t['train']['X'])
+            loss = loss_fn(pred_train, kfeats_t['train']['Y'])
+            if snippets.check_step_sslice(t, pretrain_period_log):
+                model.eval()
+                kacc_train = _quick_kf_eval(kfeats_t['train'], model)
+                kacc_val = _quick_kf_eval(kfeats_t['val'], model)
+                model.train()
+                log.info(f'{t}: {loss.item()} '
+                        f'{kacc_train=:.2f} {kacc_val=:.2f}')
+            pretrain_optimizer.zero_grad()
+            loss.backward()
+            pretrain_optimizer.step()
+
     period_log = cf['train.period.log']
-    period_full_eval = cf['train.period.full_eval']
+    period_eval_full_train = cf['train.period.eval.full_train']
+    period_eval_full_val = cf['train.period.eval.full_val']
     N_epochs = cf['train.n_epochs']
     tubes_per_batch = cf['train.tubes_per_batch']
     frames_per_tube = cf['train.frames_per_tube']
@@ -763,35 +804,38 @@ def tubefeats_train_mlp_in_ram_npy(workfolder, cfg_dict, add_args):
             optimizer.step()
         if snippets.check_step_sslice(epoch, period_log):
             model.eval()
-            acc_train = _quick_kf_eval(kfeats_t['train'], model)
-            acc_val = _quick_kf_eval(kfeats_t['val'], model)
+            kacc_train = _quick_kf_eval(kfeats_t['train'], model)
+            kacc_val = _quick_kf_eval(kfeats_t['val'], model)
             model.train()
             log.info(f'{epoch}: {loss.item()} '
-                    f'{acc_train=:.2f} {acc_val=:.2f}')
-        if snippets.check_step_sslice(epoch, period_full_eval):
+                    f'{kacc_train=:.2f} {kacc_val=:.2f}')
+        if snippets.check_step_sslice(epoch, period_eval_full_train):
             model.eval()
-            with small.QTimer('full tube train eval') as t:
+            with small.QTimer() as t:
                 tube_sofmaxes_train = _eval_full_tubes(
                     BIG, dwti_to_inds_big, dwti_to_label_train.keys(), model, scaler)
                 acc_full_train = _compute_tube_full_acc(tube_sofmaxes_train, dwti_to_label_train)
-            # flat accuracy operates only on some tubes (according to our synthetic labels)
-            with small.QTimer('full tube val eval') as t:
-                tube_sofmaxes_val = _eval_full_tubes(
-                    BIG, dwti_to_inds_big, tubes_dwein_d['val'].keys(), model, scaler)
-                acc_full_val = _compute_tube_full_acc(tube_sofmaxes_val, dwti_to_label_val)
-            # map operates over all tubes in val set (according to GT map labels)
-            with small.QTimer('ap assign/eval') as t:
-                av_stubes_val = _quick_fulltube_assign(tubes_dwein_d['val'], tube_sofmaxes_val, dataset)
-                df_ap = _quick_tubeval(av_stubes_val, tubes_dgt_d['val'])
-            apline = '/'.join(df_ap.loc['all'].values.astype(str))
-            log.info('Full acc: Train {:.2f}, val {:.2f}; AP: val {}'.format(
-                acc_full_train*100, acc_full_val*100, apline))
+            tsec = t.time
+            log.info('Train full keyframe acc: Train {:.2f}, took {:.2f} sec'.format(
+                acc_full_train*100, tsec))
             model.train()
+        if snippets.check_step_sslice(epoch, period_eval_full_val):
+            # flat accuracy operates only on some tubes (according to our synthetic labels)
+            tube_sofmaxes_val = _eval_full_tubes(
+                BIG, dwti_to_inds_big, tubes_dwein_d['val'].keys(), model, scaler)
+            acc_full_val = _compute_tube_full_acc(tube_sofmaxes_val, dwti_to_label_val)
+            # map operates over all tubes in val set (according to GT map labels)
+            av_stubes_val = _quick_fulltube_assign(tubes_dwein_d['val'], tube_sofmaxes_val, dataset)
+            df_ap = _quick_tubeval(av_stubes_val, tubes_dgt_d['val'])
+            apline = '/'.join(df_ap.loc['all'].values.astype(str))
+            log.info('Val full keyframe acc: {:.2f}, val tube ap {}'.format(
+                acc_full_val*100, apline))
 
     # proper map evaluation
     model.eval()
-    av_stubes_val = _quick_fulltube_assign(
-        BIG, dwti_to_inds_big, tubes_dwein_d['val'], model, scaler, dataset)
+    tube_sofmaxes_val = _eval_full_tubes(
+        BIG, dwti_to_inds_big, tubes_dwein_d['val'].keys(), model, scaler)
+    av_stubes_val = _quick_fulltube_assign(tubes_dwein_d['val'], tube_sofmaxes_val, dataset)
     df_ap = _quick_tubeval(av_stubes_val, tubes_dgt_d['val'])
     apline = '/'.join(df_ap.loc['all'].values.astype(str))
     log.info(f'Final val perf: {apline}')
