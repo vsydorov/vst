@@ -576,8 +576,7 @@ def _tubefeats_trainset_perf(model, da_big, dwti_to_label_train):
         tube_sofmaxes_train = _eval_tube_softmaxes(model, da_big, dwti_to_label_train.keys())
         acc_full_train = _compute_tube_full_acc(tube_sofmaxes_train, dwti_to_label_train)
     tsec = t.time
-    log.info('Train full keyframe acc: Train {:.2f}, took {:.2f} sec'.format(
-        acc_full_train*100, tsec))
+    return acc_full_train, tsec
 
 
 def _tubefeats_evalset_perf(model, da_big, dwti_to_label_eval,
@@ -597,12 +596,12 @@ def _tubefeats_evalset_perf(model, da_big, dwti_to_label_eval,
 def _tubefeats_training(cf, model, loss_fn, rgen, da_big,
         dwti_to_label_train, dwti_to_label_eval,
         tkfeats_train, tkfeats_eval,
-        tubes_dwein_eval, tubes_dgt_eval, dataset):
+        tubes_dwein_eval, tubes_dgt_eval, sset_eval, dataset):
     optimizer = torch.optim.AdamW(model.parameters(),
             lr=cf['train.lr'], weight_decay=cf['train.weight_decay'])
     period_log = cf['train.period.log']
-    period_eval_full_train = cf['train.period.eval.full_train']
-    period_eval_full_val = cf['train.period.eval.full_val']
+    period_eval_trainset = cf['train.period.eval.trainset']
+    period_eval_evalset = cf['train.period.eval.evalset']
     n_epochs = cf['train.n_epochs']
     tubes_per_batch = cf['train.tubes_per_batch']
     frames_per_tube = cf['train.frames_per_tube']
@@ -619,18 +618,22 @@ def _tubefeats_training(cf, model, loss_fn, rgen, da_big,
         if snippets.check_step_sslice(epoch, period_log):
             model.eval()
             kacc_train = _quick_kf_eval(tkfeats_train, model)
-            kacc_val = _quick_kf_eval(tkfeats_eval, model)
+            kacc_eval = _quick_kf_eval(tkfeats_eval, model)
             model.train()
             log.info(f'{epoch}: {loss.item()} '
-                    f'{kacc_train=:.2f} {kacc_val=:.2f}')
-        if snippets.check_step_sslice(epoch, period_eval_full_train):
+                    f'{kacc_train=:.2f} {kacc_eval=:.2f}')
+        if snippets.check_step_sslice(epoch, period_eval_trainset):
             model.eval()
-            _tubefeats_trainset_perf(model, da_big, dwti_to_label_train)
+            acc, tsec = _tubefeats_trainset_perf(model, da_big, dwti_to_label_train)
             model.train()
-        if snippets.check_step_sslice(epoch, period_eval_full_val):
+            log.info('Train full keyframe acc: '
+                'Train {:.2f}, took {:.2f} sec'.format(acc*100, tsec))
+        if snippets.check_step_sslice(epoch, period_eval_evalset):
             model.eval()
-            _tubefeats_evalset_perf(model, da_big, dwti_to_label_eval,
+            evalset_result = _tubefeats_evalset_perf(model, da_big, dwti_to_label_eval,
                 dataset, tubes_dwein_eval, tubes_dgt_eval)
+            log.info(f'Evalset perf at {epoch=}')
+            _tubefeats_display_evalresults(evalset_result, sset_eval)
             model.train()
 
 
@@ -639,7 +642,7 @@ def _tubefeats_experiment(
         tkfeats_train, tkfeats_eval,
         dwti_to_label_train, dwti_to_label_eval,
         tubes_dwein_eval, tubes_dgt_eval,
-        dataset):
+        sset_eval, dataset):
     torch.manual_seed(initial_seed)
     rgen = np.random.default_rng(initial_seed)
 
@@ -652,7 +655,8 @@ def _tubefeats_experiment(
     _tubefeats_training(cf, model, loss_fn, rgen, da_big,
         dwti_to_label_train, dwti_to_label_eval,
         tkfeats_train, tkfeats_eval,
-        tubes_dwein_eval, tubes_dgt_eval, dataset)
+        tubes_dwein_eval, tubes_dgt_eval,
+        sset_eval, dataset)
 
     # proper map evaluation
     model.eval()
@@ -784,10 +788,9 @@ def tubefeats_train_mlp(workfolder, cfg_dict, add_args):
         frames_per_tube: 2
         period:
             log: '::1'
-            full_eval: '0::10'
             eval:
-                full_train: '::'
-                full_val: '0::20'
+                trainset: '::'
+                evalset: '0::20'
     kf_pretrain:
         enabled: False
         train:
@@ -834,11 +837,11 @@ def tubefeats_train_mlp(workfolder, cfg_dict, add_args):
 
     def experiment(i):
         result = _tubefeats_experiment(
-            cf, initial_seed, da_big,
+            cf, initial_seed+i, da_big,
             tkfeats_train, tkfeats_eval,
             dwti_to_label_train, dwti_to_label_eval,
             tubes_dwein_eval, tubes_dgt_eval,
-            dataset)
+            sset_eval, dataset)
         _tubefeats_display_evalresults(result, sset_eval)
         return result
 
