@@ -777,6 +777,7 @@ def kffeats_train_mlp(workfolder, cfg_dict, add_args):
     log.info(f'Train/eval splits: {sset_train} {sset_eval=}')
 
     def experiment(i):
+        log.info(f'Experiment {i}')
         result = _kffeats_experiment(
             cf, initial_seed+i, da_big,
             tkfeats_train, tkfeats_eval,
@@ -791,12 +792,15 @@ def kffeats_train_mlp(workfolder, cfg_dict, add_args):
 
     if len(trial_results) == 1:
         return  # no need to avg
-    avg_result = {}
-    for k in ['kacc_train', 'kacc_eval', 'kf_acc', 'kf_roc_auc']:
-        avg_result[k] = np.mean([tr[k] for tr in trial_results])
     df_keys = ['df_recall_cheat', 'df_ap_cheat']
+    scalar_keys = ['kacc_train', 'kacc_eval', 'kf_acc', 'kf_roc_auc']
     if 'df_ap_full' in trial_results[0]:
         df_keys.append('df_ap_full')
+    if 'acc_flattube_synt' in trial_results[0]:
+        scalar_keys.append('acc_flattube_synt')
+    avg_result = {}
+    for k in scalar_keys:
+        avg_result[k] = np.mean([tr[k] for tr in trial_results])
     for k in df_keys:
         to_avg = [tr[k] for tr in trial_results]
         df = pd.concat(to_avg,
@@ -879,6 +883,7 @@ def tubefeats_train_mlp(workfolder, cfg_dict, add_args):
     tubes_dgt_eval = tubes_dgt_d[sset_eval]
 
     def experiment(i):
+        log.info(f'Experiment {i}')
         result = _tubefeats_experiment(
             cf, initial_seed+i, da_big,
             tkfeats_train, tkfeats_eval,
@@ -894,8 +899,8 @@ def tubefeats_train_mlp(workfolder, cfg_dict, add_args):
     if len(trial_results) == 1:
         return  # no need to avg
     avg_result = {}
-    avg_result['acc_full'] = np.mean([tr['acc_full'] for tr in trial_results])
-    to_avg = [tr['df_ap'] for tr in trial_results]
-    avg_result['df_ap']= pd.concat(to_avg, keys=range(len(to_avg)), axis=1).mean(axis=1, level=1)
+    avg_result['acc_flattube_synt'] = np.mean([tr['acc_flattube_synt'] for tr in trial_results])
+    to_avg = [tr['df_ap_full'] for tr in trial_results]
+    avg_result['df_ap_full']= pd.concat(to_avg, keys=range(len(to_avg)), axis=1).mean(axis=1, level=1)
     log.info('Results for average over {} trials'.format(n_trials))
     _tubefeats_display_evalresults(avg_result, sset_eval)
