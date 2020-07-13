@@ -1,5 +1,3 @@
-import h5py
-from tqdm import tqdm
 import numpy as np
 import pandas as pd
 import logging
@@ -17,6 +15,8 @@ import torch.nn.functional as F
 
 from vsydorov_tools import small
 
+from thes.data.dataset.daly import (
+    Ncfg_daly, load_gt_and_wein_tubes)
 from thes.data.dataset.external import (
     Dataset_daly_ocv, Vid_daly,
     get_daly_split_vids, split_off_validation_set, Action_name_daly)
@@ -26,6 +26,9 @@ from thes.data.tubes.types import (
     AV_dict, loadconvert_tubes_dwein, Objaction_dets,
     dtindex_filter_split, av_stubes_above_score,
     Box_connections_dwti)
+from thes.data.tubes.routines import (
+    score_ftubes_via_objaction_overlap_aggregation,
+    qload_synthetic_tube_labels)
 from thes.data.tubes.nms import (
     compute_nms_for_av_stubes,)
 from thes.evaluation.recall import (
@@ -33,51 +36,9 @@ from thes.evaluation.recall import (
 from thes.evaluation.ap.convert import (
     compute_ap_for_avtubes_as_df)
 from thes.tools import snippets
-from thes.data.tubes.routines import (
-    score_ftubes_via_objaction_overlap_aggregation)
-from thes.data.tubes.routines import (
-    spatial_tube_iou_v3,
-    temporal_ious_where_positive)
 from thes.pytorch import (sequence_batch_collate_v2, default_collate)
 
 log = logging.getLogger(__name__)
-
-
-class Ncfg_daly:
-    @staticmethod
-    def set_defcfg(cfg):
-        cfg.set_deftype("""
-        dataset:
-            name: ['daly', ['daly']]
-            cache_folder: [~, str]
-            mirror: ['uname', ~]
-            val_split:
-                fraction: [0.1, float]
-                nsamplings: [20, int]
-                seed: [42, int]
-        """)
-
-    @staticmethod
-    def get_dataset(cf):
-        dataset = Dataset_daly_ocv(cf['dataset.mirror'])
-        dataset.populate_from_folder(cf['dataset.cache_folder'])
-        return dataset
-
-    @staticmethod
-    def get_vids(cf, dataset):
-        v_fraction = cf['dataset.val_split.fraction']
-        v_nsamplings = cf['dataset.val_split.nsamplings']
-        v_seed = cf['dataset.val_split.seed']
-
-        val, train = split_off_validation_set(
-                dataset, v_fraction, v_nsamplings, v_seed)
-        vgroup = {
-            'train': train,
-            'val': val,
-            'trainval': get_daly_split_vids(dataset, 'train'),
-            'test': get_daly_split_vids(dataset, 'test'),
-        }
-        return vgroup
 
 
 class Ncfg_kfeats:
@@ -184,57 +145,6 @@ class Net_mlp_onelayer(nn.Module):
         return x
 
 
-def record_overlaps(tubes_dgt, tubes_dwein):
-    overlap_hits = {}
-    for dgt_index, gt_tube in tubes_dgt.items():
-        vid, action_name, ins_id = dgt_index
-        dwt_vid = {k: v for k, v in tubes_dwein.items()
-                if k[0] == vid}
-        dwt_vid_keys = list(dwt_vid.keys())
-        dwt_vid_values = list(dwt_vid.values())
-        dwt_frange = np.array([
-            (x['start_frame'], x['end_frame']) for x in dwt_vid_values])
-        # Temporal
-        t_ious, pids = temporal_ious_where_positive(
-            gt_tube['start_frame'], gt_tube['end_frame'], dwt_frange)
-        # Spatial (where temporal >0)
-        dwt_intersect = [dwt_vid_values[pid] for pid in pids]
-        sp_mious = [spatial_tube_iou_v3(p, gt_tube)
-                for p in dwt_intersect]
-        for p, t_iou, sp_miou in zip(pids, t_ious, sp_mious):
-            st_iou = t_iou * sp_miou
-            if st_iou > 0:
-                dwt_vid = dwt_vid_keys[p]
-                overlap_hits.setdefault(dwt_vid, []).append(
-                        [action_name, (t_iou, sp_miou, st_iou)])
-    best_ious = {}
-    for k, v in overlap_hits.items():
-        vsorted_last = sorted(v, key=lambda x: x[1][0])[-1]
-        action_name = vsorted_last[0]
-        st_miou = vsorted_last[1][2]
-        best_ious[k] = (action_name, st_miou)
-    return best_ious
-
-
-def create_synthetic_tube_labels(tubes_dwein, best_ious):
-    # Assign to classes
-    POS_THRESH = 0.5
-    HN_THRESH = 0.3
-    labels: Dict[I_dgt, str] = {}
-    for dwt_index in tubes_dwein.keys():
-        label = 'background'
-        if dwt_index in best_ious:
-            best_cls, best_iou = best_ious[dwt_index]
-            if best_iou > POS_THRESH:
-                label = best_cls
-            elif 0 < best_iou < HN_THRESH:
-                label = 'background_hard'
-            else:
-                label = 'none'
-        labels[dwt_index] = label
-    return labels
-
-
 def fitscale_kfeats(kfeats_d):
     # Optional standard scaling on trianval
     scaler = StandardScaler()
@@ -242,21 +152,6 @@ def fitscale_kfeats(kfeats_d):
     for sset, kfeats in kfeats_d.items():
         kfeats['X'] = scaler.transform(kfeats['X'])
     return scaler
-
-
-def load_gt_and_wein_tubes(tubes_dwein_fold, dataset, vgroup):
-    # / Load tubes
-    tubes_dwein_all: Dict[I_dwein, T_dwein] = \
-            loadconvert_tubes_dwein(tubes_dwein_fold)
-    tubes_dgt_all: Dict[I_dgt, T_dgt] = get_daly_gt_tubes(dataset)
-    tubes_dgt_all = remove_hard_dgt_tubes(tubes_dgt_all)
-    # // Per subset
-    tubes_dwein_d = {}
-    tubes_dgt_d = {}
-    for sset, vids in vgroup.items():
-        tubes_dwein_d[sset] = dtindex_filter_split(tubes_dwein_all, vids)
-        tubes_dgt_d[sset] = dtindex_filter_split(tubes_dgt_all, vids)
-    return tubes_dwein_d, tubes_dgt_d
 
 
 def get_dwti_big_mapping(
@@ -286,25 +181,6 @@ def load_big_features(tubes_featfold):
     with small.QTimer('big numpy load'):
         BIG = np.load(str(tubes_featfold/"feats.npy"))
     return BIG, dwti_to_inds_big
-
-
-def _qload_synthetic_tube_labels(tubes_dgt, tubes_dwein, dataset):
-    # / Divide trainval tubes into classes (intersection with GT tubes)
-    best_ious = record_overlaps(tubes_dgt, tubes_dwein)
-    labels_train: Dict[I_dgt, str] = create_synthetic_tube_labels(
-            tubes_dwein, best_ious)
-    # / Create classification dataset
-    cls_labels = dataset.action_names + ['background']
-    dwti_to_label = {}
-    for dwti, label in labels_train.items():
-        if label == 'none':
-            continue
-        elif label in ('background', 'background_hard'):
-            ilabel = len(dataset.action_names)
-        else:
-            ilabel = dataset.action_names.index(label)
-        dwti_to_label[dwti] = ilabel
-    return cls_labels, dwti_to_label
 
 
 class TD_thin_over_BIG(torch.utils.data.Dataset):
@@ -501,7 +377,7 @@ def _kffeats_eval(
     # // Evaluation of full wein-tubes with the trained model
     if cf['eval.full_tubes']:
         # here we are mirroring '_tubefeats_evalset_perf'
-        _, dwti_to_label_eval = _qload_synthetic_tube_labels(
+        _, dwti_to_label_eval = qload_synthetic_tube_labels(
             tubes_dgt_eval, tubes_dwein_eval, dataset)
         tube_sofmaxes_eval = _eval_tube_softmaxes(
             model, da_big, tubes_dwein_eval.keys())
@@ -869,9 +745,9 @@ def tubefeats_train_mlp(workfolder, cfg_dict, add_args):
     BIG, dwti_to_inds_big = load_big_features(cf['inputs.big.fold'])
     da_big = Data_access_big(BIG, dwti_to_inds_big, scaler)
 
-    cls_labels, dwti_to_label_train = _qload_synthetic_tube_labels(
+    cls_labels, dwti_to_label_train = qload_synthetic_tube_labels(
             tubes_dgt_d[sset_train], tubes_dwein_d[sset_train], dataset)
-    _, dwti_to_label_eval = _qload_synthetic_tube_labels(
+    _, dwti_to_label_eval = qload_synthetic_tube_labels(
             tubes_dgt_d[sset_eval], tubes_dwein_d[sset_eval], dataset)
 
     # / Torch section

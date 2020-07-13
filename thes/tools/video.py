@@ -27,7 +27,6 @@ def yana_size_query(X, dsize):
         isize = dsize[1], dsize[0]
     return isize
 
-
 def randint0(value):
     if value == 0:
         return 0
@@ -56,7 +55,7 @@ def threaded_ocv_resize_clip(
             interpolation=interpolation))
     concurrent.futures.wait(futures)
     thread_executor.shutdown()
-    scaled = np.array([x.result() for x in futures])
+    scaled = [x.result() for x in futures]
     return scaled
 
 
@@ -107,14 +106,14 @@ def ffmpeg_video_frames_read(video_path, fps):
 """ Transforms """
 
 
-def tfm_video_resize_threaded(X, dsize, max_workers=8):
+def tfm_video_resize_threaded(X_list, dsize, max_workers=8):
     # 256 resize, normalize, group,
-    h_before, w_before = X.shape[1:3]
-    X = threaded_ocv_resize_clip(X, dsize)
-    h_resized, w_resized = X.shape[1:3]
+    h_before, w_before = X_list[0].shape[0:2]
+    X_list = threaded_ocv_resize_clip(X_list, dsize, max_workers)
+    h_resized, w_resized = X_list[0].shape[0:2]
     params = {'h_before': h_before, 'w_before': w_before,
               'h_resized': h_resized, 'w_resized': w_resized}
-    return X, params
+    return X_list, params
 
 
 def tfm_video_random_crop(first64, th, tw):
@@ -165,3 +164,6 @@ def tfm_unresize_box(box, params):
     real_scale = np.tile(np.r_[real_scale_h, real_scale_w], 2)
     box = (box / real_scale).astype(int)
     return box
+
+
+""" Video preparation """

@@ -1,61 +1,46 @@
 import h5py
 import numpy as np
 import pprint
-import pandas as pd
 import logging
 import time
 import copy
 from pathlib import Path
 from types import MethodType
 from typing import (  # NOQA
-        Dict, Any, List, Optional, Tuple, TypedDict, Set)
+    Dict, Any, List, Optional, Tuple, TypedDict, Set)
 from tqdm import tqdm
 import concurrent.futures
-
 import cv2
 import av
 
 import torch
 import torch.nn as nn
 import torch.utils.data
-import torch.nn.functional as F
-
+from detectron2.layers import ROIAlign
 import slowfast.models
 import slowfast.utils.checkpoint as cu
-
-from detectron2.layers import ROIAlign
 
 from vsydorov_tools import small
 from vsydorov_tools import cv as vt_cv
 from vsydorov_tools import log as vt_log
 
+from thes.data.dataset.daly import (
+    get_daly_keyframes_to_cover)
 from thes.data.dataset.external import (
-    Dataset_daly_ocv, Vid_daly,
-    get_daly_split_vids, split_off_validation_set)
+    Dataset_daly_ocv, Vid_daly)
 from thes.data.tubes.types import (
-    I_dwein, T_dwein, T_dwein_scored, I_dgt, T_dgt,
-    get_daly_gt_tubes, push_into_avdict,
-    AV_dict, loadconvert_tubes_dwein, Objaction_dets,
-    dtindex_filter_split, av_stubes_above_score,
-    Box_connections_dwti)
-from thes.data.tubes.nms import (
-    compute_nms_for_av_stubes,)
-from thes.evaluation.recall import (
-    compute_recall_for_avtubes_as_dfs,)
-from thes.evaluation.ap.convert import (
-    compute_ap_for_avtubes_as_df)
-from thes.tools import snippets
+    I_dwein, T_dwein,
+    loadconvert_tubes_dwein, Box_connections_dwti)
+from thes.data.tubes.routines import (
+    group_tubes_on_frame_level)
 from thes.slowfast.cfg import (basic_sf_cfg)
+from thes.tools import snippets
+from thes.tools.video import (
+    tfm_video_resize_threaded, tfm_video_center_crop)
 from thes.caffe import (nicolas_net, model_test_get_image_blob)
 from thes.pytorch import sequence_batch_collate_v2
-from thes.data.tubes.routines import (
-        score_ftubes_via_objaction_overlap_aggregation)
 
 log = logging.getLogger(__name__)
-
-
-# def profile(func):
-#     return func
 
 
 def np_to_gpu(X):
@@ -66,7 +51,6 @@ def np_to_gpu(X):
 
 norm_mean = np.array([0.45, 0.45, 0.45])
 norm_std = np.array([0.225, 0.225, 0.225])
-test_crop_size = 256
 
 def sf_resnet_headless_forward(self, x):
     # slowfast/models/video_model_builder.py/ResNet.forward
@@ -189,85 +173,6 @@ class Extractor_fullframe(nn.Module):
         return result
 
 
-def yana_size_query(X, dsize):
-    # https://github.com/hassony2/torch_videovision
-    def _get_resize_sizes(im_h, im_w, size):
-        if im_w < im_h:
-            ow = size
-            oh = int(size * im_h / im_w)
-        else:
-            oh = size
-            ow = int(size * im_w / im_h)
-        return oh, ow
-
-    if isinstance(dsize, int):
-        im_h, im_w, im_c = X[0].shape
-        new_h, new_w = _get_resize_sizes(im_h, im_w, dsize)
-        isize = (new_w, new_h)
-    else:
-        assert len(dsize) == 2
-        isize = dsize[1], dsize[0]
-    return isize
-
-def threaded_ocv_resize_clip(
-        X, dsize, max_workers=8,
-        interpolation=cv2.INTER_LINEAR):
-    isize = yana_size_query(X, dsize)
-    thread_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=max_workers)
-    futures = []
-    for img in X:
-        futures.append(thread_executor.submit(
-            cv2.resize, img, isize,
-            interpolation=interpolation))
-    concurrent.futures.wait(futures)
-    thread_executor.shutdown()
-    scaled = [x.result() for x in futures]
-    return scaled
-
-
-def tfm_video_resize_threaded(X_list, dsize, max_workers=8):
-    # 256 resize, normalize, group,
-    h_before, w_before = X_list[0].shape[0:2]
-    X_list = threaded_ocv_resize_clip(X_list, dsize, max_workers)
-    h_resized, w_resized = X_list[0].shape[0:2]
-    params = {'h_before': h_before, 'w_before': w_before,
-              'h_resized': h_resized, 'w_resized': w_resized}
-    return X_list, params
-
-
-def tfm_video_center_crop(first64, th, tw):
-    h_before, w_before = first64.shape[1:3]
-    ccrop_i = int((h_before-th)/2)
-    ccrop_j = int((w_before-tw)/2)
-    first64 = first64[:,
-            ccrop_i:ccrop_i+th,
-            ccrop_j:ccrop_j+tw, :]
-    params = {'h_before': h_before, 'w_before': w_before,
-              'i': ccrop_i, 'j': ccrop_j,
-              'th': th, 'tw': tw}
-    return first64, params
-
-
-def prepare_video(X_list, flip):
-    # Resize video, flip to RGB, convert to torch tensor
-    if flip:
-        if isinstance(X_list, list):
-            X_list = [np.flip(x, -1) for x in X_list]
-        else:
-            X_list = np.flip(X_list, -1)
-    # Resize
-    X_list, resize_params = tfm_video_resize_threaded(
-            X_list, test_crop_size)
-    X = np.stack(X_list)
-    # Centercrop
-    X, ccrop_params = tfm_video_center_crop(
-            X, test_crop_size, test_crop_size)
-    # Convert to torch
-    Xt = torch.from_numpy(X)
-    return Xt, resize_params, ccrop_params
-
-
 def to_gpu_normalize_permute(Xt, norm_mean_t, norm_std_t):
     # Convert to float on GPU
     X_f32c = Xt.type(torch.cuda.FloatTensor)
@@ -356,6 +261,24 @@ def sample_via_pyav(video_path, finds_to_sample, threading=True):
     return sampled_framelist
 
 
+def prepare_video_resize_crop_flip(
+        X_list, crop_size, flip_lastdim):
+    # Resize video, flip to RGB
+    if flip_lastdim:
+        if isinstance(X_list, list):
+            X_list = [np.flip(x, -1) for x in X_list]
+        else:
+            X_list = np.flip(X_list, -1)
+    # Resize
+    X_list, resize_params = tfm_video_resize_threaded(
+            X_list, crop_size)
+    X = np.stack(X_list)
+    # Centercrop
+    X, ccrop_params = tfm_video_center_crop(
+            X, crop_size, crop_size)
+    return X, resize_params, ccrop_params
+
+
 class TDataset_over_keyframes(torch.utils.data.Dataset):
     def __init__(self, keyframes, model_nframes, model_sample,
             is_slowfast: bool, slowfast_alpha: int,
@@ -375,20 +298,26 @@ class TDataset_over_keyframes(torch.utils.data.Dataset):
         finds_to_sample = i0 + self.sample_grid0
         finds_to_sample = np.clip(
                 finds_to_sample, 0, keyframe['nframes']-1)
+        test_crop_size = 256
 
         if self._load_method == 'opencv':
             with vt_cv.video_capture_open(video_path) as vcap:
                 framelist_u8_bgr = vt_cv.video_sample(
                         vcap, finds_to_sample)
-            Xt, resize_params, ccrop_params = prepare_video(
-                    framelist_u8_bgr, flip=True)
+            X, resize_params, ccrop_params = \
+                prepare_video_resize_crop_flip(
+                    framelist_u8_bgr, test_crop_size, True)
         elif self._load_method == 'pyav':
             framelist_u8_rgb = sample_via_pyav(
                     video_path, finds_to_sample, True)
-            Xt, resize_params, ccrop_params = prepare_video(
-                    framelist_u8_rgb, flip=False)
+            X, resize_params, ccrop_params = \
+                prepare_video_resize_crop_flip(
+                    framelist_u8_rgb, test_crop_size, False)
         else:
             raise RuntimeError()
+
+        # Convert to torch
+        Xt = torch.from_numpy(X)
 
         # Resolve pathways
         if self._is_slowfast:
@@ -444,19 +373,26 @@ class TDataset_over_connections(torch.utils.data.Dataset):
         finds_to_sample = i0 + self.sample_grid0
         finds_to_sample = np.clip(finds_to_sample, 0, nframes-1)
 
+        test_crop_size = 256
+
         if self._load_method == 'opencv':
             with vt_cv.video_capture_open(video_path) as vcap:
                 framelist_u8_bgr = vt_cv.video_sample(
                         vcap, finds_to_sample)
-            Xt, resize_params, ccrop_params = prepare_video(
-                    framelist_u8_bgr, flip=True)
+            X, resize_params, ccrop_params = \
+                prepare_video_resize_crop_flip(
+                    framelist_u8_bgr, test_crop_size, True)
         elif self._load_method == 'pyav':
             framelist_u8_rgb = sample_via_pyav(
                     video_path, finds_to_sample, True)
-            Xt, resize_params, ccrop_params = prepare_video(
-                    framelist_u8_rgb, flip=False)
+            X, resize_params, ccrop_params = \
+                prepare_video_resize_crop_flip(
+                    framelist_u8_rgb, test_crop_size, False)
         else:
             raise RuntimeError()
+
+        # Convert to torch
+        Xt = torch.from_numpy(X)
 
         # Resolve pathways
         if self._is_slowfast:
@@ -579,6 +515,91 @@ class Dataloader_isaver(
         flush_purge()
         return self.result
 
+
+def _caffe_feat_extract_func(net, keyframe):
+    PIXEL_MEANS = [102.9801, 115.9465, 122.7717]
+    TEST_SCALES = [600, ]
+    TEST_MAX_SIZE = 1000
+
+    i0 = keyframe['frame0']
+    video_path = keyframe['video_path']
+
+    boxes = keyframe['bbox'][None]
+
+    with vt_cv.video_capture_open(video_path) as vcap:
+        frame_u8 = vt_cv.video_sample(vcap, [i0])[0]
+
+    blob_, im_scale_factors = model_test_get_image_blob(
+            frame_u8, PIXEL_MEANS, TEST_SCALES, TEST_MAX_SIZE)
+    blob = blob_.transpose(0, 3, 1, 2)  # 1, H, W, 3 --> 1, 3, H, W
+    im_scale_factor = im_scale_factors[0]
+
+    net.blobs['data'].reshape(*blob.shape)
+    net.blobs['data'].data[...] = blob
+    sc_boxes = boxes * im_scale_factor
+    boxes5 = np.c_[np.zeros(len(sc_boxes)), sc_boxes]
+
+    net.blobs['rois'].reshape(len(boxes5), 5)
+    net.blobs['rois'].data[...] = boxes5
+    net_forwarded = net.forward()
+
+    # 11
+    cls_prob = net_forwarded['cls_prob']
+    cls_prob_copy = cls_prob.copy().squeeze()
+
+    # 4096
+    fc7_feats = net.blobs['fc7'].data.copy().squeeze()
+
+    # pool5 (spatial max-pool), 5012
+    pool5_feats = net.blobs['pool5'].data.copy().squeeze()
+    pool5_feats = pool5_feats.max(axis=(1, 2))
+
+    feats = {
+            'cls_prob': cls_prob_copy,
+            'fc7': fc7_feats,
+            'pool5_maxpool': pool5_feats}
+    return feats
+
+
+def _perform_connections_split(connections_f, cc, ct):
+    ckeys = list(connections_f.keys())
+    weights_dict = {k: len(v['boxes'])
+            for k, v in connections_f.items()}
+    weights = np.array(list(weights_dict.values()))
+    ii_ckeys_split = snippets.weighted_array_split(
+            np.arange(len(ckeys)), weights, ct)
+    ckeys_split = [[ckeys[i] for i in ii] for ii in ii_ckeys_split]
+    ktw = dict(zip(ckeys, weights))
+    weights_split = []
+    for ckeys_ in ckeys_split:
+        weight = np.sum([ktw[ckey] for ckey in ckeys_])
+        weights_split.append(weight)
+    chunk_ckeys = ckeys_split[cc]
+    log.info(f'Quick split stats [{cc,ct=}]: '
+        'Frames(boxes): {}({}) -> {}({})'.format(
+            len(ckeys), np.sum(weights),
+            len(chunk_ckeys), weights_split[cc]))
+    chunk_connections_f = {k: connections_f[k] for k in chunk_ckeys}
+    return chunk_connections_f
+
+
+def _gather_check_all_present(gather_paths, filenames):
+    # Check missing
+    missing_paths = []
+    for path in gather_paths:
+        for filename in filenames:
+            fpath = Path(path)/filename
+            if not fpath.exists():
+                missing_paths.append(fpath)
+    if len(missing_paths):
+        log.error('Some paths are MISSING:\n{}'.format(
+            pprint.pformat(missing_paths)))
+        return False
+    return True
+
+
+# Experiments
+
 def extract_sf_feats(workfolder, cfg_dict, add_args):
     out, = snippets.get_subfolders(workfolder, ['out'])
     cfg = snippets.YConfig(cfg_dict)
@@ -595,6 +616,7 @@ def extract_sf_feats(workfolder, cfg_dict, add_args):
         num_workers: [12, int]
     """)
     cf = cfg.parse()
+    test_crop_size = 256
 
     # DALY Dataset
     dataset = Dataset_daly_ocv(cf['dataset.mirror'])
@@ -720,51 +742,6 @@ def extract_sf_feats(workfolder, cfg_dict, add_args):
     small.save_pkl(out/'keyframes.pkl', keyframes)
 
 
-def _caffe_feat_extract_func(net, keyframe):
-    PIXEL_MEANS = [102.9801, 115.9465, 122.7717]
-    TEST_SCALES = [600, ]
-    TEST_MAX_SIZE = 1000
-
-    i0 = keyframe['frame0']
-    video_path = keyframe['video_path']
-
-    boxes = keyframe['bbox'][None]
-
-    with vt_cv.video_capture_open(video_path) as vcap:
-        frame_u8 = vt_cv.video_sample(vcap, [i0])[0]
-
-    blob_, im_scale_factors = model_test_get_image_blob(
-            frame_u8, PIXEL_MEANS, TEST_SCALES, TEST_MAX_SIZE)
-    blob = blob_.transpose(0, 3, 1, 2)  # 1, H, W, 3 --> 1, 3, H, W
-    im_scale_factor = im_scale_factors[0]
-
-    net.blobs['data'].reshape(*blob.shape)
-    net.blobs['data'].data[...] = blob
-    sc_boxes = boxes * im_scale_factor
-    boxes5 = np.c_[np.zeros(len(sc_boxes)), sc_boxes]
-
-    net.blobs['rois'].reshape(len(boxes5), 5)
-    net.blobs['rois'].data[...] = boxes5
-    net_forwarded = net.forward()
-
-    # 11
-    cls_prob = net_forwarded['cls_prob']
-    cls_prob_copy = cls_prob.copy().squeeze()
-
-    # 4096
-    fc7_feats = net.blobs['fc7'].data.copy().squeeze()
-
-    # pool5 (spatial max-pool), 5012
-    pool5_feats = net.blobs['pool5'].data.copy().squeeze()
-    pool5_feats = pool5_feats.max(axis=(1, 2))
-
-    feats = {
-            'cls_prob': cls_prob_copy,
-            'fc7': fc7_feats,
-            'pool5_maxpool': pool5_feats}
-    return feats
-
-
 def extract_caffe_rcnn_feats(workfolder, cfg_dict, add_args):
     out, = snippets.get_subfolders(workfolder, ['out'])
     cfg = snippets.YConfig(cfg_dict)
@@ -802,88 +779,6 @@ def extract_caffe_rcnn_feats(workfolder, cfg_dict, add_args):
     small.save_pkl(out/'keyframes.pkl', keyframes)
 
 
-def group_tubes_on_frame_level(
-        tubes_dwein: Dict[I_dwein, T_dwein],
-        frames_to_cover: Optional[Dict[Vid_daly, np.ndarray]]
-        ) -> Dict[Tuple[Vid_daly, int], Box_connections_dwti]:
-    """
-    Given dictionary of tubes, group them on frame level
-    - If "frames_to_cover" is passed - group only in those frames
-
-    This is a simplified _prepare_ftube_box_computations
-    """
-    connections: Dict[Tuple[Vid_daly, int], Box_connections_dwti] = {}
-    for dwt_index, tube in tubes_dwein.items():
-        (vid, _, _) = dwt_index
-        tube_finds = tube['frame_inds']
-        if frames_to_cover is None:
-            common_finds = tube_finds
-            good_tube_boxes = tube['boxes']
-        else:
-            good_finds = frames_to_cover[vid]
-            common_finds, comm1, comm2 = np.intersect1d(
-                tube_finds, good_finds,
-                assume_unique=True, return_indices=True)
-            if len(common_finds) == 0:
-                continue
-            good_tube_boxes = tube['boxes'][comm1]
-        for frame_ind, box in zip(common_finds, good_tube_boxes):
-            frame_ind = int(frame_ind)
-            c = connections.setdefault((vid, frame_ind),
-                Box_connections_dwti(
-                    vid=vid, frame_ind=frame_ind,
-                    dwti_sources=[], boxes=[]))
-            c['dwti_sources'].append(dwt_index)
-            c['boxes'].append(box)
-    return connections
-
-
-def get_daly_keyframes_to_cover(
-        dataset, vids, add_keyframes: bool, every_n: int,
-        ) -> Dict[Vid_daly, np.ndarray]:
-    frames_to_cover: Dict[Vid_daly, np.ndarray] = {}
-    for vid in vids:
-        v = dataset.videos_ocv[vid]
-        # general keyframe ranges of all instances
-        instance_ranges = []
-        for action_name, instances in v['instances'].items():
-            for ins_ind, instance in enumerate(instances):
-                s, e = instance['start_frame'], instance['end_frame']
-                keyframes = [int(kf['frame'])
-                        for kf in instance['keyframes']]
-                instance_ranges.append((s, e, keyframes))
-        good = set()
-        for s, e, keyframes in instance_ranges:
-            if add_keyframes:
-                good |= set(keyframes)
-            if every_n > 0:
-                good |= set(range(s, e+1, every_n))
-        frames_to_cover[vid] = np.array(sorted(good))
-    return frames_to_cover
-
-
-def _perform_connections_split(connections_f, cc, ct):
-    ckeys = list(connections_f.keys())
-    weights_dict = {k: len(v['boxes'])
-            for k, v in connections_f.items()}
-    weights = np.array(list(weights_dict.values()))
-    ii_ckeys_split = snippets.weighted_array_split(
-            np.arange(len(ckeys)), weights, ct)
-    ckeys_split = [[ckeys[i] for i in ii] for ii in ii_ckeys_split]
-    ktw = dict(zip(ckeys, weights))
-    weights_split = []
-    for ckeys_ in ckeys_split:
-        weight = np.sum([ktw[ckey] for ckey in ckeys_])
-        weights_split.append(weight)
-    chunk_ckeys = ckeys_split[cc]
-    log.info(f'Quick split stats [{cc,ct=}]: '
-        'Frames(boxes): {}({}) -> {}({})'.format(
-            len(ckeys), np.sum(weights),
-            len(chunk_ckeys), weights_split[cc]))
-    chunk_connections_f = {k: connections_f[k] for k in chunk_ckeys}
-    return chunk_connections_f
-
-
 def probe_philtubes_for_extraction(workfolder, cfg_dict, add_args):
     out, = snippets.get_subfolders(workfolder, ['out'])
     cfg = snippets.YConfig(cfg_dict)
@@ -909,6 +804,7 @@ def probe_philtubes_for_extraction(workfolder, cfg_dict, add_args):
         total: [1, int]
     """)
     cf = cfg.parse()
+    test_crop_size = 256
 
     # DALY Dataset
     dataset = Dataset_daly_ocv(cf['dataset.mirror'])
@@ -1062,24 +958,6 @@ def probe_philtubes_for_extraction(workfolder, cfg_dict, add_args):
 
     small.save_pkl(out/'dict_outputs.pkl', dict_outputs)
     small.save_pkl(out/'connections_f.pkl', connections_f)
-
-
-# from thes.experiments.m02.tubes import _gather_check_all_present
-
-
-def _gather_check_all_present(gather_paths, filenames):
-    # Check missing
-    missing_paths = []
-    for path in gather_paths:
-        for filename in filenames:
-            fpath = Path(path)/filename
-            if not fpath.exists():
-                missing_paths.append(fpath)
-    if len(missing_paths):
-        log.error('Some paths are MISSING:\n{}'.format(
-            pprint.pformat(missing_paths)))
-        return False
-    return True
 
 
 def combine_probed_philtubes(workfolder, cfg_dict, add_args):

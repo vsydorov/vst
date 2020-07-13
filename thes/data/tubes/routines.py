@@ -1,23 +1,17 @@
 import logging
 from tqdm import tqdm
-import itertools
 import numpy as np
-import pandas as pd
 from typing import (  # NOQA
     Dict, List, Tuple, TypeVar, Set, Optional, Callable,
     TypedDict, NewType, NamedTuple, Sequence, Literal, cast)
-from thes.tools import snippets
 from thes.data.dataset.external import (
-        Dataset_daly_ocv, Vid_daly,
-        Action_name_daly)
-
+    Dataset_daly_ocv, Vid_daly,
+    Action_name_daly)
 from thes.data.tubes.types import (
-    I_dwein, T_dwein, T_dwein_scored, I_dgt, T_dgt,
-    Frametube, Base_frametube,
-    Objaction_dets,
-    V_dict, AV_dict)
-
-from vsydorov_tools import small
+    I_dwein, T_dwein, T_dwein_scored, I_dgt,
+    T_dgt, V_dict, AV_dict, Frametube,
+    Base_frametube, Objaction_dets,
+    Box_connections_dwti)
 
 log = logging.getLogger(__name__)
 
@@ -235,3 +229,109 @@ def score_ftubes_via_objaction_overlap_aggregation(
                     .setdefault(action_name, {})
                     .setdefault(vid, []).append(stube))
     return av_stubes
+
+
+def group_tubes_on_frame_level(
+        tubes_dwein: Dict[I_dwein, T_dwein],
+        frames_to_cover: Optional[Dict[Vid_daly, np.ndarray]]
+        ) -> Dict[Tuple[Vid_daly, int], Box_connections_dwti]:
+    """
+    Given dictionary of tubes, group them on frame level
+    - If "frames_to_cover" is passed - group only in those frames
+
+    This is a simplified _prepare_ftube_box_computations
+    """
+    connections: Dict[Tuple[Vid_daly, int], Box_connections_dwti] = {}
+    for dwt_index, tube in tubes_dwein.items():
+        (vid, _, _) = dwt_index
+        tube_finds = tube['frame_inds']
+        if frames_to_cover is None:
+            common_finds = tube_finds
+            good_tube_boxes = tube['boxes']
+        else:
+            good_finds = frames_to_cover[vid]
+            common_finds, comm1, comm2 = np.intersect1d(
+                tube_finds, good_finds,
+                assume_unique=True, return_indices=True)
+            if len(common_finds) == 0:
+                continue
+            good_tube_boxes = tube['boxes'][comm1]
+        for frame_ind, box in zip(common_finds, good_tube_boxes):
+            frame_ind = int(frame_ind)
+            c = connections.setdefault((vid, frame_ind),
+                Box_connections_dwti(
+                    vid=vid, frame_ind=frame_ind,
+                    dwti_sources=[], boxes=[]))
+            c['dwti_sources'].append(dwt_index)
+            c['boxes'].append(box)
+    return connections
+
+
+def record_overlaps(tubes_dgt, tubes_dwein):
+    overlap_hits = {}
+    for dgt_index, gt_tube in tubes_dgt.items():
+        vid, action_name, ins_id = dgt_index
+        dwt_vid = {k: v for k, v in tubes_dwein.items()
+                if k[0] == vid}
+        dwt_vid_keys = list(dwt_vid.keys())
+        dwt_vid_values = list(dwt_vid.values())
+        dwt_frange = np.array([
+            (x['start_frame'], x['end_frame']) for x in dwt_vid_values])
+        # Temporal
+        t_ious, pids = temporal_ious_where_positive(
+            gt_tube['start_frame'], gt_tube['end_frame'], dwt_frange)
+        # Spatial (where temporal >0)
+        dwt_intersect = [dwt_vid_values[pid] for pid in pids]
+        sp_mious = [spatial_tube_iou_v3(p, gt_tube)
+                for p in dwt_intersect]
+        for p, t_iou, sp_miou in zip(pids, t_ious, sp_mious):
+            st_iou = t_iou * sp_miou
+            if st_iou > 0:
+                dwt_vid = dwt_vid_keys[p]
+                overlap_hits.setdefault(dwt_vid, []).append(
+                        [action_name, (t_iou, sp_miou, st_iou)])
+    best_ious = {}
+    for k, v in overlap_hits.items():
+        vsorted_last = sorted(v, key=lambda x: x[1][0])[-1]
+        action_name = vsorted_last[0]
+        st_miou = vsorted_last[1][2]
+        best_ious[k] = (action_name, st_miou)
+    return best_ious
+
+
+def create_synthetic_tube_labels(tubes_dwein, best_ious):
+    # Assign to classes
+    POS_THRESH = 0.5
+    HN_THRESH = 0.3
+    labels: Dict[I_dgt, str] = {}
+    for dwt_index in tubes_dwein.keys():
+        label = 'background'
+        if dwt_index in best_ious:
+            best_cls, best_iou = best_ious[dwt_index]
+            if best_iou > POS_THRESH:
+                label = best_cls
+            elif 0 < best_iou < HN_THRESH:
+                label = 'background_hard'
+            else:
+                label = 'none'
+        labels[dwt_index] = label
+    return labels
+
+
+def qload_synthetic_tube_labels(tubes_dgt, tubes_dwein, dataset):
+    # / Divide trainval tubes into classes (intersection with GT tubes)
+    best_ious = record_overlaps(tubes_dgt, tubes_dwein)
+    labels_train: Dict[I_dgt, str] = create_synthetic_tube_labels(
+            tubes_dwein, best_ious)
+    # / Create classification dataset
+    cls_labels = dataset.action_names + ['background']
+    dwti_to_label: Dict[I_dgt, int] = {}
+    for dwti, label in labels_train.items():
+        if label == 'none':
+            continue
+        elif label in ('background', 'background_hard'):
+            ilabel = len(dataset.action_names)
+        else:
+            ilabel = dataset.action_names.index(label)
+        dwti_to_label[dwti] = ilabel
+    return cls_labels, dwti_to_label
