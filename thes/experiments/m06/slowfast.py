@@ -1,3 +1,6 @@
+""" Code for extraction of features via slowfast framework
+Ideally should be superseded by feature_extraction.py
+"""
 import h5py
 import numpy as np
 import pprint
@@ -11,7 +14,6 @@ from typing import (  # NOQA
 from tqdm import tqdm
 import concurrent.futures
 import cv2
-import av
 
 import torch
 import torch.nn as nn
@@ -25,60 +27,30 @@ from vsydorov_tools import cv as vt_cv
 from vsydorov_tools import log as vt_log
 
 from thes.data.dataset.daly import (
-    get_daly_keyframes_to_cover)
+    get_daly_keyframes_to_cover, create_keyframelist)
 from thes.data.dataset.external import (
     Dataset_daly_ocv, Vid_daly)
 from thes.data.tubes.types import (
     I_dwein, T_dwein,
     loadconvert_tubes_dwein, Box_connections_dwti)
 from thes.data.tubes.routines import (
-    group_tubes_on_frame_level)
+    group_tubes_on_frame_level, perform_connections_split)
 from thes.slowfast.cfg import (basic_sf_cfg)
 from thes.tools import snippets
-from thes.tools.video import (
-    tfm_video_resize_threaded, tfm_video_center_crop)
 from thes.caffe import (nicolas_net, model_test_get_image_blob)
-from thes.pytorch import sequence_batch_collate_v2
+from thes.pytorch import (
+    sequence_batch_collate_v2,
+    hforward_resnet, hforward_slowfast,
+    np_to_gpu, to_gpu_normalize_permute,
+    TDataset_over_keyframes, TDataset_over_connections,
+    Sampler_grid, Frameloader_video_slowfast,
+    Dataloader_isaver)
 
 log = logging.getLogger(__name__)
 
 
-def np_to_gpu(X):
-    X = torch.from_numpy(np.array(X))
-    X = X.type(torch.cuda.FloatTensor)
-    return X
-
-
 norm_mean = np.array([0.45, 0.45, 0.45])
 norm_std = np.array([0.225, 0.225, 0.225])
-
-def sf_resnet_headless_forward(self, x):
-    # slowfast/models/video_model_builder.py/ResNet.forward
-    x = self.s1(x)
-    x = self.s2(x)
-    for pathway in range(self.num_pathways):
-        pool = getattr(self, "pathway{}_pool".format(pathway))
-        x[pathway] = pool(x[pathway])
-    x = self.s3(x)
-    x = self.s4(x)
-    x = self.s5(x)
-    return x
-
-def sf_slowfast_headless_forward(self, x):
-    # slowfast/models/video_model_builder.py/SlowFast.forward
-    x = self.s1(x)
-    x = self.s1_fuse(x)
-    x = self.s2(x)
-    x = self.s2_fuse(x)
-    for pathway in range(self.num_pathways):
-        pool = getattr(self, "pathway{}_pool".format(pathway))
-        x[pathway] = pool(x[pathway])
-    x = self.s3(x)
-    x = self.s3_fuse(x)
-    x = self.s4(x)
-    x = self.s4_fuse(x)
-    x = self.s5(x)
-    return x
 
 class Extractor_roi(nn.Module):
     def __init__(self,
@@ -172,34 +144,6 @@ class Extractor_fullframe(nn.Module):
         result = {'tavg_smax': tavg_smax, 'st_avg': st_avg}
         return result
 
-
-def to_gpu_normalize_permute(Xt, norm_mean_t, norm_std_t):
-    # Convert to float on GPU
-    X_f32c = Xt.type(torch.cuda.FloatTensor)
-    X_f32c /= 255
-    # Normalize
-    X_f32c = (X_f32c-norm_mean_t)/norm_std_t
-    # THWC -> CTHW
-    assert len(X_f32c.shape) == 5
-    X_f32c = X_f32c.permute(0, 4, 1, 2, 3)
-    return X_f32c
-
-def prepare_box(bbox_ltrd, resize_params, ccrop_params):
-    # X is NCHW
-    # Resize bbox
-    bbox_tldr = bbox_ltrd[[1, 0, 3, 2]]
-    real_scale_h = resize_params['h_resized']/resize_params['h_before']
-    real_scale_w = resize_params['w_resized']/resize_params['w_before']
-    real_scale = np.tile(np.r_[real_scale_h, real_scale_w], 2)
-    bbox_tldr = (bbox_tldr * real_scale)
-    # Offset box
-    i, j = ccrop_params['i'], ccrop_params['j']
-    bbox_tldr -= [i, j, i, j]
-    box_maxsize = np.tile(
-            np.r_[ccrop_params['th'], ccrop_params['tw']], 2)
-    bbox_tldr = np.clip(bbox_tldr, [0, 0, 0, 0], box_maxsize)
-    return bbox_tldr
-
 def _vis_boxes(out, bbox, frames_u8, X_f32c, bbox_tldr):
     fullsize_w_boxes = frames_u8.copy()
     for i, frame in enumerate(fullsize_w_boxes):
@@ -213,307 +157,6 @@ def _vis_boxes(out, bbox, frames_u8, X_f32c, bbox_tldr):
     for i, frame in enumerate(small_w_boxes):
         snippets.cv_put_box_with_text(frame, bbox_tldr[[1, 0, 3, 2]])
     snippets.qsave_video(out/'small_w_boxes.mp4', small_w_boxes)
-
-def sample_via_pyav(video_path, finds_to_sample, threading=True):
-    container = av.open(str(video_path))
-
-    frames_length = container.streams.video[0].frames
-    duration = container.streams.video[0].duration  # how many time_base units
-
-    timebase = int(duration/frames_length)
-    pts_to_sample = timebase * finds_to_sample
-    start_pts = int(pts_to_sample[0])
-    end_pts = int(pts_to_sample[-1])
-
-    margin = 1024
-    seek_offset = max(start_pts - margin, 0)
-    stream_name = {"video": 0}
-    buffer_size = 0
-
-    stream = container.streams.video[0]
-    container.seek(seek_offset, any_frame=False, backward=True, stream=stream)
-    if threading:
-        container.streams.video[0].thread_type = 'AUTO'
-    frames = {}
-    buffer_count = 0
-    max_pts = 0
-    for frame in container.decode(**stream_name):
-        max_pts = max(max_pts, frame.pts)
-        if frame.pts < start_pts:
-            continue
-        if frame.pts <= end_pts:
-            frames[frame.pts] = frame
-        else:
-            buffer_count += 1
-            frames[frame.pts] = frame
-            if buffer_count >= buffer_size:
-                break
-    pts_we_got = np.array(sorted(frames))
-    ssorted_indices = np.searchsorted(pts_we_got, pts_to_sample)
-
-    sampled_frames = []
-    for pts in pts_we_got[ssorted_indices]:
-        sampled_frames.append(frames[pts])
-    container.close()
-
-    sampled_framelist = [frame.to_rgb().to_ndarray()
-            for frame in sampled_frames]
-    return sampled_framelist
-
-
-def prepare_video_resize_crop_flip(
-        X_list, crop_size, flip_lastdim):
-    # Resize video, flip to RGB
-    if flip_lastdim:
-        if isinstance(X_list, list):
-            X_list = [np.flip(x, -1) for x in X_list]
-        else:
-            X_list = np.flip(X_list, -1)
-    # Resize
-    X_list, resize_params = tfm_video_resize_threaded(
-            X_list, crop_size)
-    X = np.stack(X_list)
-    # Centercrop
-    X, ccrop_params = tfm_video_center_crop(
-            X, crop_size, crop_size)
-    return X, resize_params, ccrop_params
-
-
-class TDataset_over_keyframes(torch.utils.data.Dataset):
-    def __init__(self, keyframes, model_nframes, model_sample,
-            is_slowfast: bool, slowfast_alpha: int,
-            load_method='opencv'):
-        self.keyframes = keyframes
-        center_frame = (model_nframes-1)//2
-        self.sample_grid0 = (np.arange(model_nframes)-center_frame)*model_sample
-        self._is_slowfast = is_slowfast
-        self._slowfast_alpha = slowfast_alpha
-        self._load_method = load_method
-
-    def __getitem__(self, index):
-        # Extract frames
-        keyframe = self.keyframes[index]
-        video_path = keyframe['video_path']
-        i0 = keyframe['frame0']
-        finds_to_sample = i0 + self.sample_grid0
-        finds_to_sample = np.clip(
-                finds_to_sample, 0, keyframe['nframes']-1)
-        test_crop_size = 256
-
-        if self._load_method == 'opencv':
-            with vt_cv.video_capture_open(video_path) as vcap:
-                framelist_u8_bgr = vt_cv.video_sample(
-                        vcap, finds_to_sample)
-            X, resize_params, ccrop_params = \
-                prepare_video_resize_crop_flip(
-                    framelist_u8_bgr, test_crop_size, True)
-        elif self._load_method == 'pyav':
-            framelist_u8_rgb = sample_via_pyav(
-                    video_path, finds_to_sample, True)
-            X, resize_params, ccrop_params = \
-                prepare_video_resize_crop_flip(
-                    framelist_u8_rgb, test_crop_size, False)
-        else:
-            raise RuntimeError()
-
-        # Convert to torch
-        Xt = torch.from_numpy(X)
-
-        # Resolve pathways
-        if self._is_slowfast:
-            # slowfast/datasets/utils.py/pack_pathway_output
-            TIME_DIM = 0
-            fast_pathway = Xt
-            slow_pathway = torch.index_select(
-                Xt,
-                TIME_DIM,
-                torch.linspace(
-                    0, Xt.shape[TIME_DIM] - 1,
-                    Xt.shape[TIME_DIM] // self._slowfast_alpha
-                ).long(),
-            )
-            frame_list = [slow_pathway, fast_pathway]
-        else:
-            frame_list = [Xt]
-
-        # Bboxes
-        bbox_tldr = prepare_box(
-                keyframe['bbox'], resize_params, ccrop_params)
-        return index, frame_list, bbox_tldr
-
-    def __len__(self) -> int:
-        return len(self.keyframes)
-
-
-class TDataset_over_connections(torch.utils.data.Dataset):
-    def __init__(self, dict_f, dataset,
-            model_nframes, model_sample,
-            is_slowfast: bool, slowfast_alpha: int,
-            load_method='opencv'):
-        self.dict_f = dict_f
-        self.dataset = dataset
-        center_frame = (model_nframes-1)//2
-        self.sample_grid0 = (
-                np.arange(model_nframes)-center_frame)*model_sample
-        self._is_slowfast = is_slowfast
-        self._slowfast_alpha = slowfast_alpha
-        self._load_method = load_method
-
-    def __getitem__(self, index):
-        # Extract frames
-        ckey, connections = list(self.dict_f.items())[index]
-        vid = connections['vid']
-        i0 = connections['frame_ind']
-        bboxes_ltrd = connections['boxes']
-        assert ckey == (vid, i0)
-
-        video_path = str(self.dataset.videos_ocv[vid]['path'])
-        nframes = self.dataset.videos_ocv[vid]['nframes']
-
-        finds_to_sample = i0 + self.sample_grid0
-        finds_to_sample = np.clip(finds_to_sample, 0, nframes-1)
-
-        test_crop_size = 256
-
-        if self._load_method == 'opencv':
-            with vt_cv.video_capture_open(video_path) as vcap:
-                framelist_u8_bgr = vt_cv.video_sample(
-                        vcap, finds_to_sample)
-            X, resize_params, ccrop_params = \
-                prepare_video_resize_crop_flip(
-                    framelist_u8_bgr, test_crop_size, True)
-        elif self._load_method == 'pyav':
-            framelist_u8_rgb = sample_via_pyav(
-                    video_path, finds_to_sample, True)
-            X, resize_params, ccrop_params = \
-                prepare_video_resize_crop_flip(
-                    framelist_u8_rgb, test_crop_size, False)
-        else:
-            raise RuntimeError()
-
-        # Convert to torch
-        Xt = torch.from_numpy(X)
-
-        # Resolve pathways
-        if self._is_slowfast:
-            # slowfast/datasets/utils.py/pack_pathway_output
-            TIME_DIM = 0
-            fast_pathway = Xt
-            slow_pathway = torch.index_select(
-                Xt,
-                TIME_DIM,
-                torch.linspace(
-                    0, Xt.shape[TIME_DIM] - 1,
-                    Xt.shape[TIME_DIM] // self._slowfast_alpha
-                ).long(),
-            )
-            frame_list = [slow_pathway, fast_pathway]
-        else:
-            frame_list = [Xt]
-
-        # Bboxes
-        prepared_bboxes = []
-        for box_ltrd in bboxes_ltrd:
-            prepared_bbox_tldr = prepare_box(
-                box_ltrd, resize_params, ccrop_params)
-            prepared_bboxes.append(prepared_bbox_tldr)
-        meta = {
-                'index': index,
-                'ckey': ckey,
-                'bboxes_tldr': np.stack(prepared_bboxes, axis=0),
-                'do_not_collate': True}
-        return frame_list, meta
-
-    def __len__(self) -> int:
-        return len(self.dict_f)
-
-
-def create_keyframelist(dataset):
-    # Record keyframes
-    keyframes = []
-    for vid, ovideo in dataset.videos_ocv.items():
-        nframes = ovideo['nframes']
-        for action_name, instances in ovideo['instances'].items():
-            for ins_ind, instance in enumerate(instances):
-                fl = instance['flags']
-                diff = fl['isReflection'] or fl['isAmbiguous']
-                if diff:
-                    continue
-                for kf_ind, keyframe in enumerate(instance['keyframes']):
-                    frame0 = keyframe['frame']
-                    action_id = dataset.action_names.index(action_name)
-                    kf_dict = {
-                            'vid': vid,
-                            'action_id': action_id,
-                            'action_name': action_name,
-                            'ins_ind': ins_ind,
-                            'kf_ind': kf_ind,
-                            'bbox': keyframe['bbox_abs'],
-                            'video_path': ovideo['path'],
-                            'frame0': int(frame0),
-                            'nframes': nframes,
-                            'height': ovideo['height'],
-                            'width': ovideo['width'],
-                            }
-                    keyframes.append(kf_dict)
-    return keyframes
-
-
-class Dataloader_isaver(
-        snippets.Isaver_mixin_restore_save, snippets.Isaver_base):
-    """
-    Will process a list with a 'func', 'prepare_func(start_i)' is to be run before processing
-    """
-    def __init__(self, folder,
-            total, func, prepare_func,
-            save_every=0,
-            save_interval=120,  # every 2 minutes by default
-            log_interval=None,):
-        super().__init__(folder, total)
-        self.func = func
-        self.prepare_func = prepare_func
-        self._save_every = save_every
-        self._save_interval = save_interval
-        self._log_interval = log_interval
-        self.result = []
-
-    def run(self):
-        i_last = self._restore()
-        self._time_last_save = time.perf_counter()
-        self._time_last_log = time.perf_counter()
-        self._i_last_saved = 0
-
-        result_cache = []
-
-        def flush_purge():
-            self.result.extend(result_cache)
-            result_cache.clear()
-            with small.QTimer('saving pkl'):
-                self._save(i_last)
-            self._purge_intermediate_files()
-
-        loader = self.prepare_func(i_last)
-        pbar = tqdm(loader, total=len(loader))
-        for i_batch, data_input in enumerate(pbar):
-            result_dict, i_last = self.func(data_input)
-            result_cache.append(result_dict)
-            SAVE = False
-            if self._save_every > 0:
-                SAVE |= (i_last - self._i_last_saved) >= self._save_every
-            if self._save_interval:
-                since_last_save = time.perf_counter() - self._time_last_save
-                SAVE |= since_last_save > self._save_interval
-            if SAVE:
-                flush_purge()
-                self._time_last_save = time.perf_counter()
-                self._i_last_saved = i_last
-            if self._log_interval:
-                since_last_log = time.perf_counter() - self._time_last_log
-                if since_last_log > self._log_interval:
-                    log.info(snippets._tqdm_str(pbar))
-                    self._time_last_log = time.perf_counter()
-        flush_purge()
-        return self.result
 
 
 def _caffe_feat_extract_func(net, keyframe):
@@ -561,28 +204,6 @@ def _caffe_feat_extract_func(net, keyframe):
     return feats
 
 
-def _perform_connections_split(connections_f, cc, ct):
-    ckeys = list(connections_f.keys())
-    weights_dict = {k: len(v['boxes'])
-            for k, v in connections_f.items()}
-    weights = np.array(list(weights_dict.values()))
-    ii_ckeys_split = snippets.weighted_array_split(
-            np.arange(len(ckeys)), weights, ct)
-    ckeys_split = [[ckeys[i] for i in ii] for ii in ii_ckeys_split]
-    ktw = dict(zip(ckeys, weights))
-    weights_split = []
-    for ckeys_ in ckeys_split:
-        weight = np.sum([ktw[ckey] for ckey in ckeys_])
-        weights_split.append(weight)
-    chunk_ckeys = ckeys_split[cc]
-    log.info(f'Quick split stats [{cc,ct=}]: '
-        'Frames(boxes): {}({}) -> {}({})'.format(
-            len(ckeys), np.sum(weights),
-            len(chunk_ckeys), weights_split[cc]))
-    chunk_connections_f = {k: connections_f[k] for k in chunk_ckeys}
-    return chunk_connections_f
-
-
 def _gather_check_all_present(gather_paths, filenames):
     # Check missing
     missing_paths = []
@@ -626,13 +247,13 @@ def extract_sf_feats(workfolder, cfg_dict, add_args):
     if model_str == 'slowfast':
         rel_yml_path = 'Kinetics/c2/SLOWFAST_4x16_R50.yaml'
         CHECKPOINT_FILE_PATH = '/home/vsydorov/projects/deployed/2019_12_Thesis/links/scratch2/102_slowfast/20_zoo_checkpoints/kinetics400/SLOWFAST_4x16_R50.pkl'
-        headless_forward_func = sf_slowfast_headless_forward
+        headless_forward_func = hforward_slowfast
         is_slowfast = True
         _POOL_SIZE = [[1, 1, 1], [1, 1, 1]]
     elif model_str == 'i3d':
         rel_yml_path = 'Kinetics/c2/I3D_8x8_R50.yaml'
         CHECKPOINT_FILE_PATH = '/home/vsydorov/projects/deployed/2019_12_Thesis/links/scratch2/102_slowfast/20_zoo_checkpoints/kinetics400/I3D_8x8_R50.pkl'
-        headless_forward_func = sf_resnet_headless_forward
+        headless_forward_func = hforward_resnet
         is_slowfast = False
         _POOL_SIZE = [[2, 1, 1]]
     else:
@@ -699,11 +320,14 @@ def extract_sf_feats(workfolder, cfg_dict, add_args):
     norm_mean_t = np_to_gpu(norm_mean)
     norm_std_t = np_to_gpu(norm_std)
 
+    sampler_grid = Sampler_grid(model_nframes, model_sample)
+    frameloader_vsf = Frameloader_video_slowfast(
+            is_slowfast, slowfast_alpha, 256)
+
     def prepare_func(start_i):
         remaining_keyframes = keyframes[start_i+1:]
         tdataset_kf = TDataset_over_keyframes(
-                remaining_keyframes, model_nframes, model_sample,
-                is_slowfast, slowfast_alpha)
+                remaining_keyframes, sampler_grid, frameloader_vsf)
         loader = torch.utils.data.DataLoader(tdataset_kf,
                 batch_size=BATCH_SIZE, shuffle=False,
                 num_workers=NUM_WORKERS, pin_memory=True)
@@ -826,19 +450,19 @@ def probe_philtubes_for_extraction(workfolder, cfg_dict, add_args):
     # Here we'll run our connection split
     if cf['compute_split.enabled']:
         cc, ct = (cf['compute_split.chunk'], cf['compute_split.total'])
-        connections_f = _perform_connections_split(connections_f, cc, ct)
+        connections_f = perform_connections_split(connections_f, cc, ct)
 
     model_str = cf['model']
     if model_str == 'slowfast':
         rel_yml_path = 'Kinetics/c2/SLOWFAST_4x16_R50.yaml'
         CHECKPOINT_FILE_PATH = '/home/vsydorov/projects/deployed/2019_12_Thesis/links/scratch2/102_slowfast/20_zoo_checkpoints/kinetics400/SLOWFAST_4x16_R50.pkl'
-        headless_forward_func = sf_slowfast_headless_forward
+        headless_forward_func = hforward_slowfast
         is_slowfast = True
         _POOL_SIZE = [[1, 1, 1], [1, 1, 1]]
     elif model_str == 'i3d':
         rel_yml_path = 'Kinetics/c2/I3D_8x8_R50.yaml'
         CHECKPOINT_FILE_PATH = '/home/vsydorov/projects/deployed/2019_12_Thesis/links/scratch2/102_slowfast/20_zoo_checkpoints/kinetics400/I3D_8x8_R50.pkl'
-        headless_forward_func = sf_resnet_headless_forward
+        headless_forward_func = hforward_resnet
         is_slowfast = False
         _POOL_SIZE = [[2, 1, 1]]
     else:
@@ -904,13 +528,16 @@ def probe_philtubes_for_extraction(workfolder, cfg_dict, add_args):
     norm_mean_t = np_to_gpu(norm_mean)
     norm_std_t = np_to_gpu(norm_std)
 
+    sampler_grid = Sampler_grid(model_nframes, model_sample)
+    frameloader_vsf = Frameloader_video_slowfast(
+            is_slowfast, slowfast_alpha, 256)
+
     def prepare_func(start_i):
         # start_i defined wrt keys in connections_f
         remaining_dict = dict(list(
             connections_f.items())[start_i+1:])
         tdataset_kf = TDataset_over_connections(
-            remaining_dict, dataset, model_nframes,
-            model_sample, is_slowfast, slowfast_alpha)
+            remaining_dict, dataset, sampler_grid, frameloader_vsf)
         loader = torch.utils.data.DataLoader(tdataset_kf,
             batch_size=BATCH_SIZE, shuffle=False,
             num_workers=NUM_WORKERS, pin_memory=True,

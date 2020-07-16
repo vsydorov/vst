@@ -1,17 +1,16 @@
 import logging
-from tqdm import tqdm
 import numpy as np
+from tqdm import tqdm
 from typing import (  # NOQA
-    Dict, List, Tuple, TypeVar, Set, Optional, Callable,
-    TypedDict, NewType, NamedTuple, Sequence, Literal, cast)
+    Dict, List, Tuple, TypeVar, Set, Optional, Callable, TypedDict, NewType,
+    NamedTuple, Sequence, Literal, cast)
+
+from thes.tools import snippets
 from thes.data.dataset.external import (
-    Dataset_daly_ocv, Vid_daly,
-    Action_name_daly)
+    Dataset_daly_ocv, Vid_daly, Action_name_daly)
 from thes.data.tubes.types import (
-    I_dwein, T_dwein, T_dwein_scored, I_dgt,
-    T_dgt, V_dict, AV_dict, Frametube,
-    Base_frametube, Objaction_dets,
-    Box_connections_dwti)
+    I_dwein, T_dwein, T_dwein_scored, I_dgt, AV_dict,
+    Base_frametube, Objaction_dets, Box_connections_dwti)
 
 log = logging.getLogger(__name__)
 
@@ -335,3 +334,25 @@ def qload_synthetic_tube_labels(tubes_dgt, tubes_dwein, dataset):
             ilabel = dataset.action_names.index(label)
         dwti_to_label[dwti] = ilabel
     return cls_labels, dwti_to_label
+
+
+def perform_connections_split(connections_f, cc, ct):
+    ckeys = list(connections_f.keys())
+    weights_dict = {k: len(v['boxes'])
+            for k, v in connections_f.items()}
+    weights = np.array(list(weights_dict.values()))
+    ii_ckeys_split = snippets.weighted_array_split(
+            np.arange(len(ckeys)), weights, ct)
+    ckeys_split = [[ckeys[i] for i in ii] for ii in ii_ckeys_split]
+    ktw = dict(zip(ckeys, weights))
+    weights_split = []
+    for ckeys_ in ckeys_split:
+        weight = np.sum([ktw[ckey] for ckey in ckeys_])
+        weights_split.append(weight)
+    chunk_ckeys = ckeys_split[cc]
+    log.info(f'Quick split stats [{cc,ct=}]: '
+        'Frames(boxes): {}({}) -> {}({})'.format(
+            len(ckeys), np.sum(weights),
+            len(chunk_ckeys), weights_split[cc]))
+    chunk_connections_f = {k: connections_f[k] for k in chunk_ckeys}
+    return chunk_connections_f

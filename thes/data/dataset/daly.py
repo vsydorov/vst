@@ -86,3 +86,34 @@ def load_gt_and_wein_tubes(tubes_dwein_fold, dataset, vgroup):
         tubes_dwein_d[sset] = dtindex_filter_split(tubes_dwein_all, vids)
         tubes_dgt_d[sset] = dtindex_filter_split(tubes_dgt_all, vids)
     return tubes_dwein_d, tubes_dgt_d
+
+
+def create_keyframelist(dataset):
+    # Record keyframes
+    keyframes = []
+    for vid, ovideo in dataset.videos_ocv.items():
+        nframes = ovideo['nframes']
+        for action_name, instances in ovideo['instances'].items():
+            for ins_ind, instance in enumerate(instances):
+                fl = instance['flags']
+                diff = fl['isReflection'] or fl['isAmbiguous']
+                if diff:
+                    continue
+                for kf_ind, keyframe in enumerate(instance['keyframes']):
+                    frame0 = keyframe['frame']
+                    action_id = dataset.action_names.index(action_name)
+                    kf_dict = {
+                            'vid': vid,
+                            'action_id': action_id,
+                            'action_name': action_name,
+                            'ins_ind': ins_ind,
+                            'kf_ind': kf_ind,
+                            'bbox': keyframe['bbox_abs'],
+                            'video_path': ovideo['path'],
+                            'frame0': int(frame0),
+                            'nframes': nframes,
+                            'height': ovideo['height'],
+                            'width': ovideo['width'],
+                            }
+                    keyframes.append(kf_dict)
+    return keyframes
