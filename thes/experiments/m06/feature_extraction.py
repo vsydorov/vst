@@ -41,7 +41,7 @@ from thes.tools.video import (
 from thes.caffe import (nicolas_net, model_test_get_image_blob)
 from thes.pytorch import (
     sequence_batch_collate_v2,
-    hforward_resnet, hforward_slowfast,
+    hforward_resnet, hforward_resnet_nopool, hforward_slowfast,
     np_to_gpu, to_gpu_normalize_permute,
     TDataset_over_keyframes, TDataset_over_connections,
     Sampler_grid, Frameloader_video_slowfast, Dataloader_isaver)
@@ -52,28 +52,30 @@ CHECKPOINTS_PREFIX = Path('/home/vsydorov/projects/deployed/2019_12_Thesis/links
 CHECKPOINTS = {
     'SLOWFAST_4x16_R50': 'kinetics400/SLOWFAST_4x16_R50.pkl',
     'I3D_8x8_R50': 'kinetics400/I3D_8x8_R50.pkl',
-    'C2D_NOPOOL_8x8_R50': 'kinetics400/C2D_NOPOOL_8x8_R50.pkl',  # does not work
     'c2d': 'kin400_video_nonlocal/c2d_baseline_8x8_IN_pretrain_400k.pkl',  # https://github.com/facebookresearch/SlowFast/issues/163
-    'R50_IMNET': 'imagenet/R50_IN1K.pyth'
+    'c2d_1x1': 'kin400_video_nonlocal/c2d_baseline_8x8_IN_pretrain_400k.pkl',
+    'c2d_imnet': 'imagenet/R50_IN1K.pyth',
 }
 REL_YAML_PATHS = {
     'SLOWFAST_4x16_R50': 'Kinetics/c2/SLOWFAST_4x16_R50.yaml',
     'I3D_8x8_R50': 'Kinetics/c2/I3D_8x8_R50.yaml',
-    'C2D_NOPOOL_8x8_R50': 'Kinetics/c2/C2D_NOPOOL_8x8_R50.yaml',  # does not work
     'c2d': 'Kinetics/C2D_8x8_R50_IN1K.yaml',
-    'R50_IMNET': None
+    'c2d_1x1': 'Kinetics/C2D_8x8_R50_IN1K.yaml',
+    'c2d_imnet': 'Kinetics/C2D_8x8_R50_IN1K.yaml',
 }
 
 class Head_featextract_roi(nn.Module):
-    def __init__(self, dim_in, pool_size, resolution, scale_factor):
+    def __init__(self, dim_in, temp_pool_size, resolution, scale_factor):
         super(Head_featextract_roi, self).__init__()
         self.dim_in = dim_in
-        self.num_pathways = len(pool_size)
+        self.num_pathways = len(temp_pool_size)
 
         for pi in range(self.num_pathways):
-            tpool = nn.AvgPool3d(
-                    [pool_size[pi][0], 1, 1], stride=1)
-            self.add_module(f's{pi}_tpool', tpool)
+            pi_temp_pool_size = temp_pool_size[pi]
+            if pi_temp_pool_size is not None:
+                tpool = nn.AvgPool3d(
+                        [pi_temp_pool_size, 1, 1], stride=1)
+                self.add_module(f's{pi}_tpool', tpool)
             roi_align = ROIAlign(
                     resolution[pi],
                     spatial_scale=1.0/scale_factor[pi],
@@ -87,8 +89,11 @@ class Head_featextract_roi(nn.Module):
         # / Roi_Pooling
         pool_out = []
         for pi in range(self.num_pathways):
-            t_pool = getattr(self, f's{pi}_tpool')
-            out = t_pool(x[pi])
+            t_pool = getattr(self, f's{pi}_tpool', None)
+            if t_pool is not None:
+                out = t_pool(x[pi])
+            else:
+                out = x[pi]
             assert out.shape[2] == 1
             out = torch.squeeze(out, 2)
 
@@ -107,14 +112,17 @@ class Head_featextract_roi(nn.Module):
         return result
 
 class FExtractor(object):
-    def __init__(self, sf_cfg):
-        self.headless_define(sf_cfg)
-        self.head_define(self.model, sf_cfg)
+    def __init__(self, sf_cfg, model_id):
+        self.headless_define(sf_cfg, model_id)
+        self.head_define(self.model, sf_cfg, model_id)
 
-    def headless_define(self, sf_cfg):
+    def headless_define(self, sf_cfg, model_id):
         model = slowfast.models.build_model(sf_cfg)
         if isinstance(model, slowfast.models.video_model_builder.ResNet):
-            hforward = hforward_resnet
+            if model_id == 'c2d_1x1':
+                hforward = hforward_resnet_nopool
+            else:
+                hforward = hforward_resnet
         elif isinstance(model, slowfast.models.video_model_builder.SlowFast):
             hforward = hforward_slowfast
         else:
@@ -122,7 +130,7 @@ class FExtractor(object):
         self.model = model
         self.model.forward = MethodType(hforward, self.model)
 
-    def head_define(self, model, sf_cfg):
+    def head_define(self, model, sf_cfg, model_id):
         model_nframes = sf_cfg.DATA.NUM_FRAMES
         POOL1 = SF_POOL1[sf_cfg.MODEL.ARCH]
         width_per_group = sf_cfg.RESNET.WIDTH_PER_GROUP
@@ -146,8 +154,13 @@ class FExtractor(object):
             scale_factor = [32] * 2
         else:
             raise RuntimeError()
+
+        if model_id == 'c2d_1x1':
+            temp_pool_size = [None]
+        else:
+            temp_pool_size = [s[0] for s in pool_size]
         self.head = Head_featextract_roi(
-                dim_in, pool_size, resolution, scale_factor)
+                dim_in, temp_pool_size, resolution, scale_factor)
 
     def forward(self, Xt_f32c, bboxes0_c):
         x = self.model(Xt_f32c)
@@ -159,7 +172,7 @@ class Ncfg_extractor:
     def set_defcfg(cfg):
         cfg.set_deftype("""
         extractor:
-            model_id: [~, ['SLOWFAST_4x16_R50', 'I3D_8x8_R50', 'C2D_NOPOOL_8x8_R50', 'c2d', 'R50_IMNET']]
+            model_id: [~, ['SLOWFAST_4x16_R50', 'I3D_8x8_R50', 'c2d', 'c2d_1x1', 'c2d_imnet']]
             extraction_mode: ['roi', ['roi', 'fullframe']]
         extraction:
             batch_size: [8, int]
@@ -171,18 +184,26 @@ class Ncfg_extractor:
         model_id = cf['extractor.model_id']
         rel_yml_path = REL_YAML_PATHS[model_id]
         sf_cfg = basic_sf_cfg(rel_yml_path)
+        if model_id == 'c2d_1x1':
+            sf_cfg.DATA.NUM_FRAMES = 1
+            sf_cfg.DATA.SAMPLING_RATE = 1
         sf_cfg.NUM_GPUS = 1
         norm_mean = sf_cfg.DATA.MEAN
         norm_std = sf_cfg.DATA.STD
 
-        fextractor = FExtractor(sf_cfg)
+        fextractor = FExtractor(sf_cfg, model_id)
 
         # Load model
         CHECKPOINT_FILE_PATH = CHECKPOINTS_PREFIX/CHECKPOINTS[model_id]
-        with vt_log.logging_disabled(logging.WARNING):
+        if model_id in ['c2d_imnet']:
             cu.load_checkpoint(
                 CHECKPOINT_FILE_PATH, fextractor.model, False, None,
-                inflation=False, convert_from_caffe2=True,)
+                inflation=True, convert_from_caffe2=False,)
+        else:
+            with vt_log.logging_disabled(logging.WARNING):
+                cu.load_checkpoint(
+                    CHECKPOINT_FILE_PATH, fextractor.model, False, None,
+                    inflation=False, convert_from_caffe2=True,)
 
         norm_mean_t = np_to_gpu(norm_mean)
         norm_std_t = np_to_gpu(norm_std)

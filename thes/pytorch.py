@@ -267,6 +267,15 @@ class TDataset_over_connections(torch.utils.data.Dataset):
 
 # Headless forward functions
 
+def hforward_resnet_nopool(self, x):
+    # slowfast/models/video_model_builder.py/ResNet.forward
+    x = self.s1(x)
+    x = self.s2(x)
+    x = self.s3(x)
+    x = self.s4(x)
+    x = self.s5(x)
+    return x
+
 def hforward_resnet(self, x):
     # slowfast/models/video_model_builder.py/ResNet.forward
     x = self.s1(x)
