@@ -560,7 +560,8 @@ def _tubefeats_experiment(
     torch.manual_seed(initial_seed)
     rgen = np.random.default_rng(initial_seed)
 
-    model = Net_mlp_onelayer(2304, 11, cf['net.H'])
+    input_dim = da_big.BIG.shape[-1]
+    model = Net_mlp_onelayer(input_dim, 11, cf['net.H'])
     loss_fn = torch.nn.CrossEntropyLoss(reduction='mean')
     # pretraining
     if cf['kf_pretrain.enabled']:

@@ -241,10 +241,11 @@ def extract_keyframe_features(workfolder, cfg_dict, add_args):
         bboxes0_c = bboxes0.type(torch.cuda.FloatTensor)
         with torch.no_grad():
             result = fextractor.forward(Xts_f32c, bboxes0_c)
-        result_np = {k: v.cpu().numpy()
+        result_dict = {k: v.cpu().numpy()
                 for k, v in result.items()}
         II_np = II.cpu().numpy()
-        return II_np, result_np
+        last_i = II_np[-1]
+        return result_dict, last_i
 
     disaver_fold = small.mkdir(out/'disaver')
     total = len(keyframes)
@@ -354,3 +355,96 @@ def extract_philtube_features(workfolder, cfg_dict, add_args):
 
     small.save_pkl(out/'dict_outputs.pkl', dict_outputs)
     small.save_pkl(out/'connections_f.pkl', connections_f)
+
+
+def combine_split_philtube_features(workfolder, cfg_dict, add_args):
+    out, = snippets.get_subfolders(workfolder, ['out'])
+    cfg = snippets.YConfig(cfg_dict)
+    cfg.set_defaults_handling(['inputs.cfolders'])
+    Ncfg_daly.set_defcfg(cfg)
+    cfg.set_deftype("""
+    inputs:
+        cfolders: [~, ~]
+        dims: [~, int]
+        key: ['roipooled', str]
+    tubes_dwein: [~, str]
+    frame_coverage:
+        keyframes: [True, bool]
+        subsample: [16, int]
+    """)
+    cf = cfg.parse()
+
+    # / prepare data
+    dataset: Dataset_daly_ocv = Ncfg_daly.get_dataset(cf)
+    tubes_dwein: Dict[I_dwein, T_dwein] = \
+            loadconvert_tubes_dwein(cf['tubes_dwein'])
+    # // Frames to cover: keyframes and every 16th frame
+    vids = list(dataset.videos_ocv.keys())
+    frames_to_cover: Dict[Vid_daly, np.ndarray] = \
+            get_daly_keyframes_to_cover(dataset, vids,
+                    cf['frame_coverage.keyframes'],
+                    cf['frame_coverage.subsample'])
+    connections_f: Dict[Tuple[Vid_daly, int], Box_connections_dwti]
+    connections_f = group_tubes_on_frame_level(
+            tubes_dwein, frames_to_cover)
+
+    # Load inputs now
+    input_cfolders = cf['inputs.cfolders']
+    if not snippets.gather_check_all_present(input_cfolders, [
+            'dict_outputs.pkl', 'connections_f.pkl']):
+        return
+
+    # Loading all piecemeal connections
+    i_cons = {}
+    for i, path in enumerate(input_cfolders):
+        path = Path(path)
+        local_connections_f = small.load_pkl(path/'connections_f.pkl')
+        i_cons[i] = local_connections_f
+    # Check consistency
+    grouped_cons = {}
+    for c in i_cons.values():
+        grouped_cons.update(c)
+    if grouped_cons.keys() != connections_f.keys():
+        log.error('Loaded connections inconsistent with expected ones')
+
+    partbox_numbering = []
+    for lc in i_cons.values():
+        nboxes = np.sum([len(c['boxes']) for c in lc.values()])
+        partbox_numbering.append(nboxes)
+    partbox_numbering = np.r_[0, np.cumsum(partbox_numbering)]
+
+    # Create mapping of indices
+    box_inds = [0]
+    for c in connections_f.values():
+        box_inds.append(len(c['boxes']))
+    box_inds = np.cumsum(box_inds)
+    box_inds2 = np.c_[box_inds[:-1], box_inds[1:]]
+
+    small.save_pkl(out/'connections_f.pkl', connections_f)
+    small.save_pkl(out/'box_inds2.pkl', box_inds2)
+
+    np_filename = str(out/'feats.npy')
+    dset = np.lib.format.open_memmap(np_filename, 'w+',
+        dtype=np.float16, shape=(partbox_numbering[-1], cf['inputs.dims']))
+
+    # Piecemeal conversion
+    for i, path in enumerate(input_cfolders):
+        success_file = out/f'{i}.merged'
+        if success_file.exists():
+            continue
+        log.info(f'Merging chunk {i=} at {path=}')
+        path = Path(path)
+        with small.QTimer('Unpickling'):
+            local_dict_outputs = small.load_pkl(path/'dict_outputs.pkl')
+        roipooled_feats = local_dict_outputs[cf['inputs.key']]
+        with small.QTimer('Vstack'):
+            cat_roipooled_feats = np.vstack(roipooled_feats)
+        with small.QTimer('to float16'):
+            feats16 = cat_roipooled_feats.astype(np.float16)
+        b, e = partbox_numbering[i], partbox_numbering[i+1]
+        assert e-b == feats16.shape[0]
+        with small.QTimer(f'Saving to disk chunk {i=}'):
+            dset[b:e] = feats16
+        success_file.touch()
+
+    del dset

@@ -1,4 +1,5 @@
 import cv2
+import pprint
 import pandas as pd
 import yaml
 import time
@@ -172,6 +173,21 @@ def weighted_array_split(X, weights, N):
             weights.cumsum(), approx_split_indices)
     X_split = np.array_split(X, split_indices)
     return X_split
+
+
+def gather_check_all_present(gather_paths, filenames):
+    # Check missing
+    missing_paths = []
+    for path in gather_paths:
+        for filename in filenames:
+            fpath = Path(path)/filename
+            if not fpath.exists():
+                missing_paths.append(fpath)
+    if len(missing_paths):
+        log.error('Some paths are MISSING:\n{}'.format(
+            pprint.pformat(missing_paths)))
+        return False
+    return True
 
 
 def check_step_sslice(

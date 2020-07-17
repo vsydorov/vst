@@ -204,21 +204,6 @@ def _caffe_feat_extract_func(net, keyframe):
     return feats
 
 
-def _gather_check_all_present(gather_paths, filenames):
-    # Check missing
-    missing_paths = []
-    for path in gather_paths:
-        for filename in filenames:
-            fpath = Path(path)/filename
-            if not fpath.exists():
-                missing_paths.append(fpath)
-    if len(missing_paths):
-        log.error('Some paths are MISSING:\n{}'.format(
-            pprint.pformat(missing_paths)))
-        return False
-    return True
-
-
 # Experiments
 
 def extract_sf_feats(workfolder, cfg_dict, add_args):
@@ -625,7 +610,7 @@ def combine_probed_philtubes(workfolder, cfg_dict, add_args):
 
     # Load inputs now
     input_cfolders = cf['inputs.cfolders']
-    if not _gather_check_all_present(input_cfolders, [
+    if not snippets.gather_check_all_present(input_cfolders, [
             'dict_outputs.pkl', 'connections_f.pkl']):
         return
 
