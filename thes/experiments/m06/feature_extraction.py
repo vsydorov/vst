@@ -429,9 +429,6 @@ def combine_split_philtube_features(workfolder, cfg_dict, add_args):
 
     # Piecemeal conversion
     for i, path in enumerate(input_cfolders):
-        success_file = out/f'{i}.merged'
-        if success_file.exists():
-            continue
         log.info(f'Merging chunk {i=} at {path=}')
         path = Path(path)
         with small.QTimer('Unpickling'):
@@ -445,6 +442,5 @@ def combine_split_philtube_features(workfolder, cfg_dict, add_args):
         assert e-b == feats16.shape[0]
         with small.QTimer(f'Saving to disk chunk {i=}'):
             dset[b:e] = feats16
-        success_file.touch()
 
     del dset
