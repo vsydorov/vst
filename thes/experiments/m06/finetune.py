@@ -13,7 +13,8 @@ from detectron2.layers import ROIAlign
 import slowfast.models
 import slowfast.utils.checkpoint as cu
 
-from slowfast.models.video_model_builder import SlowFast
+from slowfast.models.video_model_builder import SlowFast as M_slowfast
+from slowfast.models.video_model_builder import ResNet as M_resnet
 from slowfast.models.batchnorm_helper import get_norm
 import slowfast.utils.weight_init_helper as init_helper
 
@@ -222,10 +223,9 @@ def to_gpu_normalize_permute(Xt, norm_mean_t, norm_std_t):
     X_f32c = X_f32c.permute(0, 4, 1, 2, 3)
     return X_f32c
 
-class SlowFast_roitune(SlowFast):
+class SlowFast_roitune(M_slowfast):
     def __init__(self, sf_cfg, num_classes):
-        # super().__init__(cfg)
-        super(SlowFast, self).__init__()
+        super(M_slowfast, self).__init__()
         self.norm_module = get_norm(sf_cfg)
         self.enable_detection = sf_cfg.DETECTION.ENABLE
         self.num_pathways = 2
@@ -321,6 +321,23 @@ class SlowFast_roitune(SlowFast):
         x = self._roitune_forward(x, bboxes0)
         return x
 
+
+class C2D_1x1_roitune(M_resnet):
+    def __init__(self, sf_cfg, num_classes):
+        super(M_slowfast, self).__init__()
+        self.norm_module = get_norm(sf_cfg)
+        self.enable_detection = sf_cfg.DETECTION.ENABLE
+        self.num_pathways = 2
+        self._construct_network(sf_cfg)
+        self._construct_roitune(sf_cfg, num_classes)
+        init_helper.init_weights(
+            self, sf_cfg.MODEL.FC_INIT_STD,
+            sf_cfg.RESNET.ZERO_INIT_FINAL_BN)
+
+    def _construct_roitune(self, sf_cfg, num_classes):
+        pass
+
+
 def build_slowfast_roitune(num_classes):
     rel_yml_path = 'Kinetics/c2/SLOWFAST_4x16_R50.yaml'
     sf_cfg = basic_sf_cfg(rel_yml_path)
@@ -347,7 +364,7 @@ def tubefeats_train_model(workfolder, cfg_dict, add_args):
         tubes_dwein: [~, str]
     frame_coverage:
         keyframes: [True, bool]
-        subsample: [16, int]
+        subsample: [4, int]
     split_assignment: ['train/val', ['train/val', 'trainval/test']]
     """)
     cfg.set_defaults("""
@@ -371,12 +388,11 @@ def tubefeats_train_model(workfolder, cfg_dict, add_args):
     sset_train, sset_eval = cf['split_assignment'].split('/')
     tubes_dwein_d, tubes_dgt_d = load_gt_and_wein_tubes(
             cf['inputs.tubes_dwein'], dataset, vgroup)
-    # Create labels over connections
     dwti_to_label_train: Dict[I_dgt, int]
     cls_labels, dwti_to_label_train = qload_synthetic_tube_labels(
             tubes_dgt_d[sset_train], tubes_dwein_d[sset_train], dataset)
 
-    # Frames to cover: keyframes and every 16th frame
+    # Frames to cover: keyframes and every 4th frame
     vids = list(dataset.videos_ocv.keys())
     frames_to_cover: Dict[Vid_daly, np.ndarray] = \
             get_daly_keyframes_to_cover(dataset, vids,
