@@ -584,6 +584,34 @@ class Isaver_mixin_restore_save(object):
         ifiles['finished'].touch()
 
 
+class Counter_repeated_action(object):
+    """
+    Will check whether repeated action should be performed
+    """
+    def __init__(self, sslice='::', seconds=None, iters=None):
+        self.sslice = sslice
+        self.seconds = seconds
+        self.iters = iters
+        self.tic(-1)
+
+    def tic(self, i=None):
+        self._time_last = time.perf_counter()
+        if i is not None:
+            self._i_last = i
+
+    def check(self, i=None):
+        ACTION = False
+        if i is not None:
+            ACTION |= check_step_sslice(i, self.sslice)
+            if self.iters is not None:
+                ACTION |= (i - self._i_last) >= self.iters
+
+        if self.seconds is not None:
+            time_since_last = time.perf_counter() - self._time_last
+            ACTION |= time_since_last >= self.seconds
+        return ACTION
+
+
 class Isaver_simple(Isaver_mixin_restore_save, Isaver_base):
     """
     Will process a list with a func

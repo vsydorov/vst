@@ -117,3 +117,12 @@ def create_keyframelist(dataset):
                             }
                     keyframes.append(kf_dict)
     return keyframes
+
+
+def to_keyframedict(keyframes):
+    result = {}
+    for kf in keyframes:
+        kf_ind = (kf['vid'], kf['action_name'],
+                kf['ins_ind'], kf['kf_ind'])
+        result[kf_ind] = kf
+    return result

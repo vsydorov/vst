@@ -201,14 +201,14 @@ def extract_prepare_around_keyframe(
 
 
 class TDataset_over_keyframes(torch.utils.data.Dataset):
-    def __init__(self, keyframes, sampler_grid, extractor_vsf):
-        self.keyframes = keyframes
+    def __init__(self, dict_keyframes, sampler_grid, frameloader_vsf):
+        self.dict_keyframes = dict_keyframes
         self.sampler_grid = sampler_grid
-        self.extractor_vsf = extractor_vsf
+        self.frameloader_vsf = frameloader_vsf
 
     def __getitem__(self, index):
         # Extract frames
-        keyframe = self.keyframes[index]
+        kkey, keyframe = list(self.dict_keyframes.items())[index]
         video_path = keyframe['video_path']
         i0 = keyframe['frame0']
 
@@ -216,24 +216,27 @@ class TDataset_over_keyframes(torch.utils.data.Dataset):
                 i0, keyframe['nframes'])
 
         frame_list, resize_params, ccrop_params = \
-            self.extractor_vsf.prepare_frame_list(
+            self.frameloader_vsf.prepare_frame_list(
                     video_path, finds_to_sample)
-        bbox_tldr = self.extractor_vsf.prepare_box(
+        bbox_tldr = self.frameloader_vsf.prepare_box(
                 keyframe['bbox'], resize_params, ccrop_params)
-
-        return index, frame_list, bbox_tldr
+        meta = {
+                'index': index,
+                'kkey': kkey,
+                'do_not_collate': True}
+        return meta, frame_list, bbox_tldr
 
     def __len__(self) -> int:
-        return len(self.keyframes)
+        return len(self.dict_keyframes)
 
 
 class TDataset_over_connections(torch.utils.data.Dataset):
     def __init__(self, dict_f, dataset,
-            sampler_grid, extractor_vsf):
+            sampler_grid, frameloader_vsf):
         self.dict_f = dict_f
         self.dataset = dataset
         self.sampler_grid = sampler_grid
-        self.extractor_vsf = extractor_vsf
+        self.frameloader_vsf = frameloader_vsf
 
     def __getitem__(self, index):
         # Extract frames
@@ -248,11 +251,11 @@ class TDataset_over_connections(torch.utils.data.Dataset):
 
         finds_to_sample = self.sampler_grid.apply(i0, nframes)
         frame_list, resize_params, ccrop_params = \
-            self.extractor_vsf.prepare_frame_list(
+            self.frameloader_vsf.prepare_frame_list(
                     video_path, finds_to_sample)
         prepared_bboxes = []
         for box_ltrd in bboxes_ltrd:
-            prepared_bbox_tldr = self.extractor_vsf.prepare_box(
+            prepared_bbox_tldr = self.frameloader_vsf.prepare_box(
                 box_ltrd, resize_params, ccrop_params)
             prepared_bboxes.append(prepared_bbox_tldr)
         meta = {
@@ -332,22 +335,22 @@ class Dataloader_isaver(
     """
     def __init__(self, folder,
             total, func, prepare_func,
-            save_every=0,
-            save_interval=120,  # every 2 minutes by default
+            save_interval_iters=None,
+            save_interval_seconds=120,  # every 2 minutes by default
             log_interval=None,):
         super().__init__(folder, total)
         self.func = func
         self.prepare_func = prepare_func
-        self._save_every = save_every
-        self._save_interval = save_interval
+        self._save_interval_iters = save_interval_iters
+        self._save_interval_seconds = save_interval_seconds
         self._log_interval = log_interval
         self.result = []
 
     def run(self):
         i_last = self._restore()
-        self._time_last_save = time.perf_counter()
-        self._time_last_log = time.perf_counter()
-        self._i_last_saved = 0
+        countra = snippets.Counter_repeated_action(
+                seconds=self._interval_seconds,
+                iters=self._interval_iters)
 
         result_cache = []
 
@@ -363,20 +366,9 @@ class Dataloader_isaver(
         for i_batch, data_input in enumerate(pbar):
             result_dict, i_last = self.func(data_input)
             result_cache.append(result_dict)
-            SAVE = False
-            if self._save_every > 0:
-                SAVE |= (i_last - self._i_last_saved) >= self._save_every
-            if self._save_interval:
-                since_last_save = time.perf_counter() - self._time_last_save
-                SAVE |= since_last_save > self._save_interval
-            if SAVE:
+            if countra.check(i_batch):
                 flush_purge()
-                self._time_last_save = time.perf_counter()
-                self._i_last_saved = i_last
-            if self._log_interval:
-                since_last_log = time.perf_counter() - self._time_last_log
-                if since_last_log > self._log_interval:
-                    log.info(snippets._tqdm_str(pbar))
-                    self._time_last_log = time.perf_counter()
+                log.debug(snippets._tqdm_str(pbar))
+                countra.tic(i_batch)
         flush_purge()
         return self.result

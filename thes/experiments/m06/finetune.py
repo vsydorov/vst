@@ -1,6 +1,7 @@
 import copy
 import numpy as np
 import logging
+from pathlib import Path
 from types import MethodType
 from typing import (  # NOQA
     Dict, Any, List, Optional, Tuple, TypedDict, Set)
@@ -17,6 +18,7 @@ from slowfast.models.video_model_builder import SlowFast as M_slowfast
 from slowfast.models.video_model_builder import ResNet as M_resnet
 from slowfast.models.batchnorm_helper import get_norm
 import slowfast.utils.weight_init_helper as init_helper
+from slowfast.models.video_model_builder import _POOL1 as SF_POOL1
 
 
 from vsydorov_tools import small
@@ -38,19 +40,12 @@ from thes.slowfast.cfg import (basic_sf_cfg)
 from thes.tools import snippets
 from thes.tools.video import (
     tfm_video_resize_threaded, tfm_video_center_crop)
-from thes.pytorch import sequence_batch_collate_v2
+from thes.pytorch import (
+    sequence_batch_collate_v2, np_to_gpu,
+    to_gpu_normalize_permute, Sampler_grid,
+    Frameloader_video_slowfast)
 
 log = logging.getLogger(__name__)
-
-
-norm_mean = np.array([0.45, 0.45, 0.45])
-norm_std = np.array([0.225, 0.225, 0.225])
-
-
-def np_to_gpu(X):
-    X = torch.from_numpy(np.array(X))
-    X = X.type(torch.cuda.FloatTensor)
-    return X
 
 
 def _quick_shuffle_batches(dwti_to_inds_big, rgen, dwti_to_label,
@@ -143,18 +138,16 @@ class TD_over_cl(torch.utils.data.Dataset):
     cls_vf: Dict[Tuple[Vid_daly, int], Bc_dwti_labeled] = {}
     keys_vf: List[Tuple[Vid_daly, int]]
 
-    def __init__(self, cls_vf, keys_vf, dataset,
-            model_nframes, model_sample, slowfast_alpha):
+    def __init__(self, cls_vf, dataset,
+            sampler_grid, frameloader_vsf):
         self.cls_vf = cls_vf
-        self.keys_vf = keys_vf
+        self.keys_vf = list(cls_vf.keys())
         self.dataset = dataset
-        center_frame = (model_nframes-1)//2
-        self.sample_grid0 = (
-                np.arange(model_nframes)-center_frame)*model_sample
-        self._slowfast_alpha = slowfast_alpha
+        self.sampler_grid = sampler_grid
+        self.frameloader_vsf = frameloader_vsf
 
     def __len__(self):
-        return len(self.keys_vf)
+        return len(self.cls_vf)
 
     def __getitem__(self, index):
         key_vf = self.keys_vf[index]
@@ -169,40 +162,15 @@ class TD_over_cl(torch.utils.data.Dataset):
         video_path = str(self.dataset.videos_ocv[vid]['path'])
         nframes = self.dataset.videos_ocv[vid]['nframes']
 
-        finds_to_sample = i0 + self.sample_grid0
-        finds_to_sample = np.clip(finds_to_sample, 0, nframes-1)
-        test_crop_size = 256
-
-        # opencv loading only
-        with vt_cv.video_capture_open(video_path) as vcap:
-            framelist_u8_bgr = vt_cv.video_sample(vcap, finds_to_sample)
-        X, resize_params, ccrop_params = prepare_video_resize_crop_flip(
-                framelist_u8_bgr, test_crop_size, flip_lastdim=True)
-
-        # Convert to torch
-        Xt = torch.from_numpy(X)
-
-        # / Assume slowfast
-        # slowfast/datasets/utils.py/pack_pathway_output
-        TIME_DIM = 0
-        fast_pathway = Xt
-        slow_pathway = torch.index_select(
-            Xt,
-            TIME_DIM,
-            torch.linspace(
-                0, Xt.shape[TIME_DIM] - 1,
-                Xt.shape[TIME_DIM] // self._slowfast_alpha
-            ).long(),
-        )
-        frame_list = [slow_pathway, fast_pathway]
-
-        # Bboxes
+        finds_to_sample = self.sampler_grid.apply(i0, nframes)
+        frame_list, resize_params, ccrop_params = \
+            self.frameloader_vsf.prepare_frame_list(
+                    video_path, finds_to_sample)
         prepared_bboxes = []
         for box_ltrd in bboxes_ltrd:
-            prepared_bbox_tldr = prepare_box(
+            prepared_bbox_tldr = self.frameloader_vsf.prepare_box(
                 box_ltrd, resize_params, ccrop_params)
             prepared_bboxes.append(prepared_bbox_tldr)
-
         meta = {
             'labels': labels,
             'index': index,
@@ -211,17 +179,6 @@ class TD_over_cl(torch.utils.data.Dataset):
             'do_not_collate': True}
         return (frame_list, meta)
 
-
-def to_gpu_normalize_permute(Xt, norm_mean_t, norm_std_t):
-    # Convert to float on GPU
-    X_f32c = Xt.type(torch.cuda.FloatTensor)
-    X_f32c /= 255
-    # Normalize
-    X_f32c = (X_f32c-norm_mean_t)/norm_std_t
-    # THWC -> CTHW
-    assert len(X_f32c.shape) == 5
-    X_f32c = X_f32c.permute(0, 4, 1, 2, 3)
-    return X_f32c
 
 class SlowFast_roitune(M_slowfast):
     def __init__(self, sf_cfg, num_classes):
@@ -324,10 +281,10 @@ class SlowFast_roitune(M_slowfast):
 
 class C2D_1x1_roitune(M_resnet):
     def __init__(self, sf_cfg, num_classes):
-        super(M_slowfast, self).__init__()
+        super(M_resnet, self).__init__()
         self.norm_module = get_norm(sf_cfg)
         self.enable_detection = sf_cfg.DETECTION.ENABLE
-        self.num_pathways = 2
+        self.num_pathways = 1
         self._construct_network(sf_cfg)
         self._construct_roitune(sf_cfg, num_classes)
         init_helper.init_weights(
@@ -335,7 +292,62 @@ class C2D_1x1_roitune(M_resnet):
             sf_cfg.RESNET.ZERO_INIT_FINAL_BN)
 
     def _construct_roitune(self, sf_cfg, num_classes):
-        pass
+        # params
+        xform_resolution = 7
+        resolution = [[xform_resolution] * 2]
+        scale_factor = [32]
+        dim_in = [sf_cfg.RESNET.WIDTH_PER_GROUP * 32]
+        dropout_rate = 0.5
+
+        pi = 0
+        roi_align = ROIAlign(
+                resolution[pi],
+                spatial_scale=1.0/scale_factor[pi],
+                sampling_ratio=0,
+                aligned=True)
+        self.add_module(f's{pi}_roi', roi_align)
+        spool = nn.MaxPool2d(resolution[pi], stride=1)
+        self.add_module(f's{pi}_spool', spool)
+
+        if dropout_rate > 0.0:
+            self.rt_dropout = nn.Dropout(dropout_rate)
+        self.rt_projection = nn.Linear(
+                sum(dim_in), num_classes, bias=True)
+        self.rt_act = nn.Softmax(dim=-1)
+
+    def _headless_forward(self, x):
+        # hforward_resnet_nopool
+        # slowfast/models/video_model_builder.py/ResNet.forward
+        x = self.s1(x)
+        x = self.s2(x)
+        x = self.s3(x)
+        x = self.s4(x)
+        x = self.s5(x)
+        return x
+
+    def _roitune_forward(self, feats_in, bboxes0):
+        out = feats_in[0]
+        assert out.shape[2] == 1
+        out = torch.squeeze(out, 2)
+        out = self.s0_roi(out, bboxes0)
+        out = self.s0_spool(out)
+
+        # B C H W
+        x = out.view(out.shape[0], -1)
+
+        # Perform dropout.
+        if hasattr(self, "rt_dropout"):
+            x = self.rt_dropout(x)
+
+        x = x.view(x.shape[0], -1)
+        x = self.rt_projection(x)
+        x = self.rt_act(x)
+        return x
+
+    def forward(self, x, bboxes0):
+        x = self._headless_forward(x)
+        x = self._roitune_forward(x, bboxes0)
+        return x
 
 
 def build_slowfast_roitune(num_classes):
@@ -351,43 +363,7 @@ def build_slowfast_roitune(num_classes):
     model = model.cuda(device=cur_device)
     return model, sf_cfg
 
-# EXPERIMENTS
-
-
-def tubefeats_train_model(workfolder, cfg_dict, add_args):
-    out, = snippets.get_subfolders(workfolder, ['out'])
-    cfg = snippets.YConfig(cfg_dict)
-    Ncfg_daly.set_defcfg(cfg)
-    cfg.set_deftype("""
-    seed: [42, int]
-    inputs:
-        tubes_dwein: [~, str]
-    frame_coverage:
-        keyframes: [True, bool]
-        subsample: [4, int]
-    split_assignment: ['train/val', ['train/val', 'trainval/test']]
-    """)
-    cfg.set_defaults("""
-    train:
-        lr: 1.0e-5
-        weight_decay: 5.0e-2
-        n_epochs: 120
-        tubes_per_batch: 500
-        frames_per_tube: 2
-        period:
-            log: '::1'
-            eval:
-                trainset: '::'
-                evalset: '0::20'
-    """)
-    cf = cfg.parse()
-    initial_seed = cf['seed']
-
-    dataset: Dataset_daly_ocv = Ncfg_daly.get_dataset(cf)
-    vgroup = Ncfg_daly.get_vids(cf, dataset)
-    sset_train, sset_eval = cf['split_assignment'].split('/')
-    tubes_dwein_d, tubes_dgt_d = load_gt_and_wein_tubes(
-            cf['inputs.tubes_dwein'], dataset, vgroup)
+def _prepare_keyframe_cls_labels():
     dwti_to_label_train: Dict[I_dgt, int]
     cls_labels, dwti_to_label_train = qload_synthetic_tube_labels(
             tubes_dgt_d[sset_train], tubes_dwein_d[sset_train], dataset)
@@ -425,14 +401,41 @@ def tubefeats_train_model(workfolder, cfg_dict, add_args):
                     'labels': np.array(labels)}
             cls_vf_train[(vid, f)] = bc_dwti_labeled
 
+def _build_model():
     # Build model
-    model, sf_cfg = build_slowfast_roitune(11)
+    rel_yml_path = 'Kinetics/C2D_8x8_R50_IN1K.yaml'
+    sf_cfg = basic_sf_cfg(rel_yml_path)
+    sf_cfg.NUM_GPUS = 1
+    sf_cfg.DATA.NUM_FRAMES = 1
+    sf_cfg.DATA.SAMPLING_RATE = 1
+
+    # / slowfast.models.build_model
+    model = C2D_1x1_roitune(sf_cfg, 11)
+    # Determine the GPU used by the current process
+    cur_device = torch.cuda.current_device()
+    # Transfer the model to the current GPU device
+    model = model.cuda(device=cur_device)
+
     model_nframes = sf_cfg.DATA.NUM_FRAMES
     model_sample = sf_cfg.DATA.SAMPLING_RATE
     slowfast_alpha = sf_cfg.SLOWFAST.ALPHA
 
+    sampler_grid = Sampler_grid(model_nframes, model_sample)
+    frameloader_vsf = Frameloader_video_slowfast(
+            False, slowfast_alpha, 256)
+
+    norm_mean = sf_cfg.DATA.MEAN
+    norm_std = sf_cfg.DATA.STD
+    norm_mean_t = np_to_gpu(norm_mean)
+    norm_std_t = np_to_gpu(norm_std)
+
+
+def _load_model_initial():
     # Load model
-    CHECKPOINT_FILE_PATH = '/home/vsydorov/projects/deployed/2019_12_Thesis/links/scratch2/102_slowfast/20_zoo_checkpoints/kinetics400/SLOWFAST_4x16_R50.pkl'
+    # CHECKPOINT_FILE_PATH = '/home/vsydorov/projects/deployed/2019_12_Thesis/links/scratch2/102_slowfast/20_zoo_checkpoints/kinetics400/SLOWFAST_4x16_R50.pkl'
+    CHECKPOINTS_PREFIX = Path('/home/vsydorov/projects/deployed/2019_12_Thesis/links/scratch2/102_slowfast/20_zoo_checkpoints/')
+    rel = 'kin400_video_nonlocal/c2d_baseline_8x8_IN_pretrain_400k.pkl'
+    CHECKPOINT_FILE_PATH = CHECKPOINTS_PREFIX/rel
 
     # Load model
     model.eval()
@@ -440,6 +443,44 @@ def tubefeats_train_model(workfolder, cfg_dict, add_args):
         cu.load_checkpoint(
             CHECKPOINT_FILE_PATH, model, False, None,
             inflation=False, convert_from_caffe2=True,)
+
+
+# EXPERIMENTS
+
+def tubefeats_train_model(workfolder, cfg_dict, add_args):
+    out, = snippets.get_subfolders(workfolder, ['out'])
+    cfg = snippets.YConfig(cfg_dict)
+    Ncfg_daly.set_defcfg(cfg)
+    cfg.set_deftype("""
+    seed: [42, int]
+    inputs:
+        tubes_dwein: [~, str]
+    frame_coverage:
+        keyframes: [True, bool]
+        subsample: [4, int]
+    split_assignment: ['train/val', ['train/val', 'trainval/test']]
+    """)
+    cfg.set_defaults("""
+    train:
+        lr: 1.0e-5
+        weight_decay: 5.0e-2
+        n_epochs: 120
+        tubes_per_batch: 500
+        frames_per_tube: 2
+        period:
+            log: '::1'
+            eval:
+                trainset: '::'
+                evalset: '0::20'
+    """)
+    cf = cfg.parse()
+    initial_seed = cf['seed']
+
+    dataset: Dataset_daly_ocv = Ncfg_daly.get_dataset(cf)
+    vgroup = Ncfg_daly.get_vids(cf, dataset)
+    sset_train, sset_eval = cf['split_assignment'].split('/')
+    tubes_dwein_d, tubes_dgt_d = load_gt_and_wein_tubes(
+            cf['inputs.tubes_dwein'], dataset, vgroup)
 
     # Training
     torch.manual_seed(initial_seed)
@@ -454,15 +495,11 @@ def tubefeats_train_model(workfolder, cfg_dict, add_args):
     frames_per_tube = cf['train.frames_per_tube']
     model.train()
 
-    norm_mean_t = np_to_gpu(norm_mean)
-    norm_std_t = np_to_gpu(norm_std)
-
     BATCH_SIZE = 12
     NUM_WORKERS = 8
     for epoch in range(n_epochs):
-        keys_vf = list(cls_vf_train.keys())
-        tdataset_cl = TD_over_cl(cls_vf_train, keys_vf, dataset,
-                model_nframes, model_sample, slowfast_alpha)
+        tdataset_cl = TD_over_cl(cls_vf_train, dataset,
+                sampler_grid, frameloader_vsf)
         loader = torch.utils.data.DataLoader(tdataset_cl,
                 batch_size=BATCH_SIZE, shuffle=True,
                 num_workers=NUM_WORKERS, pin_memory=True,
@@ -505,3 +542,19 @@ def tubefeats_train_model(workfolder, cfg_dict, add_args):
             # log.info(f'{epoch}: {loss.item()} '
             #         f'{kacc_train=:.2f} {kacc_eval=:.2f}')
             log.info(f'{epoch}: {loss.item()} ')
+
+
+def finetune_over_extracted_frames(workfolder, cfg_dict, add_args):
+    out, = snippets.get_subfolders(workfolder, ['out'])
+    cfg = snippets.YConfig(cfg_dict)
+    Ncfg_daly.set_defcfg(cfg)
+    cfg.set_deftype("""
+    seed: [42, int]
+    inputs:
+        tubes_dwein: [~, str]
+        keyframes_rgb: [~, str]
+    split_assignment: ['train/val', ['train/val', 'trainval/test']]
+    """)
+    cf = cfg.parse()
+
+    dataset: Dataset_daly_ocv = Ncfg_daly.get_dataset(cf)

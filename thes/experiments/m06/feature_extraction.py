@@ -26,7 +26,8 @@ from vsydorov_tools import log as vt_log
 from slowfast.models.video_model_builder import _POOL1 as SF_POOL1
 
 from thes.data.dataset.daly import (
-    Ncfg_daly, get_daly_keyframes_to_cover, create_keyframelist)
+    Ncfg_daly, get_daly_keyframes_to_cover,
+    create_keyframelist, to_keyframedict)
 from thes.data.dataset.external import (
     Dataset_daly_ocv, Vid_daly)
 from thes.data.tubes.types import (
@@ -237,22 +238,26 @@ def extract_keyframe_features(workfolder, cfg_dict, add_args):
     # prepare data
     dataset: Dataset_daly_ocv = Ncfg_daly.get_dataset(cf)
     keyframes = create_keyframelist(dataset)
+    keyframes_dict = to_keyframedict(keyframes)
 
     # / extract
     def prepare_func(start_i):
-        remaining_keyframes = keyframes[start_i+1:]
+        remaining_keyframes_dict = dict(list(
+            keyframes_dict.items())[start_i+1:])
         tdataset_kf = TDataset_over_keyframes(
-                remaining_keyframes, sampler_grid, frameloader_vsf)
+                remaining_keyframes_dict, sampler_grid, frameloader_vsf)
         loader = torch.utils.data.DataLoader(tdataset_kf,
                 batch_size=BATCH_SIZE, shuffle=False,
-                num_workers=NUM_WORKERS, pin_memory=True)
+                num_workers=NUM_WORKERS, pin_memory=True,
+                collate_fn=sequence_batch_collate_v2)
         return loader
 
     bboxes_batch_index = torch.arange(
         BATCH_SIZE).type(torch.DoubleTensor)[:, None]
 
     def func(data_input):
-        II, Xts, bboxes = data_input
+        metas, Xts, bboxes = data_input
+        kkeys = [tuple(m['kkey']) for m in metas]
         Xts_f32c = [to_gpu_normalize_permute(
             x, norm_mean_t, norm_std_t) for x in Xts]
 
@@ -264,8 +269,7 @@ def extract_keyframe_features(workfolder, cfg_dict, add_args):
             result = fextractor.forward(Xts_f32c, bboxes0_c)
         result_dict = {k: v.cpu().numpy()
                 for k, v in result.items()}
-        II_np = II.cpu().numpy()
-        last_i = II_np[-1]
+        last_i = list(keyframes_dict.keys()).index(kkeys[-1])
         return result_dict, last_i
 
     disaver_fold = small.mkdir(out/'disaver')
@@ -465,3 +469,143 @@ def combine_split_philtube_features(workfolder, cfg_dict, add_args):
             dset[b:e] = feats16
 
     del dset
+
+
+class Isaver_extract_rgb(snippets.Isaver_base):
+    def __init__(
+            self, folder,
+            total, func, prepare_func,
+            interval_iters=None,
+            interval_seconds=120,  # every 2 minutes by default
+                ):
+        super(Isaver_extract_rgb, self).__init__(folder, total)
+        self.func = func
+        self.prepare_func = prepare_func
+        self._interval_iters = interval_iters
+        self._interval_seconds = interval_seconds
+        self.result = []
+        self.npy_array = None
+
+    def _get_filenames(self, i) -> Dict[str, Path]:
+        base_filenames = {
+            'finished': self._fmt_finished.format(i, self._total)}
+        base_filenames['pkl'] = Path(
+                base_filenames['finished']).with_suffix('.pkl')
+        base_filenames['npy'] = Path(
+                base_filenames['finished']).with_suffix('.npy')
+        filenames = {k: self._folder/v
+                for k, v in base_filenames.items()}
+        return filenames
+
+    def _restore(self):
+        intermediate_files: Dict[int, Dict[str, Path]] = \
+                self._get_intermediate_files()
+        start_i, ifiles = max(intermediate_files.items(),
+                default=(-1, None))
+        if ifiles is not None:
+            self.result = small.load_pkl(ifiles['pkl'])
+            self.npy_array = np.load(ifiles['npy'])
+            log.info('Restore from pkl: {} npy: {}'.format(
+                ifiles['pkl'], ifiles['npy']))
+        return start_i
+
+    def _save(self, i):
+        ifiles = self._get_filenames(i)
+        small.save_pkl(ifiles['pkl'], self.result)
+        np.save(ifiles['npy'], self.npy_array)
+        ifiles['finished'].touch()
+
+    def run(self):
+        i_last = self._restore()
+        countra = snippets.Counter_repeated_action(
+                seconds=self._interval_seconds,
+                iters=self._interval_iters)
+
+        pkl_cache = []
+        npy_cache = []
+
+        def flush_purge():
+            self.result.extend(pkl_cache)
+            if self.npy_array is None:
+                to_stack = npy_cache
+            else:
+                to_stack = (self.npy_array, *npy_cache)
+            self.npy_array = np.vstack(to_stack)
+            pkl_cache.clear()
+            npy_cache.clear()
+            with small.QTimer('saving'):
+                self._save(i_last)
+            self._purge_intermediate_files()
+
+        loader = self.prepare_func(i_last)
+        pbar = tqdm(loader, total=len(loader))
+        for i_batch, data_input in enumerate(pbar):
+            pkl_part, npy_part, i_last = self.func(data_input)
+            pkl_cache.append(pkl_part)
+            npy_cache.append(npy_part)
+            if countra.check(i_batch):
+                flush_purge()
+                log.debug(snippets._tqdm_str(pbar))
+                countra.tic(i_batch)
+        flush_purge()
+        return self.result, self.npy_array
+
+
+def extract_keyframe_rgb(workfolder, cfg_dict, add_args):
+    out, = snippets.get_subfolders(workfolder, ['out'])
+    cfg = snippets.YConfig(cfg_dict)
+    Ncfg_daly.set_defcfg(cfg)
+    cf = cfg.parse()
+    # prepare data
+    dataset: Dataset_daly_ocv = Ncfg_daly.get_dataset(cf)
+    keyframes = create_keyframelist(dataset)
+    keyframes_dict = to_keyframedict(keyframes)
+    # prepare others
+    NUM_WORKERS = 12
+    BATCH_SIZE = 32
+
+    model_nframes = 1
+    model_sample = 1
+    is_slowfast = False
+    slowfast_alpha = 8
+    sampler_grid = Sampler_grid(model_nframes, model_sample)
+    frameloader_vsf = Frameloader_video_slowfast(
+            is_slowfast, slowfast_alpha, 256)
+
+    def prepare_func(start_i):
+        remaining_keyframes_dict = dict(list(
+            keyframes_dict.items())[start_i+1:])
+        tdataset_kf = TDataset_over_keyframes(
+                remaining_keyframes_dict, sampler_grid, frameloader_vsf)
+        loader = torch.utils.data.DataLoader(tdataset_kf,
+                batch_size=BATCH_SIZE, shuffle=False,
+                num_workers=NUM_WORKERS, pin_memory=False,
+                collate_fn=sequence_batch_collate_v2)
+        return loader
+
+    def func(data_input):
+        metas, frame_list, bboxes_tldr = data_input
+        kkeys = [tuple(m['kkey']) for m in metas]
+        bboxes_np = bboxes_tldr.cpu().numpy()
+        Xts_np = frame_list[0].cpu().numpy()
+        pkl_part = {
+                'bboxes': bboxes_np,
+                'kkeys': kkeys}
+        npy_part = Xts_np
+
+        last_i = list(keyframes_dict.keys()).index(kkeys[-1])
+        return pkl_part, npy_part, last_i
+
+    disaver_fold = small.mkdir(out/'disaver')
+    total = len(keyframes)
+    disaver = Isaver_extract_rgb(disaver_fold, total, func, prepare_func,
+        interval_seconds=90)
+    outputs, npy_array = disaver.run()
+    keys = next(iter(outputs)).keys()
+    dict_outputs = {}
+    for k in keys:
+        key_outputs = [oo for o in outputs for oo in o[k]]
+        dict_outputs[k] = key_outputs
+
+    small.save_pkl(out/'dict_outputs.pkl', dict_outputs)
+    np.save(out/'rgb.npy', npy_array)
