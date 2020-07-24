@@ -220,6 +220,86 @@ class Ncfg_extractor:
                 is_slowfast, slowfast_alpha, 256)
         return norm_mean_t, norm_std_t, sampler_grid, frameloader_vsf, fextractor
 
+
+class Isaver_extract_rgb(snippets.Isaver_base):
+    def __init__(
+            self, folder,
+            total, func, prepare_func,
+            interval_iters=None,
+            interval_seconds=120,  # every 2 minutes by default
+                ):
+        super(Isaver_extract_rgb, self).__init__(folder, total)
+        self.func = func
+        self.prepare_func = prepare_func
+        self._interval_iters = interval_iters
+        self._interval_seconds = interval_seconds
+        self.result = []
+        self.npy_array = None
+
+    def _get_filenames(self, i) -> Dict[str, Path]:
+        base_filenames = {
+            'finished': self._fmt_finished.format(i, self._total)}
+        base_filenames['pkl'] = Path(
+                base_filenames['finished']).with_suffix('.pkl')
+        base_filenames['npy'] = Path(
+                base_filenames['finished']).with_suffix('.npy')
+        filenames = {k: self._folder/v
+                for k, v in base_filenames.items()}
+        return filenames
+
+    def _restore(self):
+        intermediate_files: Dict[int, Dict[str, Path]] = \
+                self._get_intermediate_files()
+        start_i, ifiles = max(intermediate_files.items(),
+                default=(-1, None))
+        if ifiles is not None:
+            self.result = small.load_pkl(ifiles['pkl'])
+            self.npy_array = np.load(ifiles['npy'])
+            log.info('Restore from pkl: {} npy: {}'.format(
+                ifiles['pkl'], ifiles['npy']))
+        return start_i
+
+    def _save(self, i):
+        ifiles = self._get_filenames(i)
+        small.save_pkl(ifiles['pkl'], self.result)
+        np.save(ifiles['npy'], self.npy_array)
+        ifiles['finished'].touch()
+
+    def run(self):
+        i_last = self._restore()
+        countra = snippets.Counter_repeated_action(
+                seconds=self._interval_seconds,
+                iters=self._interval_iters)
+
+        pkl_cache = []
+        npy_cache = []
+
+        def flush_purge():
+            self.result.extend(pkl_cache)
+            if self.npy_array is None:
+                to_stack = npy_cache
+            else:
+                to_stack = (self.npy_array, *npy_cache)
+            self.npy_array = np.vstack(to_stack)
+            pkl_cache.clear()
+            npy_cache.clear()
+            with small.QTimer('saving'):
+                self._save(i_last)
+            self._purge_intermediate_files()
+
+        loader = self.prepare_func(i_last)
+        pbar = tqdm(loader, total=len(loader))
+        for i_batch, data_input in enumerate(pbar):
+            pkl_part, npy_part, i_last = self.func(data_input)
+            pkl_cache.append(pkl_part)
+            npy_cache.append(npy_part)
+            if countra.check(i_batch):
+                flush_purge()
+                log.debug(snippets._tqdm_str(pbar))
+                countra.tic(i_batch)
+        flush_purge()
+        return self.result, self.npy_array
+
 # Experiments
 
 
@@ -469,86 +549,6 @@ def combine_split_philtube_features(workfolder, cfg_dict, add_args):
             dset[b:e] = feats16
 
     del dset
-
-
-class Isaver_extract_rgb(snippets.Isaver_base):
-    def __init__(
-            self, folder,
-            total, func, prepare_func,
-            interval_iters=None,
-            interval_seconds=120,  # every 2 minutes by default
-                ):
-        super(Isaver_extract_rgb, self).__init__(folder, total)
-        self.func = func
-        self.prepare_func = prepare_func
-        self._interval_iters = interval_iters
-        self._interval_seconds = interval_seconds
-        self.result = []
-        self.npy_array = None
-
-    def _get_filenames(self, i) -> Dict[str, Path]:
-        base_filenames = {
-            'finished': self._fmt_finished.format(i, self._total)}
-        base_filenames['pkl'] = Path(
-                base_filenames['finished']).with_suffix('.pkl')
-        base_filenames['npy'] = Path(
-                base_filenames['finished']).with_suffix('.npy')
-        filenames = {k: self._folder/v
-                for k, v in base_filenames.items()}
-        return filenames
-
-    def _restore(self):
-        intermediate_files: Dict[int, Dict[str, Path]] = \
-                self._get_intermediate_files()
-        start_i, ifiles = max(intermediate_files.items(),
-                default=(-1, None))
-        if ifiles is not None:
-            self.result = small.load_pkl(ifiles['pkl'])
-            self.npy_array = np.load(ifiles['npy'])
-            log.info('Restore from pkl: {} npy: {}'.format(
-                ifiles['pkl'], ifiles['npy']))
-        return start_i
-
-    def _save(self, i):
-        ifiles = self._get_filenames(i)
-        small.save_pkl(ifiles['pkl'], self.result)
-        np.save(ifiles['npy'], self.npy_array)
-        ifiles['finished'].touch()
-
-    def run(self):
-        i_last = self._restore()
-        countra = snippets.Counter_repeated_action(
-                seconds=self._interval_seconds,
-                iters=self._interval_iters)
-
-        pkl_cache = []
-        npy_cache = []
-
-        def flush_purge():
-            self.result.extend(pkl_cache)
-            if self.npy_array is None:
-                to_stack = npy_cache
-            else:
-                to_stack = (self.npy_array, *npy_cache)
-            self.npy_array = np.vstack(to_stack)
-            pkl_cache.clear()
-            npy_cache.clear()
-            with small.QTimer('saving'):
-                self._save(i_last)
-            self._purge_intermediate_files()
-
-        loader = self.prepare_func(i_last)
-        pbar = tqdm(loader, total=len(loader))
-        for i_batch, data_input in enumerate(pbar):
-            pkl_part, npy_part, i_last = self.func(data_input)
-            pkl_cache.append(pkl_part)
-            npy_cache.append(npy_part)
-            if countra.check(i_batch):
-                flush_purge()
-                log.debug(snippets._tqdm_str(pbar))
-                countra.tic(i_batch)
-        flush_purge()
-        return self.result, self.npy_array
 
 
 def extract_keyframe_rgb(workfolder, cfg_dict, add_args):

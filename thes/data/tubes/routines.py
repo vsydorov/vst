@@ -3,7 +3,7 @@ import numpy as np
 from tqdm import tqdm
 from typing import (  # NOQA
     Dict, List, Tuple, TypeVar, Set, Optional, Callable, TypedDict, NewType,
-    NamedTuple, Sequence, Literal, cast)
+    NamedTuple, Sequence, Literal, cast, Any)
 
 from thes.tools import snippets
 from thes.data.dataset.external import (
@@ -356,3 +356,35 @@ def perform_connections_split(connections_f, cc, ct):
             len(chunk_ckeys), weights_split[cc]))
     chunk_connections_f = {k: connections_f[k] for k in chunk_ckeys}
     return chunk_connections_f
+
+
+def create_kinda_objaction_struct(dataset, test_kfs, Y_conf_scores_sm):
+    # // Creating kinda objaction structure
+    # Group vid -> frame
+    grouped_kfscores_vf: Dict[Vid_daly, Dict[int, Any]] = {}
+    for kf, scores in zip(test_kfs, Y_conf_scores_sm):
+        vid = kf['vid']
+        frame0 = kf['frame0']
+        pred_box = kf['bbox']
+        (grouped_kfscores_vf
+                .setdefault(vid, {})
+                .setdefault(frame0, [])
+                .append([pred_box, scores]))
+    # fake objactions
+    objactions_vf: Dict[Vid_daly, Dict[int, Objaction_dets]] = {}
+    for vid, grouped_kfscores_f in grouped_kfscores_vf.items():
+        for frame_ind, gkfscores in grouped_kfscores_f.items():
+            all_scores, all_boxes, all_classes = [], [], []
+            for (box, scores) in gkfscores:
+                all_boxes.append(np.tile(box, (len(scores), 1)))
+                all_classes.append(np.array(dataset.action_names))
+                all_scores.append(scores)
+            all_scores_ = np.hstack(all_scores)
+            all_classes_ = np.hstack(all_classes)
+            all_boxes_ = np.vstack(all_boxes)
+            detections = {
+                    'pred_boxes': all_boxes_,
+                    'scores': all_scores_,
+                    'pred_classes': all_classes_}
+            objactions_vf.setdefault(vid, {})[frame_ind] = detections
+    return objactions_vf

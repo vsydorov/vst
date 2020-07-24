@@ -1,7 +1,10 @@
 import copy
+import re
 import numpy as np
 import logging
 from pathlib import Path
+from sklearn.metrics import (
+    accuracy_score, roc_auc_score)
 from types import MethodType
 from typing import (  # NOQA
     Dict, Any, List, Optional, Tuple, TypedDict, Set)
@@ -26,16 +29,27 @@ from vsydorov_tools import cv as vt_cv
 
 from thes.data.dataset.daly import (
     Ncfg_daly, get_daly_keyframes_to_cover,
-    load_gt_and_wein_tubes)
+    load_gt_and_wein_tubes, create_keyframelist)
 from thes.data.dataset.external import (
     Dataset_daly_ocv, Vid_daly)
 from thes.data.tubes.types import (
     Box_connections_dwti,
     I_dwein, T_dwein, T_dwein_scored, I_dgt, T_dgt,
     get_daly_gt_tubes, push_into_avdict,
-    AV_dict, loadconvert_tubes_dwein)
+    AV_dict, loadconvert_tubes_dwein,
+    av_stubes_above_score)
 from thes.data.tubes.routines import (
-    group_tubes_on_frame_level, qload_synthetic_tube_labels)
+    group_tubes_on_frame_level,
+    score_ftubes_via_objaction_overlap_aggregation,
+    create_kinda_objaction_struct,
+    qload_synthetic_tube_labels
+    )
+from thes.evaluation.recall import (
+    compute_recall_for_avtubes_as_dfs,)
+from thes.evaluation.ap.convert import (
+    compute_ap_for_avtubes_as_df)
+from thes.data.tubes.nms import (
+    compute_nms_for_av_stubes,)
 from thes.slowfast.cfg import (basic_sf_cfg)
 from thes.tools import snippets
 from thes.tools.video import (
@@ -279,77 +293,6 @@ class SlowFast_roitune(M_slowfast):
         return x
 
 
-class C2D_1x1_roitune(M_resnet):
-    def __init__(self, sf_cfg, num_classes):
-        super(M_resnet, self).__init__()
-        self.norm_module = get_norm(sf_cfg)
-        self.enable_detection = sf_cfg.DETECTION.ENABLE
-        self.num_pathways = 1
-        self._construct_network(sf_cfg)
-        self._construct_roitune(sf_cfg, num_classes)
-        init_helper.init_weights(
-            self, sf_cfg.MODEL.FC_INIT_STD,
-            sf_cfg.RESNET.ZERO_INIT_FINAL_BN)
-
-    def _construct_roitune(self, sf_cfg, num_classes):
-        # params
-        xform_resolution = 7
-        resolution = [[xform_resolution] * 2]
-        scale_factor = [32]
-        dim_in = [sf_cfg.RESNET.WIDTH_PER_GROUP * 32]
-        dropout_rate = 0.5
-
-        pi = 0
-        roi_align = ROIAlign(
-                resolution[pi],
-                spatial_scale=1.0/scale_factor[pi],
-                sampling_ratio=0,
-                aligned=True)
-        self.add_module(f's{pi}_roi', roi_align)
-        spool = nn.MaxPool2d(resolution[pi], stride=1)
-        self.add_module(f's{pi}_spool', spool)
-
-        if dropout_rate > 0.0:
-            self.rt_dropout = nn.Dropout(dropout_rate)
-        self.rt_projection = nn.Linear(
-                sum(dim_in), num_classes, bias=True)
-        self.rt_act = nn.Softmax(dim=-1)
-
-    def _headless_forward(self, x):
-        # hforward_resnet_nopool
-        # slowfast/models/video_model_builder.py/ResNet.forward
-        x = self.s1(x)
-        x = self.s2(x)
-        x = self.s3(x)
-        x = self.s4(x)
-        x = self.s5(x)
-        return x
-
-    def _roitune_forward(self, feats_in, bboxes0):
-        out = feats_in[0]
-        assert out.shape[2] == 1
-        out = torch.squeeze(out, 2)
-        out = self.s0_roi(out, bboxes0)
-        out = self.s0_spool(out)
-
-        # B C H W
-        x = out.view(out.shape[0], -1)
-
-        # Perform dropout.
-        if hasattr(self, "rt_dropout"):
-            x = self.rt_dropout(x)
-
-        x = x.view(x.shape[0], -1)
-        x = self.rt_projection(x)
-        x = self.rt_act(x)
-        return x
-
-    def forward(self, x, bboxes0):
-        x = self._headless_forward(x)
-        x = self._roitune_forward(x, bboxes0)
-        return x
-
-
 def build_slowfast_roitune(num_classes):
     rel_yml_path = 'Kinetics/c2/SLOWFAST_4x16_R50.yaml'
     sf_cfg = basic_sf_cfg(rel_yml_path)
@@ -401,21 +344,7 @@ def _prepare_keyframe_cls_labels():
                     'labels': np.array(labels)}
             cls_vf_train[(vid, f)] = bc_dwti_labeled
 
-def _build_model():
-    # Build model
-    rel_yml_path = 'Kinetics/C2D_8x8_R50_IN1K.yaml'
-    sf_cfg = basic_sf_cfg(rel_yml_path)
-    sf_cfg.NUM_GPUS = 1
-    sf_cfg.DATA.NUM_FRAMES = 1
-    sf_cfg.DATA.SAMPLING_RATE = 1
-
-    # / slowfast.models.build_model
-    model = C2D_1x1_roitune(sf_cfg, 11)
-    # Determine the GPU used by the current process
-    cur_device = torch.cuda.current_device()
-    # Transfer the model to the current GPU device
-    model = model.cuda(device=cur_device)
-
+def _build_model_addons():
     model_nframes = sf_cfg.DATA.NUM_FRAMES
     model_sample = sf_cfg.DATA.SAMPLING_RATE
     slowfast_alpha = sf_cfg.SLOWFAST.ALPHA
@@ -424,25 +353,363 @@ def _build_model():
     frameloader_vsf = Frameloader_video_slowfast(
             False, slowfast_alpha, 256)
 
-    norm_mean = sf_cfg.DATA.MEAN
-    norm_std = sf_cfg.DATA.STD
-    norm_mean_t = np_to_gpu(norm_mean)
-    norm_std_t = np_to_gpu(norm_std)
+
+class Head_roitune(nn.Module):
+    def __init__(self, sf_cfg, num_classes):
+        super(Head_roitune, self).__init__()
+        self._construct_roitune(sf_cfg, num_classes)
+
+    def _construct_roitune(self, sf_cfg, num_classes):
+        # params
+        xform_resolution = 7
+        resolution = [[xform_resolution] * 2]
+        scale_factor = [32]
+        dim_in = [sf_cfg.RESNET.WIDTH_PER_GROUP * 32]
+        dropout_rate = 0.5
+
+        pi = 0
+        roi_align = ROIAlign(
+                resolution[pi],
+                spatial_scale=1.0/scale_factor[pi],
+                sampling_ratio=0,
+                aligned=True)
+        self.add_module(f's{pi}_roi', roi_align)
+        spool = nn.MaxPool2d(resolution[pi], stride=1)
+        self.add_module(f's{pi}_spool', spool)
+
+        if dropout_rate > 0.0:
+            self.rt_dropout = nn.Dropout(dropout_rate)
+        self.rt_projection = nn.Linear(
+                sum(dim_in), num_classes, bias=True)
+        self.rt_act = nn.Softmax(dim=-1)
+
+    def forward(self, feats_in, bboxes0):
+        out = feats_in[0]
+        assert out.shape[2] == 1
+        out = torch.squeeze(out, 2)
+        out = self.s0_roi(out, bboxes0)
+        out = self.s0_spool(out)
+
+        # B C H W
+        x = out.view(out.shape[0], -1)
+
+        # Perform dropout.
+        if hasattr(self, "rt_dropout"):
+            x = self.rt_dropout(x)
+
+        x = x.view(x.shape[0], -1)
+        x = self.rt_projection(x)
+        x = self.rt_act(x)
+        return x
 
 
-def _load_model_initial():
-    # Load model
-    # CHECKPOINT_FILE_PATH = '/home/vsydorov/projects/deployed/2019_12_Thesis/links/scratch2/102_slowfast/20_zoo_checkpoints/kinetics400/SLOWFAST_4x16_R50.pkl'
-    CHECKPOINTS_PREFIX = Path('/home/vsydorov/projects/deployed/2019_12_Thesis/links/scratch2/102_slowfast/20_zoo_checkpoints/')
-    rel = 'kin400_video_nonlocal/c2d_baseline_8x8_IN_pretrain_400k.pkl'
-    CHECKPOINT_FILE_PATH = CHECKPOINTS_PREFIX/rel
+class C2D_1x1_roitune(M_resnet):
+    def __init__(self, sf_cfg, num_classes):
+        super(M_resnet, self).__init__()
+        self.norm_module = get_norm(sf_cfg)
+        self.enable_detection = sf_cfg.DETECTION.ENABLE
+        self.num_pathways = 1
+        self._construct_network(sf_cfg)
+        self.head = Head_roitune(sf_cfg, num_classes)
+        init_helper.init_weights(
+            self, sf_cfg.MODEL.FC_INIT_STD,
+            sf_cfg.RESNET.ZERO_INIT_FINAL_BN)
 
-    # Load model
+    def forward(self, x, bboxes0):
+        # hforward_resnet_nopool
+        # slowfast/models/video_model_builder.py/ResNet.forward
+        x = self.s1(x)
+        x = self.s2(x)
+        x = self.s3(x)
+        x = self.s4(x)
+        x = self.s5(x)
+        x = self.head(x, bboxes0)
+        return x
+
+
+class TD_over_krgb(torch.utils.data.Dataset):
+    def __init__(self, array, bboxes, keyframes):
+        self.array = array
+        self.bboxes = bboxes
+        self.keyframes = keyframes
+
+    def __len__(self):
+        return len(self.keyframes)
+
+    def __getitem__(self, index):
+        rgb = self.array[index]
+        bbox = self.bboxes[index]
+        label = self.keyframes[index]['action_id']
+        return rgb, bbox, label
+
+
+def _evaluation_step(model, eval_loader, norm_mean_t, norm_std_t):
     model.eval()
-    with vt_log.logging_disabled(logging.WARNING):
-        cu.load_checkpoint(
-            CHECKPOINT_FILE_PATH, model, False, None,
-            inflation=False, convert_from_caffe2=True,)
+    all_softmaxes_ = []
+    for i_batch, (data_input) in enumerate(eval_loader):
+        rgbs, bboxes_t, labels = data_input
+        frame_list_f32c = [to_gpu_normalize_permute(
+                rgbs, norm_mean_t, norm_std_t)]
+        bboxes0_t = add_roi_batch_indices(bboxes_t)
+        bboxes0_c = bboxes0_t.type(torch.cuda.FloatTensor)
+
+        # pred
+        with torch.no_grad():
+            pred = model(frame_list_f32c, bboxes0_c)
+        pred_np = pred.cpu().numpy()
+        all_softmaxes_.append(pred_np)
+    all_softmaxes = np.vstack(all_softmaxes_)
+    model.train()
+    return all_softmaxes
+
+def _prepare_krgb_datas(cf, dataset, vgroup, sset_train, sset_eval):
+    cull_train = cf['cull.train']
+    cull_eval = cf['cull.eval']
+
+    krgb_prefix = Path(cf['inputs.keyframes_rgb'])
+
+    krgb_array = np.load(krgb_prefix/'rgb.npy')
+    krgb_dict_outputs = small.load_pkl(krgb_prefix/'dict_outputs.pkl')
+    krgb_bboxes = np.vstack(krgb_dict_outputs['bboxes'])
+    keyframes = create_keyframelist(dataset)
+
+    inds_kf_sstrain = [i for i, kf in enumerate(keyframes)
+            if kf['vid'] in vgroup[sset_train]]
+    if cull_train:
+        inds_kf_sstrain = inds_kf_sstrain[:cull_train]
+
+    inds_kf_sseval = [i for i, kf in enumerate(keyframes)
+            if kf['vid'] in vgroup[sset_eval]]
+    if cull_eval:
+        inds_kf_sseval = inds_kf_sseval[:cull_eval]
+
+    krgb_array_sstrain = krgb_array[inds_kf_sstrain]
+    krgb_bboxes_sstrain = krgb_bboxes[inds_kf_sstrain]
+    keyframes_sstrain = [keyframes[i] for i in inds_kf_sstrain]
+    td_sstrain = TD_over_krgb(
+            krgb_array_sstrain, krgb_bboxes_sstrain, keyframes_sstrain)
+
+    krgb_array_sseval = krgb_array[inds_kf_sseval]
+    krgb_bboxes_sseval = krgb_bboxes[inds_kf_sseval]
+    keyframes_sseval = [keyframes[i] for i in inds_kf_sseval]
+    td_sseval = TD_over_krgb(
+            krgb_array_sseval, krgb_bboxes_sseval, keyframes_sseval)
+
+    TRAIN_BATCH_SIZE = 32
+    EVAL_BATCH_SIZE = 32
+
+    train_krgb_loader = torch.utils.data.DataLoader(td_sstrain,
+            batch_size=TRAIN_BATCH_SIZE, shuffle=True,
+            num_workers=0, pin_memory=True)
+
+    eval_krgb_loader = torch.utils.data.DataLoader(td_sseval,
+            batch_size=EVAL_BATCH_SIZE, shuffle=False,
+            num_workers=0, pin_memory=True,
+            drop_last=False)
+    return train_krgb_loader, eval_krgb_loader, keyframes_sseval
+
+
+def _evalline(
+        all_softmaxes, keyframes_sseval, dataset,
+        tubes_dgt_eval, tubes_dwein_eval):
+    with small.QTimer('Eval: accuracy and ROC'):
+        # accuracy
+        all_pred = np.argmax(all_softmaxes, axis=1)
+        gt_actionid = np.array(
+                [k['action_id'] for k in keyframes_sseval])
+        kf_acc = accuracy_score(gt_actionid, all_pred)
+        try:
+            kf_roc_auc = roc_auc_score(gt_actionid,
+                    all_softmaxes, multi_class='ovr')
+        except ValueError as err:
+            log.warning(f'auc could not be computed, Caught "{err}"')
+            kf_roc_auc = np.NaN
+    with small.QTimer('Eval: cheating AP'):
+        # // Tube evaluation (via fake GT intersection)
+        av_gt_tubes: AV_dict[T_dgt] = push_into_avdict(
+                tubes_dgt_eval)
+        objactions_vf = create_kinda_objaction_struct(
+                dataset, keyframes_sseval, all_softmaxes)
+        # Assigning scores based on intersections
+        av_stubes: AV_dict[T_dwein_scored] = \
+            score_ftubes_via_objaction_overlap_aggregation(
+                dataset, objactions_vf, tubes_dwein_eval, 'iou',
+                0.1, 0.0, enable_tqdm=False)
+        av_stubes_ = av_stubes_above_score(
+                av_stubes, 0.0)
+        av_stubes_ = compute_nms_for_av_stubes(
+                av_stubes_, 0.3)
+        iou_thresholds = [.3, .5, .7]
+        df_ap_cheat = compute_ap_for_avtubes_as_df(
+            av_gt_tubes, av_stubes_, iou_thresholds, False, False)
+
+    df_ap_cheat = (df_ap_cheat*100).round(2)
+    cheating_apline = '/'.join(
+            df_ap_cheat.loc['all'].values.astype(str))
+    log.info(' '.join((
+        'K. Acc: {:.2f};'.format(kf_acc*100),
+        'RAUC: {:.2f};'.format(kf_roc_auc*100),
+        'AP (cheating tubes): {}'.format(cheating_apline)
+    )))
+
+def _build_model(n_outputs):
+    # Build model
+    rel_yml_path = 'Kinetics/C2D_8x8_R50_IN1K.yaml'
+    sf_cfg = basic_sf_cfg(rel_yml_path)
+    sf_cfg.NUM_GPUS = 1
+    sf_cfg.DATA.NUM_FRAMES = 1
+    sf_cfg.DATA.SAMPLING_RATE = 1
+
+    # / slowfast.models.build_model
+    model = C2D_1x1_roitune(sf_cfg, n_outputs)
+    # Determine the GPU used by the current process
+    cur_device = torch.cuda.current_device()
+    # Transfer the model to the current GPU device
+    model = model.cuda(device=cur_device)
+    return sf_cfg, model
+
+
+class Manager_checkpoint_name(object):
+    ckpt_re = r'model_at_epoch_(?P<i_epoch>\d*).pth.tar'
+    ckpt_format = 'model_at_epoch_{:03d}.pth.tar'
+
+    @classmethod
+    def get_checkpoint_path(self, rundir, i_epoch) -> Path:
+        save_filepath = rundir/self.ckpt_format.format(i_epoch)
+        return save_filepath
+
+    @classmethod
+    def find_checkpoints(self, rundir):
+        checkpoints = {}
+        for subfolder_item in rundir.iterdir():
+            search = re.search(self.ckpt_re, subfolder_item.name)
+            if search:
+                i_epoch = int(search.groupdict()['i_epoch'])
+                checkpoints[i_epoch] = subfolder_item
+        return checkpoints
+
+    @classmethod
+    def find_last_checkpoint(self, rundir):
+        checkpoints = self.find_checkpoints(rundir)
+        if len(checkpoints):
+            checkpoint_path = max(checkpoints.items())[1]
+        else:
+            checkpoint_path = None
+        return checkpoint_path
+
+
+class Manager_model_checkpoints(object):
+    def __init__(self, model, optimizer):
+        self.model = model
+        self.optimizer = optimizer
+
+    @staticmethod
+    def load_model_initial(model):
+        CHECKPOINTS_PREFIX = Path('/home/vsydorov/projects/deployed/2019_12_Thesis/links/scratch2/102_slowfast/20_zoo_checkpoints/')
+        rel = 'kin400_video_nonlocal/c2d_baseline_8x8_IN_pretrain_400k.pkl'
+        CHECKPOINT_FILE_PATH = CHECKPOINTS_PREFIX/rel
+
+        # Load model
+        with vt_log.logging_disabled(logging.WARNING):
+            cu.load_checkpoint(
+                CHECKPOINT_FILE_PATH, model, False, None,
+                inflation=False, convert_from_caffe2=True,)
+
+    def save_epoch(self, rundir, i_epoch):
+        # model_{epoch} - "after epoch was finished"
+        save_filepath = (Manager_checkpoint_name
+                .get_checkpoint_path(rundir, i_epoch))
+        states = {
+            'i_epoch': i_epoch,
+            'model_sdict': self.model.state_dict(),
+            'optimizer_sdict': self.optimizer.state_dict(),
+        }
+        with small.QTimer() as qtr:
+            torch.save(states, str(save_filepath))
+        log.info('Saved model. Epoch {}, Path {}. Took {:.2f}s'.format(
+            i_epoch, save_filepath, qtr.time))
+
+    def restore_model_magic(
+            self, checkpoint_path, training_start_epoch=0):
+        if checkpoint_path is not None:
+            states = torch.load(checkpoint_path)
+            self.model.load_state_dict(states['model_sdict'])
+            self.optimizer.load_state_dict(states['optimizer_sdict'])
+            start_epoch = states['i_epoch']
+            start_epoch += 1
+            log.info('Continuing training from checkpoint {}. '
+                    'Epoch {} (ckpt + 1)'.format(checkpoint_path, start_epoch))
+        else:
+            self.load_model_initial(self.model)
+            start_epoch = training_start_epoch
+        return start_epoch
+
+
+def set_finetune_level(model, freeze_level=-1):
+    for param in model.parameters():
+        param.requires_grad = True
+    # freeze layers until freeze_level (inclusive)
+    for i_child, child in enumerate(model.children()):
+        if i_child <= freeze_level:
+            for param in child.parameters():
+                param.requires_grad = False
+
+class Manager_model_trainer(object):
+    def __init__(self, cf):
+        # prepare model
+        sf_cfg, model = _build_model(10)
+        set_finetune_level(model, cf['freeze_level'])
+
+        norm_mean_t = np_to_gpu(sf_cfg.DATA.MEAN)
+        norm_std_t = np_to_gpu(sf_cfg.DATA.STD)
+
+        loss_fn = torch.nn.CrossEntropyLoss(reduction='mean')
+        optimizer = torch.optim.AdamW(model.parameters(),
+                lr=cf['train.lr'], weight_decay=cf['train.weight_decay'])
+        man_ckpt = Manager_model_checkpoints(model, optimizer)
+
+        self.sf_cfg = sf_cfg
+        self.model = model
+        self.optimizer = optimizer
+        self.norm_mean_t = norm_mean_t
+        self.norm_std_t = norm_std_t
+        self.loss_fn = loss_fn
+        self.man_ckpt = man_ckpt
+
+    def batch_forward(self, data_input):
+        rgbs, bboxes_t, labels = data_input
+        frame_list_f32c = [to_gpu_normalize_permute(
+                rgbs, self.norm_mean_t, self.norm_std_t)]
+        bboxes0_t = add_roi_batch_indices(bboxes_t)
+        bboxes0_c = bboxes0_t.type(torch.cuda.FloatTensor)
+        labels_c = labels.cuda()
+
+        pred_train = self.model(frame_list_f32c, bboxes0_c)
+        loss = self.loss_fn(pred_train, labels_c)
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+        return loss
+
+    def evaluate_print(
+            self, eval_krgb_loader, keyframes_sseval,
+            dataset, tubes_dgt_eval, tubes_dwein_eval):
+        with small.QTimer('Evaluation, obtain softmaxes'):
+            all_softmaxes = _evaluation_step(
+                    self.model, eval_krgb_loader,
+                    self.norm_mean_t, self.norm_std_t)
+        _evalline(all_softmaxes, keyframes_sseval,
+                dataset, tubes_dgt_eval, tubes_dwein_eval)
+
+
+def add_roi_batch_indices(bboxes_t, counts=None):
+    if counts is None:
+        counts = np.ones(len(bboxes_t), dtype=np.int)
+    batch_indices = np.repeat(np.arange(len(counts)), counts)
+    batch_indices_t = torch.from_numpy(batch_indices).type(
+            torch.DoubleTensor)[:, None]
+    bboxes0_t = torch.cat((batch_indices_t, bboxes_t), axis=1)
+    return bboxes0_t
 
 
 # EXPERIMENTS
@@ -544,7 +811,7 @@ def tubefeats_train_model(workfolder, cfg_dict, add_args):
             log.info(f'{epoch}: {loss.item()} ')
 
 
-def finetune_over_extracted_frames(workfolder, cfg_dict, add_args):
+def finetune_preextracted_krgb(workfolder, cfg_dict, add_args):
     out, = snippets.get_subfolders(workfolder, ['out'])
     cfg = snippets.YConfig(cfg_dict)
     Ncfg_daly.set_defcfg(cfg)
@@ -555,6 +822,57 @@ def finetune_over_extracted_frames(workfolder, cfg_dict, add_args):
         keyframes_rgb: [~, str]
     split_assignment: ['train/val', ['train/val', 'trainval/test']]
     """)
+    cfg.set_defaults("""
+    freeze_level: -1
+    train:
+        lr: 1.0e-5
+        weight_decay: 5.0e-2
+    cull:
+        train: ~
+        eval: ~
+    period:
+        ibatch:
+            loss_log: '0::50'
+    """)
     cf = cfg.parse()
 
     dataset: Dataset_daly_ocv = Ncfg_daly.get_dataset(cf)
+    vgroup = Ncfg_daly.get_vids(cf, dataset)
+    sset_train, sset_eval = cf['split_assignment'].split('/')
+    tubes_dwein_d, tubes_dgt_d = load_gt_and_wein_tubes(
+            cf['inputs.tubes_dwein'], dataset, vgroup)
+    tubes_dwein_eval = tubes_dwein_d[sset_eval]
+    tubes_dgt_eval = tubes_dgt_d[sset_eval]
+
+    # precomputed rgb
+    train_krgb_loader, eval_krgb_loader, keyframes_sseval = \
+        _prepare_krgb_datas(cf, dataset, vgroup, sset_train, sset_eval)
+
+    man_mtrainer = Manager_model_trainer(cf)
+
+    n_epochs = 40
+    period_ibatch_loss_log = cf['period.ibatch.loss_log']
+
+    rundir = small.mkdir(out/'rundir')
+    if '--new' in add_args:
+        checkpoint_path = None
+    else:
+        checkpoint_path = (Manager_checkpoint_name.
+                find_last_checkpoint(rundir))
+
+    start_epoch = (man_mtrainer.man_ckpt
+            .restore_model_magic(checkpoint_path))
+
+    man_mtrainer.model.train()
+    for i_epoch in range(start_epoch, n_epochs):
+        for i_batch, (data_input) in enumerate(train_krgb_loader):
+            loss = man_mtrainer.batch_forward(data_input)
+            if snippets.check_step_sslice(
+                    i_batch, period_ibatch_loss_log):
+                Nb = len(train_krgb_loader)
+                log.info(f'{i_epoch=}, {i_batch=}/{Nb}: loss {loss.item()}')
+        man_mtrainer.man_ckpt.save_epoch(rundir, i_epoch)
+        man_mtrainer.model.eval()
+        man_mtrainer.evaluate_print(eval_krgb_loader, keyframes_sseval,
+                dataset, tubes_dgt_eval, tubes_dwein_eval)
+        man_mtrainer.model.train()
