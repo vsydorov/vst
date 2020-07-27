@@ -51,6 +51,7 @@ log = logging.getLogger(__name__)
 
 CHECKPOINTS_PREFIX = Path('/home/vsydorov/projects/deployed/2019_12_Thesis/links/scratch2/102_slowfast/20_zoo_checkpoints/')
 CHECKPOINTS = {
+    'SLOWFAST_8x8_R50': 'kinetics400/SLOWFAST_8x8_R50.pkl',
     'SLOWFAST_4x16_R50': 'kinetics400/SLOWFAST_4x16_R50.pkl',
     'I3D_8x8_R50': 'kinetics400/I3D_8x8_R50.pkl',
     'c2d': 'kin400_video_nonlocal/c2d_baseline_8x8_IN_pretrain_400k.pkl',  # https://github.com/facebookresearch/SlowFast/issues/163
@@ -58,6 +59,7 @@ CHECKPOINTS = {
     'c2d_imnet': 'imagenet/R50_IN1K.pyth',
 }
 REL_YAML_PATHS = {
+    'SLOWFAST_8x8_R50': 'Kinetics/c2/SLOWFAST_8x8_R50.yaml',
     'SLOWFAST_4x16_R50': 'Kinetics/c2/SLOWFAST_4x16_R50.yaml',
     'I3D_8x8_R50': 'Kinetics/c2/I3D_8x8_R50.yaml',
     'c2d': 'Kinetics/C2D_8x8_R50_IN1K.yaml',
@@ -174,7 +176,8 @@ class Ncfg_extractor:
     def set_defcfg(cfg):
         cfg.set_deftype("""
         extractor:
-            model_id: [~, ['SLOWFAST_4x16_R50', 'I3D_8x8_R50', 'c2d', 'c2d_1x1', 'c2d_imnet']]
+            model_id: [~, ['SLOWFAST_8x8_R50', 'SLOWFAST_4x16_R50',
+                           'I3D_8x8_R50', 'c2d', 'c2d_1x1', 'c2d_imnet']]
             extraction_mode: ['roi', ['roi', 'fullframe']]
         extraction:
             batch_size: [8, int]
