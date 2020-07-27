@@ -349,8 +349,8 @@ class Dataloader_isaver(
     def run(self):
         i_last = self._restore()
         countra = snippets.Counter_repeated_action(
-                seconds=self._interval_seconds,
-                iters=self._interval_iters)
+                seconds=self._save_interval_seconds,
+                iters=self._save_interval_iters)
 
         result_cache = []
 
@@ -372,3 +372,15 @@ class Dataloader_isaver(
                 countra.tic(i_batch)
         flush_purge()
         return self.result
+
+class NumpyRandomSampler(torch.utils.data.Sampler):
+    def __init__(self, data_source, rgen):
+        self.data_source = data_source
+        self.rgen = rgen
+
+    def __iter__(self):
+        n = len(self.data_source)
+        return iter(self.rgen.permutation(n).tolist())
+
+    def __len__(self):
+        return len(self.data_source)

@@ -57,7 +57,7 @@ from thes.tools.video import (
 from thes.pytorch import (
     sequence_batch_collate_v2, np_to_gpu,
     to_gpu_normalize_permute, Sampler_grid,
-    Frameloader_video_slowfast)
+    Frameloader_video_slowfast, NumpyRandomSampler)
 
 log = logging.getLogger(__name__)
 
@@ -392,6 +392,7 @@ class Head_roitune(nn.Module):
 
         # B C H W
         x = out.view(out.shape[0], -1)
+        roipooled = x
 
         # Perform dropout.
         if hasattr(self, "rt_dropout"):
@@ -400,7 +401,7 @@ class Head_roitune(nn.Module):
         x = x.view(x.shape[0], -1)
         x = self.rt_projection(x)
         x = self.rt_act(x)
-        return x
+        return (x, roipooled)
 
 
 class C2D_1x1_roitune(M_resnet):
@@ -439,8 +440,10 @@ class TD_over_krgb(torch.utils.data.Dataset):
     def __getitem__(self, index):
         rgb = self.array[index]
         bbox = self.bboxes[index]
-        label = self.keyframes[index]['action_id']
-        return rgb, bbox, label
+        keyframe = self.keyframes[index]
+        keyframe['do_not_collate'] = True
+        label = keyframe['action_id']
+        return rgb, bbox, label, keyframe
 
 
 def _evaluation_step(model, eval_loader, norm_mean_t, norm_std_t):
@@ -462,7 +465,9 @@ def _evaluation_step(model, eval_loader, norm_mean_t, norm_std_t):
     model.train()
     return all_softmaxes
 
+
 def _prepare_krgb_datas(cf, dataset, vgroup, sset_train, sset_eval):
+    initial_seed = cf['seed']
     cull_train = cf['cull.train']
     cull_eval = cf['cull.eval']
 
@@ -498,50 +503,58 @@ def _prepare_krgb_datas(cf, dataset, vgroup, sset_train, sset_eval):
     TRAIN_BATCH_SIZE = 32
     EVAL_BATCH_SIZE = 32
 
+    train_sampler_rgen = np.random.default_rng(initial_seed)
+    sampler = NumpyRandomSampler(td_sstrain, train_sampler_rgen)
+
     train_krgb_loader = torch.utils.data.DataLoader(td_sstrain,
-            batch_size=TRAIN_BATCH_SIZE, shuffle=True,
-            num_workers=0, pin_memory=True)
+            batch_size=TRAIN_BATCH_SIZE,
+            num_workers=0, pin_memory=True,
+            sampler=sampler, shuffle=False,
+            collate_fn=sequence_batch_collate_v2)
 
     eval_krgb_loader = torch.utils.data.DataLoader(td_sseval,
             batch_size=EVAL_BATCH_SIZE, shuffle=False,
             num_workers=0, pin_memory=True,
-            drop_last=False)
+            drop_last=False,
+            collate_fn=sequence_batch_collate_v2)
     return train_krgb_loader, eval_krgb_loader, keyframes_sseval
 
 
 def _evalline(
         all_softmaxes, keyframes_sseval, dataset,
-        tubes_dgt_eval, tubes_dwein_eval):
-    with small.QTimer('Eval: accuracy and ROC'):
-        # accuracy
-        all_pred = np.argmax(all_softmaxes, axis=1)
-        gt_actionid = np.array(
-                [k['action_id'] for k in keyframes_sseval])
-        kf_acc = accuracy_score(gt_actionid, all_pred)
-        try:
-            kf_roc_auc = roc_auc_score(gt_actionid,
-                    all_softmaxes, multi_class='ovr')
-        except ValueError as err:
-            log.warning(f'auc could not be computed, Caught "{err}"')
-            kf_roc_auc = np.NaN
-    with small.QTimer('Eval: cheating AP'):
-        # // Tube evaluation (via fake GT intersection)
-        av_gt_tubes: AV_dict[T_dgt] = push_into_avdict(
-                tubes_dgt_eval)
-        objactions_vf = create_kinda_objaction_struct(
-                dataset, keyframes_sseval, all_softmaxes)
-        # Assigning scores based on intersections
-        av_stubes: AV_dict[T_dwein_scored] = \
-            score_ftubes_via_objaction_overlap_aggregation(
-                dataset, objactions_vf, tubes_dwein_eval, 'iou',
-                0.1, 0.0, enable_tqdm=False)
-        av_stubes_ = av_stubes_above_score(
-                av_stubes, 0.0)
-        av_stubes_ = compute_nms_for_av_stubes(
-                av_stubes_, 0.3)
-        iou_thresholds = [.3, .5, .7]
-        df_ap_cheat = compute_ap_for_avtubes_as_df(
-            av_gt_tubes, av_stubes_, iou_thresholds, False, False)
+        tubes_dgt_eval, tubes_dwein_eval, eval_timers):
+    eval_timers.tic('acc_roc')
+    # accuracy
+    all_pred = np.argmax(all_softmaxes, axis=1)
+    gt_actionid = np.array(
+            [k['action_id'] for k in keyframes_sseval])
+    kf_acc = accuracy_score(gt_actionid, all_pred)
+    try:
+        kf_roc_auc = roc_auc_score(gt_actionid,
+                all_softmaxes, multi_class='ovr')
+    except ValueError as err:
+        log.warning(f'auc could not be computed, Caught "{err}"')
+        kf_roc_auc = np.NaN
+    eval_timers.toc('acc_roc')
+    eval_timers.tic('cheat_app')
+    # // Tube evaluation (via fake GT intersection)
+    av_gt_tubes: AV_dict[T_dgt] = push_into_avdict(
+            tubes_dgt_eval)
+    objactions_vf = create_kinda_objaction_struct(
+            dataset, keyframes_sseval, all_softmaxes)
+    # Assigning scores based on intersections
+    av_stubes: AV_dict[T_dwein_scored] = \
+        score_ftubes_via_objaction_overlap_aggregation(
+            dataset, objactions_vf, tubes_dwein_eval, 'iou',
+            0.1, 0.0, enable_tqdm=False)
+    av_stubes_ = av_stubes_above_score(
+            av_stubes, 0.0)
+    av_stubes_ = compute_nms_for_av_stubes(
+            av_stubes_, 0.3)
+    iou_thresholds = [.3, .5, .7]
+    df_ap_cheat = compute_ap_for_avtubes_as_df(
+        av_gt_tubes, av_stubes_, iou_thresholds, False, False)
+    eval_timers.toc('cheat_app')
 
     df_ap_cheat = (df_ap_cheat*100).round(2)
     cheating_apline = '/'.join(
@@ -551,6 +564,7 @@ def _evalline(
         'RAUC: {:.2f};'.format(kf_roc_auc*100),
         'AP (cheating tubes): {}'.format(cheating_apline)
     )))
+    log.info('Eval_timers: {}'.format(eval_timers.time_str))
 
 def _build_model(n_outputs):
     # Build model
@@ -626,8 +640,9 @@ class Manager_model_checkpoints(object):
         }
         with small.QTimer() as qtr:
             torch.save(states, str(save_filepath))
-        log.info('Saved model. Epoch {}, Path {}. Took {:.2f}s'.format(
-            i_epoch, save_filepath, qtr.time))
+        log.info(f'Saved model. Epoch {i_epoch}')
+        log.debug('Saved to {}. Took {:.2f}s'.format(
+            save_filepath, qtr.time))
 
     def restore_model_magic(
             self, checkpoint_path, training_start_epoch=0):
@@ -664,7 +679,14 @@ class Manager_model_trainer(object):
         norm_std_t = np_to_gpu(sf_cfg.DATA.STD)
 
         loss_fn = torch.nn.CrossEntropyLoss(reduction='mean')
-        optimizer = torch.optim.AdamW(model.parameters(),
+
+        # Only params that are trained
+        params_to_update = {}
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                params_to_update[name] = param
+
+        optimizer = torch.optim.AdamW(list(params_to_update.values()),
                 lr=cf['train.lr'], weight_decay=cf['train.weight_decay'])
         man_ckpt = Manager_model_checkpoints(model, optimizer)
 
@@ -677,14 +699,14 @@ class Manager_model_trainer(object):
         self.man_ckpt = man_ckpt
 
     def batch_forward(self, data_input):
-        rgbs, bboxes_t, labels = data_input
+        rgbs, bboxes_t, labels, keyframes = data_input
         frame_list_f32c = [to_gpu_normalize_permute(
                 rgbs, self.norm_mean_t, self.norm_std_t)]
         bboxes0_t = add_roi_batch_indices(bboxes_t)
         bboxes0_c = bboxes0_t.type(torch.cuda.FloatTensor)
         labels_c = labels.cuda()
 
-        pred_train = self.model(frame_list_f32c, bboxes0_c)
+        pred_train, roipooled = self.model(frame_list_f32c, bboxes0_c)
         loss = self.loss_fn(pred_train, labels_c)
         self.optimizer.zero_grad()
         loss.backward()
@@ -694,12 +716,15 @@ class Manager_model_trainer(object):
     def evaluate_print(
             self, eval_krgb_loader, keyframes_sseval,
             dataset, tubes_dgt_eval, tubes_dwein_eval):
-        with small.QTimer('Evaluation, obtain softmaxes'):
-            all_softmaxes = _evaluation_step(
-                    self.model, eval_krgb_loader,
-                    self.norm_mean_t, self.norm_std_t)
+        eval_timers = snippets.TicToc(
+                ['softmaxes', 'acc_roc', 'cheat_app'])
+        eval_timers.tic('softmaxes')
+        all_softmaxes = _evaluation_step(
+                self.model, eval_krgb_loader,
+                self.norm_mean_t, self.norm_std_t)
+        eval_timers.toc('softmaxes')
         _evalline(all_softmaxes, keyframes_sseval,
-                dataset, tubes_dgt_eval, tubes_dwein_eval)
+            dataset, tubes_dgt_eval, tubes_dwein_eval, eval_timers)
 
 
 def add_roi_batch_indices(bboxes_t, counts=None):
@@ -835,6 +860,7 @@ def finetune_preextracted_krgb(workfolder, cfg_dict, add_args):
             loss_log: '0::50'
     """)
     cf = cfg.parse()
+    initial_seed = cf['seed']
 
     dataset: Dataset_daly_ocv = Ncfg_daly.get_dataset(cf)
     vgroup = Ncfg_daly.get_vids(cf, dataset)
@@ -848,6 +874,7 @@ def finetune_preextracted_krgb(workfolder, cfg_dict, add_args):
     train_krgb_loader, eval_krgb_loader, keyframes_sseval = \
         _prepare_krgb_datas(cf, dataset, vgroup, sset_train, sset_eval)
 
+    torch.manual_seed(initial_seed)
     man_mtrainer = Manager_model_trainer(cf)
 
     n_epochs = 40

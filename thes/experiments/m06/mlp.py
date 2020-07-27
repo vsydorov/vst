@@ -37,7 +37,8 @@ from thes.evaluation.recall import (
 from thes.evaluation.ap.convert import (
     compute_ap_for_avtubes_as_df)
 from thes.tools import snippets
-from thes.pytorch import (sequence_batch_collate_v2, default_collate)
+from thes.pytorch import (sequence_batch_collate_v2,
+        default_collate, NumpyRandomSampler)
 
 log = logging.getLogger(__name__)
 
@@ -95,6 +96,22 @@ class Ncfg_kfeats:
             tkfeats['Y'] = torch.from_numpy(tkfeats['Y'])
             tkfeats_d[sset] = tkfeats
         return tkfeats_d
+
+
+class Net_mlp_zerolayer(nn.Module):
+    def __init__(self, D_in, D_out, dropout_rate=0.5):
+        super().__init__()
+        if dropout_rate > 0.0:
+            self.dropout = nn.Dropout(dropout_rate)
+        self.linear1 = nn.Linear(D_in, D_out)
+        self.rt_act = nn.Softmax(dim=-1)
+
+    def forward(self, x):
+        if hasattr(self, "dropout"):
+            x = self.dropout(x)
+        x = self.linear1(x)
+        x = self.rt_act(x)
+        return x
 
 
 class Net_mlp_onelayer(nn.Module):
@@ -396,7 +413,12 @@ def _kffeats_experiment(
     train_period_log = cf['train.period.log']
     n_epochs = cf['train.n_epochs']
     D_in = tkfeats_train['X'].shape[-1]
-    model = Net_mlp_onelayer(D_in, 10, cf['net.H'])
+    if cf['net.kind'] == 'layer0':
+        model = Net_mlp_zerolayer(D_in, 10)
+    elif cf['net.kind'] == 'layer1':
+        model = Net_mlp_onelayer(D_in, 10, cf['net.layer1.H'])
+    else:
+        raise NotImplementedError()
     loss_fn = torch.nn.CrossEntropyLoss(reduction='mean')
     optimizer = torch.optim.AdamW(model.parameters(),
             lr=cf['train.lr'], weight_decay=cf['train.weight_decay'])
@@ -421,6 +443,23 @@ def _kffeats_experiment(
             cf, model, da_big, tkfeats_train, tkfeats_eval,
             tubes_dwein_eval, tubes_dgt_eval, dataset)
     return result
+
+
+class TD_over_feats(torch.utils.data.Dataset):
+    def __init__(self, feats, labels, keyframes):
+        self.feats = feats
+        self.labels = labels
+        self.keyframes = keyframes
+
+    def __len__(self):
+        return len(self.feats)
+
+    def __getitem__(self, index):
+        feat = self.feats[index]
+        label = self.labels[index]
+        keyframe = self.keyframes[index]
+        keyframe['do_not_collate'] = True
+        return feat, label, keyframe
 
 
 def _tubefeats_pretraining(cf, model, loss_fn,
@@ -576,10 +615,12 @@ def kffeats_train_mlp(workfolder, cfg_dict, add_args):
             fold: [~, ~]
     data_scaler: ['keyframes', ['keyframes', 'no']]
     split_assignment: ['train/val', ['train/val', 'trainval/test']]
+    net:
+        kind: ['layer1', ['layer0', 'layer1']]
+        layer1:
+            H: [32, int]
     """)
     cfg.set_defaults("""
-    net:
-        H: 32
     train:
         lr: 1.0e-5
         weight_decay: 5.0e-2

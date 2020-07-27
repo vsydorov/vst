@@ -130,6 +130,7 @@ class FExtractor(object):
             raise RuntimeError()
         self.model = model
         self.model.forward = MethodType(hforward, self.model)
+        self.model.eval()  # IMPORTANT
 
     def head_define(self, model, sf_cfg, model_id):
         model_nframes = sf_cfg.DATA.NUM_FRAMES
@@ -355,7 +356,7 @@ def extract_keyframe_features(workfolder, cfg_dict, add_args):
     disaver_fold = small.mkdir(out/'disaver')
     total = len(keyframes)
     disaver = Dataloader_isaver(disaver_fold, total, func, prepare_func,
-            save_interval=cf['extraction.save_interval'])
+        save_interval_seconds=cf['extraction.save_interval'])
     outputs = disaver.run()
     keys = next(iter(outputs)).keys()
     dict_outputs = {}
@@ -450,7 +451,7 @@ def extract_philtube_features(workfolder, cfg_dict, add_args):
     disaver_fold = small.mkdir(out/'disaver')
     total = len(connections_f)
     disaver = Dataloader_isaver(disaver_fold, total, func, prepare_func,
-        save_interval=cf['extraction.save_interval'], log_interval=300)
+        save_interval_seconds=cf['extraction.save_interval'], log_interval=300)
     outputs = disaver.run()
     keys = next(iter(outputs)).keys()
     dict_outputs = {}
