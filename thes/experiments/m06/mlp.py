@@ -407,10 +407,12 @@ def _kffeats_display_evalresults(result, sset_eval):
 def _kffeats_experiment(
         cf, initial_seed, da_big, tkfeats_train,
         tkfeats_eval, tubes_dwein_eval, tubes_dgt_eval,
-        dataset):
+        dataset, sset_eval):
 
     torch.manual_seed(initial_seed)
-    train_period_log = cf['train.period.log']
+    period_log = cf['train.period.log']
+    period_eval_evalset = cf['train.period.eval']
+
     n_epochs = cf['train.n_epochs']
     D_in = tkfeats_train['X'].shape[-1]
     if cf['net.kind'] == 'layer0':
@@ -429,7 +431,7 @@ def _kffeats_experiment(
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-        if snippets.check_step_sslice(epoch, train_period_log):
+        if snippets.check_step_sslice(epoch, period_log):
             model.eval()
             kacc_train = _quick_kf_eval(tkfeats_train, model, False)
             kacc_eval = _quick_kf_eval(tkfeats_eval, model, False)
@@ -437,11 +439,21 @@ def _kffeats_experiment(
             log.info(f'{epoch}: {loss.item():.4f} '
                     f'K.Acc.Train: {kacc_train*100:.2f}; '
                     f'K.Acc.Eval: {kacc_eval*100:.2f}')
+        if snippets.check_step_sslice(epoch, period_eval_evalset):
+            model.eval()
+            result = _kffeats_eval(
+                    cf, model, da_big, tkfeats_train, tkfeats_eval,
+                    tubes_dwein_eval, tubes_dgt_eval, dataset)
+            model.train()
+            log.info(f'Perf at {epoch=}')
+            _kffeats_display_evalresults(result, sset_eval)
     # / Final evaluation
     model.eval()
     result = _kffeats_eval(
             cf, model, da_big, tkfeats_train, tkfeats_eval,
             tubes_dwein_eval, tubes_dgt_eval, dataset)
+    log.info(f'Perf at {epoch=}')
+    _kffeats_display_evalresults(result, sset_eval)
     return result
 
 
@@ -627,8 +639,9 @@ def kffeats_train_mlp(workfolder, cfg_dict, add_args):
         n_epochs: 2001
         period:
             log: '0::500'
+            eval: '0::500'
     eval:
-        full_tubes: True
+        full_tubes: False
     n_trials: 5
     """)
     cf = cfg.parse()
@@ -669,16 +682,18 @@ def kffeats_train_mlp(workfolder, cfg_dict, add_args):
             cf, initial_seed+i, da_big,
             tkfeats_train, tkfeats_eval,
             tubes_dwein_eval, tubes_dgt_eval,
-            dataset)
-        _kffeats_display_evalresults(result, sset_eval)
+            dataset, sset_eval)
         return result
 
+    if n_trials == 1:
+        experiment(0)
+        return
+
     isaver = snippets.Isaver_simple(
-            small.mkdir(out/'isaver_ntrials'), range(n_trials), experiment)
+            small.mkdir(out/'isaver_ntrials'),
+            range(n_trials), experiment)
     trial_results = isaver.run()
 
-    if len(trial_results) == 1:
-        return  # no need to avg
     df_keys = ['df_recall_cheat', 'df_ap_cheat']
     scalar_keys = ['kacc_train', 'kacc_eval', 'kf_acc', 'kf_roc_auc']
     if 'df_ap_full' in trial_results[0]:
@@ -780,11 +795,14 @@ def tubefeats_train_mlp(workfolder, cfg_dict, add_args):
         _tubefeats_display_evalresults(result, sset_eval)
         return result
 
+    if n_trials == 1:
+        experiment(0)
+        return
+
     isaver = snippets.Isaver_simple(
-            small.mkdir(out/'isaver_ntrials'), range(n_trials), experiment)
+            small.mkdir(out/'isaver_ntrials'),
+            range(n_trials), experiment)
     trial_results = isaver.run()
-    if len(trial_results) == 1:
-        return  # no need to avg
     avg_result = {}
     avg_result['acc_flattube_synt'] = np.mean([tr['acc_flattube_synt'] for tr in trial_results])
     to_avg = [tr['df_ap_full'] for tr in trial_results]
