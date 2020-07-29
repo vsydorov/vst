@@ -580,8 +580,13 @@ def _tubefeats_experiment(
     torch.manual_seed(initial_seed)
     rgen = np.random.default_rng(initial_seed)
 
-    input_dim = da_big.BIG.shape[-1]
-    model = Net_mlp_onelayer(input_dim, 11, cf['net.H'])
+    D_in = da_big.BIG.shape[-1]
+    if cf['net.kind'] == 'layer0':
+        model = Net_mlp_zerolayer(D_in, 11)
+    elif cf['net.kind'] == 'layer1':
+        model = Net_mlp_onelayer(D_in, 11, cf['net.layer1.H'])
+    else:
+        raise NotImplementedError()
     loss_fn = torch.nn.CrossEntropyLoss(reduction='mean')
     # pretraining
     if cf['kf_pretrain.enabled']:
@@ -725,10 +730,12 @@ def tubefeats_train_mlp(workfolder, cfg_dict, add_args):
             fold: [~, str]
     data_scaler: ['keyframes', ['keyframes', 'no']]
     split_assignment: ['train/val', ['train/val', 'trainval/test']]
+    net:
+        kind: ['layer1', ['layer0', 'layer1']]
+        layer1:
+            H: [32, int]
     """)
     cfg.set_defaults("""
-    net:
-        H: 32
     train:
         lr: 1.0e-5
         weight_decay: 5.0e-2
