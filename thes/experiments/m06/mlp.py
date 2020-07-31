@@ -15,6 +15,8 @@ import torch.nn.functional as F
 
 from vsydorov_tools import small
 
+import slowfast.utils.weight_init_helper as init_helper
+
 from thes.data.dataset.daly import (
     Ncfg_daly, load_gt_and_wein_tubes)
 from thes.data.dataset.external import (
@@ -99,36 +101,71 @@ class Ncfg_kfeats:
 
 
 class Net_mlp_zerolayer(nn.Module):
-    def __init__(self, D_in, D_out, dropout_rate=0.5):
+    """
+    This one will match outputs with the last layer finetuning in
+    SoftMax-derived convnent
+    """
+    def __init__(
+            self, D_in, D_out,
+            dropout_rate, debug_outputs=False):
         super().__init__()
         if dropout_rate > 0.0:
             self.dropout = nn.Dropout(dropout_rate)
-        self.linear1 = nn.Linear(D_in, D_out)
+        self.rt_projection = nn.Linear(D_in, D_out, bias=True)
         self.rt_act = nn.Softmax(dim=-1)
 
-    def forward(self, x):
+    def init_weights(self, init_std, seed):
+        """Will match initialization of ll finetuned net"""
+        ll_generator = torch.Generator()
+        ll_generator = ll_generator.manual_seed(67280421310679+seed)
+
+        self.rt_projection.weight.data.normal_(
+                mean=0.0, std=init_std, generator=ll_generator)
+        self.rt_projection.bias.data.zero_()
+
+    def forward(self, x, debug_outputs=False):
+        result = {}
         if hasattr(self, "dropout"):
             x = self.dropout(x)
-        x = self.linear1(x)
-        x = self.rt_act(x)
-        return x
+        if debug_outputs:
+            result['x_after_dropout'] = x
+        x = self.rt_projection(x)
+        if debug_outputs:
+            result['x_after_proj'] = x
+        if not self.training:
+            x = self.rt_act(x)
+        result['x_final'] = x
+        return result
 
 
 class Net_mlp_onelayer(nn.Module):
-    def __init__(self, D_in, D_out, H, dropout_rate=0.5):
+    def __init__(self, D_in, D_out, H, dropout_rate):
         super().__init__()
         self.linear1 = nn.Linear(D_in, H)
         self.linear2 = nn.Linear(H, D_out)
-        self.dropout = nn.Dropout(dropout_rate)
-        # self.bn = nn.BatchNorm1d(H, momentum=0.1)
+        if dropout_rate > 0.0:
+            self.dropout = nn.Dropout(dropout_rate)
+        self.rt_act = nn.Softmax(dim=-1)
+
+    def init_weights(self, init_std, seed):
+        ll_generator = torch.Generator()
+        ll_generator = ll_generator.manual_seed(67280421310679+seed)
+        for l in [self.linear1, self.linear2]:
+            l.weight.data.normal_(
+                    mean=0.0, std=init_std, generator=ll_generator)
+            l.bias.data.zero_()
 
     def forward(self, x):
         x = self.linear1(x)
         x = F.relu(x)
-        x = self.dropout(x)
-        # x = self.bn(x)
+        if hasattr(self, "dropout"):
+            x = self.dropout(x)
         x = self.linear2(x)
-        return x
+        if not self.training:
+            x = self.rt_act(x)
+        result = {}
+        result['x_final'] = x
+        return result
 
 
 def fitscale_kfeats(kfeats_d):
@@ -229,7 +266,7 @@ def _quick_kf_eval(kfeat_t, model, cutoff_last_dim):
     def _qacc(pred, Y):
         return pred.argmax(1).eq(Y).sum().item()/len(Y)
     with torch.no_grad():
-        pred_eval = model(kfeat_t['X'])
+        pred_eval = model(kfeat_t['X'])['x_final']
     if cutoff_last_dim:
         pred_eval = pred_eval[:, :-1]
     acc = _qacc(pred_eval, kfeat_t['Y'])
@@ -262,11 +299,11 @@ class Data_access_big(object):
 
 def _eval_tube_softmaxes(model, da_big, dwtis):
     tube_sofmaxes = {}
+    model.eval()
     with torch.no_grad():
         for dwti in dwtis:
-            preds = model(da_big.get(model, dwti))
-            preds = softmax(preds, axis=-1)
-            tube_sofmaxes[dwti] = preds.numpy()
+            preds_softmax = model(da_big.get(model, dwti))['x_final']
+            tube_sofmaxes[dwti] = preds_softmax.numpy()
     return tube_sofmaxes
 
 
@@ -325,10 +362,11 @@ def _kffeats_eval(
     # GT-overlap
     kacc_train = _quick_kf_eval(tkfeats_train, model, False)
     kacc_eval = _quick_kf_eval(tkfeats_eval, model, False)
+    model.eval()
     with torch.no_grad():
-        Y_test = model(tkfeats_eval['X']).numpy()
-    Y_test_pred = np.argmax(Y_test, axis=1)
-    Y_test_softmax = softmax(Y_test, axis=1).copy()
+        # Already softmax when in eval mode
+        Y_test_softmax = model(tkfeats_eval['X'])['x_final'].numpy()
+    Y_test_pred = np.argmax(Y_test_softmax, axis=1)
     kf_acc = accuracy_score(tkfeats_eval['Y'], Y_test_pred)
 
     kf_roc_auc = roc_auc_score(tkfeats_eval['Y'],
@@ -404,6 +442,19 @@ def _kffeats_display_evalresults(result, sset_eval):
         log.info('Full tube AP357: {}'.format(apline))
 
 
+class Full_train_sampler(object):
+    def __init__(self, tkfeats_train):
+        self.tkfeats_train = tkfeats_train
+
+    def train_step(self, model, optimizer, loss_fn, i_epoch):
+        pred_train = model(self.tkfeats_train['X'])['x_final']
+        loss = loss_fn(pred_train, self.tkfeats_train['Y'])
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        return loss
+
+
 def _kffeats_experiment(
         cf, initial_seed, da_big, tkfeats_train,
         tkfeats_eval, tubes_dwein_eval, tubes_dgt_eval,
@@ -415,44 +466,46 @@ def _kffeats_experiment(
 
     n_epochs = cf['train.n_epochs']
     D_in = tkfeats_train['X'].shape[-1]
-    if cf['net.kind'] == 'layer0':
-        model = Net_mlp_zerolayer(D_in, 10)
-    elif cf['net.kind'] == 'layer1':
-        model = Net_mlp_onelayer(D_in, 10, cf['net.layer1.H'])
-    else:
-        raise NotImplementedError()
+    model = define_mlp_model(cf, D_in, 10)
+    model.init_weights(0.01, initial_seed)
+
     loss_fn = torch.nn.CrossEntropyLoss(reduction='mean')
     optimizer = torch.optim.AdamW(model.parameters(),
             lr=cf['train.lr'], weight_decay=cf['train.weight_decay'])
 
-    for epoch in range(n_epochs):
-        out_train = model(tkfeats_train['X'])
-        loss = loss_fn(out_train, tkfeats_train['Y'])
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        if snippets.check_step_sslice(epoch, period_log):
+    if cf['train.mode'] == 'full':
+        trsampler = Full_train_sampler(tkfeats_train)
+    elif cf['train.mode'] == 'partial':
+        train_batch_size = cf['train.partial.train_batch_size']
+        trsampler = Partial_Train_sampler(
+                tkfeats_train, initial_seed, train_batch_size)
+    else:
+        raise NotImplementedError()
+
+    for i_epoch in range(n_epochs):
+        loss = trsampler.train_step(model, optimizer, loss_fn, i_epoch)
+        if snippets.check_step_sslice(i_epoch, period_log):
             model.eval()
             kacc_train = _quick_kf_eval(tkfeats_train, model, False)
             kacc_eval = _quick_kf_eval(tkfeats_eval, model, False)
             model.train()
-            log.info(f'{epoch}: {loss.item():.4f} '
+            log.info(f'{i_epoch}: {loss.item():.4f} '
                     f'K.Acc.Train: {kacc_train*100:.2f}; '
                     f'K.Acc.Eval: {kacc_eval*100:.2f}')
-        if snippets.check_step_sslice(epoch, period_eval_evalset):
+        if snippets.check_step_sslice(i_epoch, period_eval_evalset):
             model.eval()
             result = _kffeats_eval(
                     cf, model, da_big, tkfeats_train, tkfeats_eval,
                     tubes_dwein_eval, tubes_dgt_eval, dataset)
             model.train()
-            log.info(f'Perf at {epoch=}')
+            log.info(f'Perf at {i_epoch=}')
             _kffeats_display_evalresults(result, sset_eval)
     # / Final evaluation
     model.eval()
     result = _kffeats_eval(
             cf, model, da_big, tkfeats_train, tkfeats_eval,
             tubes_dwein_eval, tubes_dgt_eval, dataset)
-    log.info(f'Perf at {epoch=}')
+    log.info(f'Perf at {i_epoch=}')
     _kffeats_display_evalresults(result, sset_eval)
     return result
 
@@ -473,6 +526,44 @@ class TD_over_feats(torch.utils.data.Dataset):
         keyframe['do_not_collate'] = True
         return feat, label, keyframe
 
+def define_mlp_model(cf, D_in, D_out):
+    dropout_rate = cf['net.ll_dropout']
+    if cf['net.kind'] == 'layer0':
+        model = Net_mlp_zerolayer(
+            D_in, D_out, dropout_rate)
+    elif cf['net.kind'] == 'layer1':
+        model = Net_mlp_onelayer(
+            D_in, D_out, cf['net.layer1.H'], dropout_rate)
+    return model
+
+class Partial_Train_sampler(object):
+    def __init__(self, tkfeats_train, initial_seed, TRAIN_BATCH_SIZE):
+        td_sstrain = TD_over_feats(tkfeats_train['X'], tkfeats_train['Y'], tkfeats_train['kf'])
+        train_sampler_rgen = np.random.default_rng(initial_seed)
+        sampler = NumpyRandomSampler(td_sstrain, train_sampler_rgen)
+
+        self.train_krgb_loader = torch.utils.data.DataLoader(td_sstrain,
+                batch_size=TRAIN_BATCH_SIZE,
+                num_workers=0, pin_memory=True,
+                sampler=sampler, shuffle=False,
+                collate_fn=sequence_batch_collate_v2)
+        self.period_ibatch_loss_log = '0::10'
+
+    def train_step(self, model, optimizer, loss_fn, i_epoch):
+        for i_batch, (data_input) in enumerate(self.train_krgb_loader):
+            feats, labels, keyframes = data_input
+            result = model(feats)
+            pred_train = result['x_final']
+            loss = loss_fn(pred_train, labels)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            if snippets.check_step_sslice(
+                    i_batch, self.period_ibatch_loss_log):
+                Nb = len(self.train_krgb_loader)
+                log.info(f'{i_epoch=}, {i_batch=}/{Nb}: loss {loss.item()}')
+        return loss
+
 
 def _tubefeats_pretraining(cf, model, loss_fn,
         tkfeats_train, tkfeats_eval):
@@ -484,7 +575,7 @@ def _tubefeats_pretraining(cf, model, loss_fn,
     pretrain_period_log = cf['kf_pretrain.period.log']
     model.train()
     for epoch in range(pretrain_n_epochs):
-        out_train = model(tkfeats_train['X'])
+        out_train = model(tkfeats_train['X'])['x_final']
         loss = loss_fn(out_train, tkfeats_train['Y'])
         pretrain_optimizer.zero_grad()
         loss.backward()
@@ -542,7 +633,7 @@ def _tubefeats_training(cf, model, loss_fn, rgen, da_big,
         loader = da_big.produce_loader(rgen, dwti_to_label_train,
             tubes_per_batch, frames_per_tube)
         for i_batch, (feats, labels) in enumerate(loader):
-            pred_train = model(feats)
+            pred_train = model(feats)['x_final']
             loss = loss_fn(pred_train, labels)
             optimizer.zero_grad()
             loss.backward()
@@ -581,12 +672,7 @@ def _tubefeats_experiment(
     rgen = np.random.default_rng(initial_seed)
 
     D_in = da_big.BIG.shape[-1]
-    if cf['net.kind'] == 'layer0':
-        model = Net_mlp_zerolayer(D_in, 11)
-    elif cf['net.kind'] == 'layer1':
-        model = Net_mlp_onelayer(D_in, 11, cf['net.layer1.H'])
-    else:
-        raise NotImplementedError()
+    model = define_mlp_model(cf, D_in, 11)
     loss_fn = torch.nn.CrossEntropyLoss(reduction='mean')
     # pretraining
     if cf['kf_pretrain.enabled']:
@@ -636,6 +722,11 @@ def kffeats_train_mlp(workfolder, cfg_dict, add_args):
         kind: ['layer1', ['layer0', 'layer1']]
         layer1:
             H: [32, int]
+        ll_dropout: [0.5, float]
+    train:
+        mode: ['full', ['full', 'partial']]
+        partial:
+            train_batch_size: [32, int]
     """)
     cfg.set_defaults("""
     train:
@@ -647,7 +738,7 @@ def kffeats_train_mlp(workfolder, cfg_dict, add_args):
             eval: '0::500'
     eval:
         full_tubes: False
-    n_trials: 5
+    n_trials: 1
     """)
     cf = cfg.parse()
     # params
@@ -734,6 +825,7 @@ def tubefeats_train_mlp(workfolder, cfg_dict, add_args):
         kind: ['layer1', ['layer0', 'layer1']]
         layer1:
             H: [32, int]
+        ll_dropout: [0.5, float]
     """)
     cfg.set_defaults("""
     train:

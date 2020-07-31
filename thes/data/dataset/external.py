@@ -138,7 +138,7 @@ class Dataset_daly(object):
         super().__init__()
         self.root_path = get_dataset_path('action/daly_take2')
         if mirror == 'uname':
-            GOOD_NODES = ['gpuhost6', 'gpuhost7', 'gpuhost9']
+            GOOD_NODES = ['gpuhost6', 'gpuhost7', 'gpuhost9', 'services']
             fallback_mirror = 'scratch2'
             node_name = platform.uname().node
             if node_name in GOOD_NODES:

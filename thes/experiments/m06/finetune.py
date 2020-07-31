@@ -205,6 +205,11 @@ class SlowFast_roitune(M_slowfast):
         init_helper.init_weights(
             self, sf_cfg.MODEL.FC_INIT_STD, sf_cfg.RESNET.ZERO_INIT_FINAL_BN
         )
+        # Weight init
+        last_layer_generator = torch.Generator(2147483647)
+        self.rt_projection.weight.data.normal_(
+            mean=0.0, std=0.01, generator=last_layer_generator)
+        self.rt_projection.weight.data.zero_()
 
     def _construct_roitune(self, sf_cfg, num_classes):
         # DETECTION.ROI_XFORM_RESOLUTION
@@ -354,18 +359,47 @@ def _build_model_addons():
             False, slowfast_alpha, 256)
 
 
-class Head_roitune(nn.Module):
-    def __init__(self, sf_cfg, num_classes):
-        super(Head_roitune, self).__init__()
-        self._construct_roitune(sf_cfg, num_classes)
+class Freezer(object):
+    def __init__(self, model, freeze_level, bn_freeze):
+        self.model = model
+        self.freeze_level = freeze_level
+        self.bn_freeze = bn_freeze
 
-    def _construct_roitune(self, sf_cfg, num_classes):
+    @staticmethod
+    def set_bn_eval(module):
+        if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
+            module.eval()
+
+    def maybe_freeze_batchnorm(self):
+        if not self.bn_freeze:
+            return
+        for i_child, child in enumerate(self.model.children()):
+            if i_child <= self.freeze_level:
+                child.apply(self.set_bn_eval)
+
+    def set_finetune_level(self):
+        for param in self.model.parameters():
+            param.requires_grad = True
+        # freeze layers until freeze_level (inclusive)
+        for i_child, child in enumerate(self.model.children()):
+            if i_child <= self.freeze_level:
+                for param in child.parameters():
+                    param.requires_grad = False
+        self.maybe_freeze_batchnorm()
+
+
+class Head_roitune(nn.Module):
+    def __init__(self, sf_cfg, num_classes, dropout_rate, debug_outputs):
+        super(Head_roitune, self).__init__()
+        self._construct_roitune(sf_cfg, num_classes, dropout_rate)
+        self.debug_outputs = debug_outputs
+
+    def _construct_roitune(self, sf_cfg, num_classes, dropout_rate):
         # params
         xform_resolution = 7
         resolution = [[xform_resolution] * 2]
         scale_factor = [32]
         dim_in = [sf_cfg.RESNET.WIDTH_PER_GROUP * 32]
-        dropout_rate = 0.5
 
         pi = 0
         roi_align = ROIAlign(
@@ -392,29 +426,39 @@ class Head_roitune(nn.Module):
 
         # B C H W
         x = out.view(out.shape[0], -1)
-        roipooled = x
+        result = {}
+        if self.debug_outputs:
+            result['roipooled'] = x
 
         # Perform dropout.
         if hasattr(self, "rt_dropout"):
             x = self.rt_dropout(x)
+        if self.debug_outputs:
+            result['x_after_dropout'] = x
 
         x = x.view(x.shape[0], -1)
+
+        if self.debug_outputs:
+            result['x_after_view'] = x
+
         x = self.rt_projection(x)
+
+        if self.debug_outputs:
+            result['x_after_proj'] = x
+
         x = self.rt_act(x)
-        return (x, roipooled)
+        result['x_final'] = x
+        return result
 
 
 class C2D_1x1_roitune(M_resnet):
-    def __init__(self, sf_cfg, num_classes):
+    def __init__(self, sf_cfg, num_classes, dropout_rate, debug_outputs):
         super(M_resnet, self).__init__()
         self.norm_module = get_norm(sf_cfg)
         self.enable_detection = sf_cfg.DETECTION.ENABLE
         self.num_pathways = 1
         self._construct_network(sf_cfg)
-        self.head = Head_roitune(sf_cfg, num_classes)
-        init_helper.init_weights(
-            self, sf_cfg.MODEL.FC_INIT_STD,
-            sf_cfg.RESNET.ZERO_INIT_FINAL_BN)
+        self.head = Head_roitune(sf_cfg, num_classes, dropout_rate, debug_outputs)
 
     def forward(self, x, bboxes0):
         # hforward_resnet_nopool
@@ -426,6 +470,18 @@ class C2D_1x1_roitune(M_resnet):
         x = self.s5(x)
         x = self.head(x, bboxes0)
         return x
+
+    def init_weights(self, init_std, seed=42):
+        # Init all weights
+        init_helper.init_weights(
+            self, init_std, False)
+
+        # Specifically init last layer
+        ll_generator = torch.Generator()
+        ll_generator = ll_generator.manual_seed(67280421310679+seed)
+        self.head.rt_projection.weight.data.normal_(
+                mean=0.0, std=init_std, generator=ll_generator)
+        self.head.rt_projection.bias.data.zero_()
 
 
 class TD_over_krgb(torch.utils.data.Dataset):
@@ -450,7 +506,7 @@ def _evaluation_step(model, eval_loader, norm_mean_t, norm_std_t):
     model.eval()
     all_softmaxes_ = []
     for i_batch, (data_input) in enumerate(eval_loader):
-        rgbs, bboxes_t, labels = data_input
+        rgbs, bboxes_t, labels, keyframes = data_input
         frame_list_f32c = [to_gpu_normalize_permute(
                 rgbs, norm_mean_t, norm_std_t)]
         bboxes0_t = add_roi_batch_indices(bboxes_t)
@@ -458,7 +514,8 @@ def _evaluation_step(model, eval_loader, norm_mean_t, norm_std_t):
 
         # pred
         with torch.no_grad():
-            pred = model(frame_list_f32c, bboxes0_c)
+            result = model(frame_list_f32c, bboxes0_c)
+            pred = result['x_final']
         pred_np = pred.cpu().numpy()
         all_softmaxes_.append(pred_np)
     all_softmaxes = np.vstack(all_softmaxes_)
@@ -566,22 +623,6 @@ def _evalline(
     )))
     log.info('Eval_timers: {}'.format(eval_timers.time_str))
 
-def _build_model(n_outputs):
-    # Build model
-    rel_yml_path = 'Kinetics/C2D_8x8_R50_IN1K.yaml'
-    sf_cfg = basic_sf_cfg(rel_yml_path)
-    sf_cfg.NUM_GPUS = 1
-    sf_cfg.DATA.NUM_FRAMES = 1
-    sf_cfg.DATA.SAMPLING_RATE = 1
-
-    # / slowfast.models.build_model
-    model = C2D_1x1_roitune(sf_cfg, n_outputs)
-    # Determine the GPU used by the current process
-    cur_device = torch.cuda.current_device()
-    # Transfer the model to the current GPU device
-    model = model.cuda(device=cur_device)
-    return sf_cfg, model
-
 
 class Manager_checkpoint_name(object):
     ckpt_re = r'model_at_epoch_(?P<i_epoch>\d*).pth.tar'
@@ -660,20 +701,30 @@ class Manager_model_checkpoints(object):
         return start_epoch
 
 
-def set_finetune_level(model, freeze_level=-1):
-    for param in model.parameters():
-        param.requires_grad = True
-    # freeze layers until freeze_level (inclusive)
-    for i_child, child in enumerate(model.children()):
-        if i_child <= freeze_level:
-            for param in child.parameters():
-                param.requires_grad = False
+# def set_finetune_level(model, freeze_level=-1):
+#     for param in model.parameters():
+#         param.requires_grad = True
+#     # freeze layers until freeze_level (inclusive)
+#     for i_child, child in enumerate(model.children()):
+#         if i_child <= freeze_level:
+#             for param in child.parameters():
+#                 param.requires_grad = False
 
 class Manager_model_trainer(object):
     def __init__(self, cf):
+        # Build model
+        rel_yml_path = 'Kinetics/C2D_8x8_R50_IN1K.yaml'
+        sf_cfg = basic_sf_cfg(rel_yml_path)
+        sf_cfg.NUM_GPUS = 1
+        sf_cfg.DATA.NUM_FRAMES = 1
+        sf_cfg.DATA.SAMPLING_RATE = 1
+
+        # / slowfast.models.build_model
+        model = C2D_1x1_roitune(sf_cfg, 10, cf['ll_dropout'], cf['debug_outputs'])
         # prepare model
-        sf_cfg, model = _build_model(10)
-        set_finetune_level(model, cf['freeze_level'])
+        freezer = Freezer(model, cf['freeze.level'],
+                cf['freeze.freeze_bn'])
+        freezer.set_finetune_level()
 
         norm_mean_t = np_to_gpu(sf_cfg.DATA.MEAN)
         norm_std_t = np_to_gpu(sf_cfg.DATA.STD)
@@ -692,11 +743,26 @@ class Manager_model_trainer(object):
 
         self.sf_cfg = sf_cfg
         self.model = model
+        self.freezer = freezer
+        self.freezer = freezer
         self.optimizer = optimizer
         self.norm_mean_t = norm_mean_t
         self.norm_std_t = norm_std_t
         self.loss_fn = loss_fn
         self.man_ckpt = man_ckpt
+
+    def model_to_gpu(self):
+        # Determine the GPU used by the current process
+        cur_device = torch.cuda.current_device()
+        # Transfer the model to the current GPU device
+        self.model = self.model.cuda(device=cur_device)
+
+    def set_train(self):
+        self.model.train()
+        self.freezer.maybe_freeze_batchnorm()
+
+    def set_eval(self):
+        self.model.eval()
 
     def batch_forward(self, data_input):
         rgbs, bboxes_t, labels, keyframes = data_input
@@ -706,7 +772,8 @@ class Manager_model_trainer(object):
         bboxes0_c = bboxes0_t.type(torch.cuda.FloatTensor)
         labels_c = labels.cuda()
 
-        pred_train, roipooled = self.model(frame_list_f32c, bboxes0_c)
+        result = self.model(frame_list_f32c, bboxes0_c)
+        pred_train = result['x_final']
         loss = self.loss_fn(pred_train, labels_c)
         self.optimizer.zero_grad()
         loss.backward()
@@ -776,6 +843,7 @@ def tubefeats_train_model(workfolder, cfg_dict, add_args):
 
     # Training
     torch.manual_seed(initial_seed)
+    torch.cuda.manual_seed(initial_seed)
     rgen = np.random.default_rng(initial_seed)
 
     loss_fn = torch.nn.CrossEntropyLoss(reduction='mean')
@@ -848,7 +916,11 @@ def finetune_preextracted_krgb(workfolder, cfg_dict, add_args):
     split_assignment: ['train/val', ['train/val', 'trainval/test']]
     """)
     cfg.set_defaults("""
-    freeze_level: -1
+    freeze:
+        level: -1
+        freeze_bn: False
+    debug_outputs: False
+    ll_dropout: 0.5
     train:
         lr: 1.0e-5
         weight_decay: 5.0e-2
@@ -857,7 +929,7 @@ def finetune_preextracted_krgb(workfolder, cfg_dict, add_args):
         eval: ~
     period:
         ibatch:
-            loss_log: '0::50'
+            loss_log: '0::10'
     """)
     cf = cfg.parse()
     initial_seed = cf['seed']
@@ -875,7 +947,10 @@ def finetune_preextracted_krgb(workfolder, cfg_dict, add_args):
         _prepare_krgb_datas(cf, dataset, vgroup, sset_train, sset_eval)
 
     torch.manual_seed(initial_seed)
+    torch.cuda.manual_seed(initial_seed)
     man_mtrainer = Manager_model_trainer(cf)
+    man_mtrainer.model.init_weights(0.01, seed=initial_seed)
+    man_mtrainer.model_to_gpu()
 
     n_epochs = 40
     period_ibatch_loss_log = cf['period.ibatch.loss_log']
@@ -890,7 +965,7 @@ def finetune_preextracted_krgb(workfolder, cfg_dict, add_args):
     start_epoch = (man_mtrainer.man_ckpt
             .restore_model_magic(checkpoint_path))
 
-    man_mtrainer.model.train()
+    man_mtrainer.set_train()
     for i_epoch in range(start_epoch, n_epochs):
         for i_batch, (data_input) in enumerate(train_krgb_loader):
             loss = man_mtrainer.batch_forward(data_input)
@@ -899,7 +974,8 @@ def finetune_preextracted_krgb(workfolder, cfg_dict, add_args):
                 Nb = len(train_krgb_loader)
                 log.info(f'{i_epoch=}, {i_batch=}/{Nb}: loss {loss.item()}')
         man_mtrainer.man_ckpt.save_epoch(rundir, i_epoch)
-        man_mtrainer.model.eval()
+        man_mtrainer.set_eval()
+        import pudb; pudb.set_trace()  # XXX BREAKPOINT
         man_mtrainer.evaluate_print(eval_krgb_loader, keyframes_sseval,
                 dataset, tubes_dgt_eval, tubes_dwein_eval)
-        man_mtrainer.model.train()
+        man_mtrainer.set_train()
