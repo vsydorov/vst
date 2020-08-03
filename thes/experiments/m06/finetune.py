@@ -557,8 +557,8 @@ def _prepare_krgb_datas(cf, dataset, vgroup, sset_train, sset_eval):
     td_sseval = TD_over_krgb(
             krgb_array_sseval, krgb_bboxes_sseval, keyframes_sseval)
 
-    TRAIN_BATCH_SIZE = 32
-    EVAL_BATCH_SIZE = 32
+    TRAIN_BATCH_SIZE = cf['train.batch_size.train']
+    EVAL_BATCH_SIZE = cf['train.batch_size.eval']
 
     train_sampler_rgen = np.random.default_rng(initial_seed)
     sampler = NumpyRandomSampler(td_sstrain, train_sampler_rgen)
@@ -924,6 +924,10 @@ def finetune_preextracted_krgb(workfolder, cfg_dict, add_args):
     train:
         lr: 1.0e-5
         weight_decay: 5.0e-2
+        batch_size:
+            train: 32
+            eval: 64
+        n_epochs: 40
     cull:
         train: ~
         eval: ~
@@ -952,7 +956,7 @@ def finetune_preextracted_krgb(workfolder, cfg_dict, add_args):
     man_mtrainer.model.init_weights(0.01, seed=initial_seed)
     man_mtrainer.model_to_gpu()
 
-    n_epochs = 40
+    n_epochs = cf['train.n_epochs']
     period_ibatch_loss_log = cf['period.ibatch.loss_log']
 
     rundir = small.mkdir(out/'rundir')
@@ -975,7 +979,7 @@ def finetune_preextracted_krgb(workfolder, cfg_dict, add_args):
                 log.info(f'{i_epoch=}, {i_batch=}/{Nb}: loss {loss.item()}')
         man_mtrainer.man_ckpt.save_epoch(rundir, i_epoch)
         man_mtrainer.set_eval()
-        import pudb; pudb.set_trace()  # XXX BREAKPOINT
+        log.info(f'Perf at {i_epoch=}')
         man_mtrainer.evaluate_print(eval_krgb_loader, keyframes_sseval,
                 dataset, tubes_dgt_eval, tubes_dwein_eval)
         man_mtrainer.set_train()
