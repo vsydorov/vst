@@ -2,14 +2,14 @@ import logging
 import numpy as np
 from tqdm import tqdm
 from typing import (  # NOQA
-    Dict, List, Tuple, TypeVar, Set, Optional, Callable, TypedDict, NewType,
-    NamedTuple, Sequence, Literal, cast, Any)
+    Dict, List, Tuple, TypeVar, Set, Optional, Callable,
+    TypedDict, NewType, NamedTuple, Sequence, Literal, cast, Any)
 
 from thes.tools import snippets
 from thes.data.dataset.external import (
     Dataset_daly_ocv, Vid_daly, Action_name_daly)
 from thes.data.tubes.types import (
-    I_dwein, T_dwein, T_dwein_scored, I_dgt, AV_dict,
+    I_dwein, T_dwein, T_dwein_scored, I_dgt, T_dgt, AV_dict,
     Base_frametube, Objaction_dets, Box_connections_dwti)
 
 log = logging.getLogger(__name__)
@@ -298,11 +298,13 @@ def record_overlaps(tubes_dgt, tubes_dwein):
     return best_ious
 
 
-def create_synthetic_tube_labels(tubes_dwein, best_ious):
+def create_synthetic_tube_labels(
+        tubes_dwein: Dict[I_dwein, T_dwein],
+        best_ious) -> Dict[I_dwein, str]:
     # Assign to classes
     POS_THRESH = 0.5
     HN_THRESH = 0.3
-    labels: Dict[I_dgt, str] = {}
+    labels: Dict[I_dwein, str] = {}
     for dwt_index in tubes_dwein.keys():
         label = 'background'
         if dwt_index in best_ious:
@@ -317,21 +319,28 @@ def create_synthetic_tube_labels(tubes_dwein, best_ious):
     return labels
 
 
-def qload_synthetic_tube_labels(tubes_dgt, tubes_dwein, dataset):
+def qload_synthetic_tube_labels(
+        tubes_dgt: Dict[I_dgt, T_dgt],
+        tubes_dwein: Dict[I_dwein, T_dwein],
+        dataset: Dataset_daly_ocv
+        ) -> Tuple[List[str], Dict[I_dwein, int]]:
     # / Divide trainval tubes into classes (intersection with GT tubes)
     best_ious = record_overlaps(tubes_dgt, tubes_dwein)
-    labels_train: Dict[I_dgt, str] = create_synthetic_tube_labels(
+    labels_train: Dict[I_dwein, str] = create_synthetic_tube_labels(
             tubes_dwein, best_ious)
     # / Create classification dataset
-    cls_labels = dataset.action_names + ['background']
-    dwti_to_label: Dict[I_dgt, int] = {}
+    cls_labels = cast(List[str], dataset.action_names) + ['background']
+    dwti_to_label: Dict[I_dwein, int] = {}
     for dwti, label in labels_train.items():
         if label == 'none':
             continue
         elif label in ('background', 'background_hard'):
             ilabel = len(dataset.action_names)
+        elif label in dataset.action_names:
+            alabel = cast(Action_name_daly, label)
+            ilabel = dataset.action_names.index(alabel)
         else:
-            ilabel = dataset.action_names.index(label)
+            raise RuntimeError()
         dwti_to_label[dwti] = ilabel
     return cls_labels, dwti_to_label
 

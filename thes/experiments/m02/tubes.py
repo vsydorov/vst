@@ -9,7 +9,6 @@ from typing import (  # NOQA
     List, Tuple, Dict, cast, TypedDict, Set, Sequence, Optional)
 
 from vsydorov_tools import small
-from vsydorov_tools import cv as vt_cv
 
 from thes.data.dataset.external import (
     Dataset_daly_ocv, Vid_daly, get_daly_split_vids, )
@@ -31,16 +30,10 @@ from thes.data.tubes.routines import temporal_ious_NN
 from thes.data.tubes.nms import (
     compute_nms_for_av_stubes,)
 from thes.evaluation.ap.convert import (
-    compute_ap_for_avtubes_as_df,
-    compute_ap_for_avtubes_WG_as_df)
+    compute_ap_for_avtubes_as_df,)
 from thes.evaluation.recall import (
     compute_recall_for_avtubes_as_dfs,)
 from thes.tools import snippets
-from thes.evaluation.ap.convert import (
-    _convert_to_flat_representation,
-    _compute_eligible_tubes_for_eval_weingroup
-    )
-from thes.evaluation.ap.core import (voc_ap)
 from thes.data.tubes.routines import (spatial_tube_iou_v3)
 from thes.data.dataset.external import (Action_name_daly)
 from thes.data.tubes.nms import compute_nms_for_stubes

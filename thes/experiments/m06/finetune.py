@@ -3,16 +3,15 @@ import re
 import numpy as np
 import logging
 from pathlib import Path
-from sklearn.metrics import (
-    accuracy_score, roc_auc_score)
 from types import MethodType
 from typing import (  # NOQA
     Dict, Any, List, Optional, Tuple, TypedDict, Set)
+from sklearn.metrics import (
+    accuracy_score, roc_auc_score)
 
 import torch
 import torch.nn as nn
 import torch.utils.data
-from vsydorov_tools import log as vt_log
 from detectron2.layers import ROIAlign
 import slowfast.models
 import slowfast.utils.checkpoint as cu
@@ -26,6 +25,7 @@ from slowfast.models.video_model_builder import _POOL1 as SF_POOL1
 
 from vsydorov_tools import small
 from vsydorov_tools import cv as vt_cv
+from vsydorov_tools import log as vt_log
 
 from thes.data.dataset.daly import (
     Ncfg_daly, get_daly_keyframes_to_cover,
@@ -44,10 +44,14 @@ from thes.data.tubes.routines import (
     create_kinda_objaction_struct,
     qload_synthetic_tube_labels
     )
+
 from thes.evaluation.recall import (
     compute_recall_for_avtubes_as_dfs,)
 from thes.evaluation.ap.convert import (
     compute_ap_for_avtubes_as_df)
+from thes.evaluation.meta import (
+    keyframe_cls_scores, cheating_tube_scoring, quick_tube_eval)
+
 from thes.data.tubes.nms import (
     compute_nms_for_av_stubes,)
 from thes.slowfast.cfg import (basic_sf_cfg)
@@ -148,7 +152,7 @@ def prepare_box(bbox_ltrd, resize_params, ccrop_params):
     return bbox_tldr
 
 
-class TD_over_cl(torch.utils.data.Dataset):
+class TDataset_over_box_connections_w_labels(torch.utils.data.Dataset):
     cls_vf: Dict[Tuple[Vid_daly, int], Bc_dwti_labeled] = {}
     keys_vf: List[Tuple[Vid_daly, int]]
 
@@ -312,51 +316,10 @@ def build_slowfast_roitune(num_classes):
     return model, sf_cfg
 
 def _prepare_keyframe_cls_labels():
-    dwti_to_label_train: Dict[I_dgt, int]
-    cls_labels, dwti_to_label_train = qload_synthetic_tube_labels(
-            tubes_dgt_d[sset_train], tubes_dwein_d[sset_train], dataset)
-
-    # Frames to cover: keyframes and every 4th frame
-    vids = list(dataset.videos_ocv.keys())
-    frames_to_cover: Dict[Vid_daly, np.ndarray] = \
-            get_daly_keyframes_to_cover(dataset, vids,
-                    cf['frame_coverage.keyframes'],
-                    cf['frame_coverage.subsample'])
-    cs_vf_train: \
-            Dict[Tuple[Vid_daly, int], Box_connections_dwti]
-    cs_vf_train = group_tubes_on_frame_level(
-            tubes_dwein_d[sset_train], frames_to_cover)
-    # Add labels
-    cls_vf_train: Dict[Tuple[Vid_daly, int], Bc_dwti_labeled] = {}
-    for (vid, f), bc_dwti in cs_vf_train.items():
-        good_i = []
-        labels = []
-        for i, dwti in enumerate(bc_dwti['dwti_sources']):
-            if dwti in dwti_to_label_train:
-                label = dwti_to_label_train[dwti]
-                good_i.append(i)
-                labels.append(label)
-        if len(good_i):
-            vid = bc_dwti['vid']
-            frame_ind = bc_dwti['frame_ind']
-            boxes = [bc_dwti['boxes'][i] for i in good_i]
-            dwti_sources = [bc_dwti['dwti_sources'][i] for i in good_i]
-            bc_dwti_labeled: Bc_dwti_labeled = {
-                    'vid': vid,
-                    'frame_ind': frame_ind,
-                    'dwti_sources': dwti_sources,
-                    'boxes': boxes,
-                    'labels': np.array(labels)}
-            cls_vf_train[(vid, f)] = bc_dwti_labeled
+    pass
 
 def _build_model_addons():
-    model_nframes = sf_cfg.DATA.NUM_FRAMES
-    model_sample = sf_cfg.DATA.SAMPLING_RATE
-    slowfast_alpha = sf_cfg.SLOWFAST.ALPHA
-
-    sampler_grid = Sampler_grid(model_nframes, model_sample)
-    frameloader_vsf = Frameloader_video_slowfast(
-            False, slowfast_alpha, 256)
+    pass
 
 
 class Freezer(object):
@@ -389,7 +352,8 @@ class Freezer(object):
 
 
 class Head_roitune(nn.Module):
-    def __init__(self, sf_cfg, num_classes, dropout_rate, debug_outputs):
+    def __init__(self, sf_cfg, num_classes,
+            dropout_rate, debug_outputs):
         super(Head_roitune, self).__init__()
         self._construct_roitune(sf_cfg, num_classes, dropout_rate)
         self.debug_outputs = debug_outputs
@@ -446,19 +410,22 @@ class Head_roitune(nn.Module):
         if self.debug_outputs:
             result['x_after_proj'] = x
 
-        x = self.rt_act(x)
+        if not self.training:
+            x = self.rt_act(x)
         result['x_final'] = x
         return result
 
 
 class C2D_1x1_roitune(M_resnet):
-    def __init__(self, sf_cfg, num_classes, dropout_rate, debug_outputs):
+    def __init__(self, sf_cfg, num_classes,
+            dropout_rate, debug_outputs):
         super(M_resnet, self).__init__()
         self.norm_module = get_norm(sf_cfg)
         self.enable_detection = sf_cfg.DETECTION.ENABLE
         self.num_pathways = 1
         self._construct_network(sf_cfg)
-        self.head = Head_roitune(sf_cfg, num_classes, dropout_rate, debug_outputs)
+        self.head = Head_roitune(sf_cfg, num_classes,
+                dropout_rate, debug_outputs)
 
     def forward(self, x, bboxes0):
         # hforward_resnet_nopool
@@ -482,146 +449,6 @@ class C2D_1x1_roitune(M_resnet):
         self.head.rt_projection.weight.data.normal_(
                 mean=0.0, std=init_std, generator=ll_generator)
         self.head.rt_projection.bias.data.zero_()
-
-
-class TD_over_krgb(torch.utils.data.Dataset):
-    def __init__(self, array, bboxes, keyframes):
-        self.array = array
-        self.bboxes = bboxes
-        self.keyframes = keyframes
-
-    def __len__(self):
-        return len(self.keyframes)
-
-    def __getitem__(self, index):
-        rgb = self.array[index]
-        bbox = self.bboxes[index]
-        keyframe = self.keyframes[index]
-        keyframe['do_not_collate'] = True
-        label = keyframe['action_id']
-        return rgb, bbox, label, keyframe
-
-
-def _evaluation_step(model, eval_loader, norm_mean_t, norm_std_t):
-    model.eval()
-    all_softmaxes_ = []
-    for i_batch, (data_input) in enumerate(eval_loader):
-        rgbs, bboxes_t, labels, keyframes = data_input
-        frame_list_f32c = [to_gpu_normalize_permute(
-                rgbs, norm_mean_t, norm_std_t)]
-        bboxes0_t = add_roi_batch_indices(bboxes_t)
-        bboxes0_c = bboxes0_t.type(torch.cuda.FloatTensor)
-
-        # pred
-        with torch.no_grad():
-            result = model(frame_list_f32c, bboxes0_c)
-            pred = result['x_final']
-        pred_np = pred.cpu().numpy()
-        all_softmaxes_.append(pred_np)
-    all_softmaxes = np.vstack(all_softmaxes_)
-    model.train()
-    return all_softmaxes
-
-
-def _prepare_krgb_datas(cf, dataset, vgroup, sset_train, sset_eval):
-    initial_seed = cf['seed']
-    cull_train = cf['cull.train']
-    cull_eval = cf['cull.eval']
-
-    krgb_prefix = Path(cf['inputs.keyframes_rgb'])
-
-    krgb_array = np.load(krgb_prefix/'rgb.npy')
-    krgb_dict_outputs = small.load_pkl(krgb_prefix/'dict_outputs.pkl')
-    krgb_bboxes = np.vstack(krgb_dict_outputs['bboxes'])
-    keyframes = create_keyframelist(dataset)
-
-    inds_kf_sstrain = [i for i, kf in enumerate(keyframes)
-            if kf['vid'] in vgroup[sset_train]]
-    if cull_train:
-        inds_kf_sstrain = inds_kf_sstrain[:cull_train]
-
-    inds_kf_sseval = [i for i, kf in enumerate(keyframes)
-            if kf['vid'] in vgroup[sset_eval]]
-    if cull_eval:
-        inds_kf_sseval = inds_kf_sseval[:cull_eval]
-
-    krgb_array_sstrain = krgb_array[inds_kf_sstrain]
-    krgb_bboxes_sstrain = krgb_bboxes[inds_kf_sstrain]
-    keyframes_sstrain = [keyframes[i] for i in inds_kf_sstrain]
-    td_sstrain = TD_over_krgb(
-            krgb_array_sstrain, krgb_bboxes_sstrain, keyframes_sstrain)
-
-    krgb_array_sseval = krgb_array[inds_kf_sseval]
-    krgb_bboxes_sseval = krgb_bboxes[inds_kf_sseval]
-    keyframes_sseval = [keyframes[i] for i in inds_kf_sseval]
-    td_sseval = TD_over_krgb(
-            krgb_array_sseval, krgb_bboxes_sseval, keyframes_sseval)
-
-    TRAIN_BATCH_SIZE = cf['train.batch_size.train']
-    EVAL_BATCH_SIZE = cf['train.batch_size.eval']
-
-    train_sampler_rgen = np.random.default_rng(initial_seed)
-    sampler = NumpyRandomSampler(td_sstrain, train_sampler_rgen)
-
-    train_krgb_loader = torch.utils.data.DataLoader(td_sstrain,
-            batch_size=TRAIN_BATCH_SIZE,
-            num_workers=0, pin_memory=True,
-            sampler=sampler, shuffle=False,
-            collate_fn=sequence_batch_collate_v2)
-
-    eval_krgb_loader = torch.utils.data.DataLoader(td_sseval,
-            batch_size=EVAL_BATCH_SIZE, shuffle=False,
-            num_workers=0, pin_memory=True,
-            drop_last=False,
-            collate_fn=sequence_batch_collate_v2)
-    return train_krgb_loader, eval_krgb_loader, keyframes_sseval
-
-
-def _evalline(
-        all_softmaxes, keyframes_sseval, dataset,
-        tubes_dgt_eval, tubes_dwein_eval, eval_timers):
-    eval_timers.tic('acc_roc')
-    # accuracy
-    all_pred = np.argmax(all_softmaxes, axis=1)
-    gt_actionid = np.array(
-            [k['action_id'] for k in keyframes_sseval])
-    kf_acc = accuracy_score(gt_actionid, all_pred)
-    try:
-        kf_roc_auc = roc_auc_score(gt_actionid,
-                all_softmaxes, multi_class='ovr')
-    except ValueError as err:
-        log.warning(f'auc could not be computed, Caught "{err}"')
-        kf_roc_auc = np.NaN
-    eval_timers.toc('acc_roc')
-    eval_timers.tic('cheat_app')
-    # // Tube evaluation (via fake GT intersection)
-    av_gt_tubes: AV_dict[T_dgt] = push_into_avdict(
-            tubes_dgt_eval)
-    objactions_vf = create_kinda_objaction_struct(
-            dataset, keyframes_sseval, all_softmaxes)
-    # Assigning scores based on intersections
-    av_stubes: AV_dict[T_dwein_scored] = \
-        score_ftubes_via_objaction_overlap_aggregation(
-            dataset, objactions_vf, tubes_dwein_eval, 'iou',
-            0.1, 0.0, enable_tqdm=False)
-    av_stubes_ = av_stubes_above_score(
-            av_stubes, 0.0)
-    av_stubes_ = compute_nms_for_av_stubes(
-            av_stubes_, 0.3)
-    iou_thresholds = [.3, .5, .7]
-    df_ap_cheat = compute_ap_for_avtubes_as_df(
-        av_gt_tubes, av_stubes_, iou_thresholds, False, False)
-    eval_timers.toc('cheat_app')
-
-    df_ap_cheat = (df_ap_cheat*100).round(2)
-    cheating_apline = '/'.join(
-            df_ap_cheat.loc['all'].values.astype(str))
-    log.info(' '.join((
-        'K. Acc: {:.2f};'.format(kf_acc*100),
-        'RAUC: {:.2f};'.format(kf_roc_auc*100),
-        'AP (cheating tubes): {}'.format(cheating_apline)
-    )))
-    log.info('Eval_timers: {}'.format(eval_timers.time_str))
 
 
 class Manager_checkpoint_name(object):
@@ -701,33 +528,26 @@ class Manager_model_checkpoints(object):
         return start_epoch
 
 
-# def set_finetune_level(model, freeze_level=-1):
-#     for param in model.parameters():
-#         param.requires_grad = True
-#     # freeze layers until freeze_level (inclusive)
-#     for i_child, child in enumerate(model.children()):
-#         if i_child <= freeze_level:
-#             for param in child.parameters():
-#                 param.requires_grad = False
-
 class Manager_model_trainer(object):
-    def __init__(self, cf):
+    def __init__(self):
         # Build model
         rel_yml_path = 'Kinetics/C2D_8x8_R50_IN1K.yaml'
         sf_cfg = basic_sf_cfg(rel_yml_path)
         sf_cfg.NUM_GPUS = 1
         sf_cfg.DATA.NUM_FRAMES = 1
         sf_cfg.DATA.SAMPLING_RATE = 1
+        self.sf_cfg = sf_cfg
+        self.norm_mean_cu = np_to_gpu(sf_cfg.DATA.MEAN)
+        self.norm_std_cu = np_to_gpu(sf_cfg.DATA.STD)
 
+    def create_model_and_such(self, cf, n_inputs):
         # / slowfast.models.build_model
-        model = C2D_1x1_roitune(sf_cfg, 10, cf['ll_dropout'], cf['debug_outputs'])
+        model = C2D_1x1_roitune(self.sf_cfg, n_inputs,
+                cf['ll_dropout'], cf['debug_outputs'])
         # prepare model
         freezer = Freezer(model, cf['freeze.level'],
                 cf['freeze.freeze_bn'])
         freezer.set_finetune_level()
-
-        norm_mean_t = np_to_gpu(sf_cfg.DATA.MEAN)
-        norm_std_t = np_to_gpu(sf_cfg.DATA.STD)
 
         loss_fn = torch.nn.CrossEntropyLoss(reduction='mean')
 
@@ -741,13 +561,10 @@ class Manager_model_trainer(object):
                 lr=cf['train.lr'], weight_decay=cf['train.weight_decay'])
         man_ckpt = Manager_model_checkpoints(model, optimizer)
 
-        self.sf_cfg = sf_cfg
         self.model = model
         self.freezer = freezer
         self.freezer = freezer
         self.optimizer = optimizer
-        self.norm_mean_t = norm_mean_t
-        self.norm_std_t = norm_std_t
         self.loss_fn = loss_fn
         self.man_ckpt = man_ckpt
 
@@ -764,35 +581,6 @@ class Manager_model_trainer(object):
     def set_eval(self):
         self.model.eval()
 
-    def batch_forward(self, data_input):
-        rgbs, bboxes_t, labels, keyframes = data_input
-        frame_list_f32c = [to_gpu_normalize_permute(
-                rgbs, self.norm_mean_t, self.norm_std_t)]
-        bboxes0_t = add_roi_batch_indices(bboxes_t)
-        bboxes0_c = bboxes0_t.type(torch.cuda.FloatTensor)
-        labels_c = labels.cuda()
-
-        result = self.model(frame_list_f32c, bboxes0_c)
-        pred_train = result['x_final']
-        loss = self.loss_fn(pred_train, labels_c)
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
-        return loss
-
-    def evaluate_print(
-            self, eval_krgb_loader, keyframes_sseval,
-            dataset, tubes_dgt_eval, tubes_dwein_eval):
-        eval_timers = snippets.TicToc(
-                ['softmaxes', 'acc_roc', 'cheat_app'])
-        eval_timers.tic('softmaxes')
-        all_softmaxes = _evaluation_step(
-                self.model, eval_krgb_loader,
-                self.norm_mean_t, self.norm_std_t)
-        eval_timers.toc('softmaxes')
-        _evalline(all_softmaxes, keyframes_sseval,
-            dataset, tubes_dgt_eval, tubes_dwein_eval, eval_timers)
-
 
 def add_roi_batch_indices(bboxes_t, counts=None):
     if counts is None:
@@ -804,107 +592,204 @@ def add_roi_batch_indices(bboxes_t, counts=None):
     return bboxes0_t
 
 
+# krgb stuff
+
+
+class TDataset_over_krgb(torch.utils.data.Dataset):
+    def __init__(self, array, bboxes, keyframes):
+        self.array = array
+        self.bboxes = bboxes
+        self.keyframes = keyframes
+
+    def __len__(self):
+        return len(self.keyframes)
+
+    def __getitem__(self, index):
+        rgb = self.array[index]
+        bbox = self.bboxes[index]
+        keyframe = self.keyframes[index]
+        keyframe['do_not_collate'] = True
+        label = keyframe['action_id']
+        return rgb, bbox, label, keyframe
+
+
+class Manager_prepared_krgb(object):
+    # Works with K-RGB (preextracted RGB keyframes)
+    def __init__(self, keyframes_rgb_fold, dataset):
+        krgb_prefix = Path(keyframes_rgb_fold)
+        self.krgb_array = np.load(krgb_prefix/'rgb.npy')
+        self.krgb_dict_outputs = \
+                small.load_pkl(krgb_prefix/'dict_outputs.pkl')
+        self.krgb_bboxes = np.vstack(self.krgb_dict_outputs['bboxes'])
+        self.keyframes = create_keyframelist(dataset)
+
+    def get_krgb_tdataset(self, vids: List[Vid_daly]):
+        inds_kf = [i for i, kf in enumerate(self.keyframes)
+                if kf['vid'] in vids]
+        krgb_array = self.krgb_array[inds_kf]
+        krgb_bboxes = self.krgb_bboxes[inds_kf]
+        keyframes = [self.keyframes[i] for i in inds_kf]
+        tdataset = TDataset_over_krgb(
+            krgb_array, krgb_bboxes, keyframes)
+        return tdataset
+
+    def get_train_loader(self, vids, batch_size, initial_seed):
+        tdataset = self.get_krgb_tdataset(vids)
+        train_sampler_rgen = np.random.default_rng(initial_seed)
+        sampler = NumpyRandomSampler(tdataset, train_sampler_rgen)
+        loader = torch.utils.data.DataLoader(tdataset,
+                batch_size=batch_size,
+                num_workers=0, pin_memory=True,
+                sampler=sampler, shuffle=False,
+                collate_fn=sequence_batch_collate_v2)
+        return loader
+
+    def get_eval_loader(self, vids, batch_size):
+        tdataset = self.get_krgb_tdataset(vids)
+        loader = torch.utils.data.DataLoader(tdataset,
+                batch_size=batch_size, shuffle=False,
+                num_workers=0, pin_memory=True,
+                drop_last=False,
+                collate_fn=sequence_batch_collate_v2)
+        return loader, tdataset.keyframes
+
+
+def _krgb_convert_data_input(data_input, norm_mean_cu, norm_std_cu):
+    rgbs, bboxes_t, labels, keyframes = data_input
+    frame_list_f32c = [to_gpu_normalize_permute(
+            rgbs, norm_mean_cu, norm_std_cu)]
+    bboxes0_t = add_roi_batch_indices(bboxes_t)
+    bboxes0_c = bboxes0_t.type(torch.cuda.FloatTensor)
+    labels_c = labels.cuda()
+    return frame_list_f32c, bboxes0_c, labels_c
+
+
+def _krgb_obtain_eval_softmaxes(
+        model, eval_krgb_loader, norm_mean_cu, norm_std_cu):
+    all_softmaxes_ = []
+    for i_batch, (data_input) in enumerate(eval_krgb_loader):
+        frame_list_f32c, bboxes0_c, labels_c = _krgb_convert_data_input(
+                data_input, norm_mean_cu, norm_std_cu)
+        with torch.no_grad():
+            result = model(frame_list_f32c, bboxes0_c)
+        pred = result['x_final']
+        pred_np = pred.cpu().numpy()
+        all_softmaxes_.append(pred_np)
+    all_softmaxes = np.vstack(all_softmaxes_)
+    return all_softmaxes
+
+# Evaluation
+
+
+# finetune_preextracted_krgb
+
+
+class TrainLooper_finetune_krgb(object):
+    def __init__(self, man_mtrainer):
+        self.man_mtrainer = man_mtrainer
+
+    def train_batch_step(self, data_input):
+        man_mtrainer = self.man_mtrainer
+        frame_list_f32c, bboxes0_c, labels_c = \
+            _krgb_convert_data_input(
+                data_input,
+                self.man_mtrainer.norm_mean_cu,
+                self.man_mtrainer.norm_std_cu)
+        result = man_mtrainer.model(frame_list_f32c, bboxes0_c)
+        pred_train = result['x_final']
+        loss = man_mtrainer.loss_fn(pred_train, labels_c)
+        man_mtrainer.optimizer.zero_grad()
+        loss.backward()
+        man_mtrainer.optimizer.step()
+        return loss
+
+    def eval_step(self, eval_krgb_loader,
+            keyframes_eval,
+            tubes_dwein_eval: Dict[I_dwein, T_dwein],
+            tubes_dgt_eval: Dict[I_dgt, T_dgt],
+            dataset: Dataset_daly_ocv):
+        man_mtrainer = self.man_mtrainer
+        eval_timers = snippets.TicToc(
+                ['softmaxes', 'acc_roc', 'cheat_app'])
+        # Obtain softmaxes
+        eval_timers.tic('softmaxes')
+        all_softmaxes = _krgb_obtain_eval_softmaxes(
+                man_mtrainer.model,
+                eval_krgb_loader,
+                man_mtrainer.norm_mean_cu,
+                man_mtrainer.norm_std_cu)
+        eval_timers.toc('softmaxes')
+        # Evaluate and print
+        eval_timers.tic('acc_roc')
+        gt_ids = np.array(
+                [k['action_id'] for k in keyframes_eval])
+        kf_acc, kf_roc_auc = keyframe_cls_scores(all_softmaxes, gt_ids)
+        eval_timers.toc('acc_roc')
+        eval_timers.tic('cheat_app')
+        av_stubes_cheat: AV_dict[T_dwein_scored] = \
+            cheating_tube_scoring(
+                all_softmaxes, keyframes_eval,
+                tubes_dwein_eval, dataset)
+        df_ap_cheat, df_recall_cheat = \
+            quick_tube_eval(av_stubes_cheat, tubes_dgt_eval)
+        eval_timers.toc('cheat_app')
+
+        df_ap_cheat = (df_ap_cheat*100).round(2)
+        cheating_apline = '/'.join(
+                df_ap_cheat.loc['all'].values.astype(str))
+        log.info(' '.join((
+            'K. Acc: {:.2f};'.format(kf_acc*100),
+            'RAUC: {:.2f};'.format(kf_roc_auc*100),
+            'AP (cheating tubes): {}'.format(cheating_apline)
+        )))
+        log.info('Eval_timers: {}'.format(eval_timers.time_str))
+
+
+# finetune_on_tubefeats
+
+def _prepare_labeled_connections(
+        cf, dataset, tubes_dwein_train, dwti_to_label_train):
+    # Frames to cover: keyframes and every 4th frame
+    vids = list(dataset.videos_ocv.keys())
+    frames_to_cover: Dict[Vid_daly, np.ndarray] = \
+            get_daly_keyframes_to_cover(dataset, vids,
+                    cf['frame_coverage.keyframes'],
+                    cf['frame_coverage.subsample'])
+    cs_vf_train_unlabeled: \
+            Dict[Tuple[Vid_daly, int], Box_connections_dwti]
+    cs_vf_train_unlabeled = group_tubes_on_frame_level(
+            tubes_dwein_train, frames_to_cover)
+    # Add labels
+    cls_vf_train: Dict[Tuple[Vid_daly, int], Bc_dwti_labeled] = {}
+    for (vid, f), bc_dwti in cs_vf_train_unlabeled.items():
+        good_i = []
+        labels = []
+        for i, dwti in enumerate(bc_dwti['dwti_sources']):
+            if dwti in dwti_to_label_train:
+                label = dwti_to_label_train[dwti]
+                good_i.append(i)
+                labels.append(label)
+        if len(good_i):
+            vid = bc_dwti['vid']
+            frame_ind = bc_dwti['frame_ind']
+            boxes = [bc_dwti['boxes'][i] for i in good_i]
+            dwti_sources = [bc_dwti['dwti_sources'][i] for i in good_i]
+            bc_dwti_labeled: Bc_dwti_labeled = {
+                    'vid': vid,
+                    'frame_ind': frame_ind,
+                    'dwti_sources': dwti_sources,
+                    'boxes': boxes,
+                    'labels': np.array(labels)}
+            cls_vf_train[(vid, f)] = bc_dwti_labeled
+    return cls_vf_train
+
+
 # EXPERIMENTS
 
-def tubefeats_train_model(workfolder, cfg_dict, add_args):
-    out, = snippets.get_subfolders(workfolder, ['out'])
-    cfg = snippets.YConfig(cfg_dict)
-    Ncfg_daly.set_defcfg(cfg)
-    cfg.set_deftype("""
-    seed: [42, int]
-    inputs:
-        tubes_dwein: [~, str]
-    frame_coverage:
-        keyframes: [True, bool]
-        subsample: [4, int]
-    split_assignment: ['train/val', ['train/val', 'trainval/test']]
-    """)
-    cfg.set_defaults("""
-    train:
-        lr: 1.0e-5
-        weight_decay: 5.0e-2
-        n_epochs: 120
-        tubes_per_batch: 500
-        frames_per_tube: 2
-        period:
-            log: '::1'
-            eval:
-                trainset: '::'
-                evalset: '0::20'
-    """)
-    cf = cfg.parse()
-    initial_seed = cf['seed']
-
-    dataset: Dataset_daly_ocv = Ncfg_daly.get_dataset(cf)
-    vgroup = Ncfg_daly.get_vids(cf, dataset)
-    sset_train, sset_eval = cf['split_assignment'].split('/')
-    tubes_dwein_d, tubes_dgt_d = load_gt_and_wein_tubes(
-            cf['inputs.tubes_dwein'], dataset, vgroup)
-
-    # Training
-    torch.manual_seed(initial_seed)
-    torch.cuda.manual_seed(initial_seed)
-    rgen = np.random.default_rng(initial_seed)
-
-    loss_fn = torch.nn.CrossEntropyLoss(reduction='mean')
-    optimizer = torch.optim.AdamW(model.parameters(),
-            lr=cf['train.lr'], weight_decay=cf['train.weight_decay'])
-    period_log = cf['train.period.log']
-    n_epochs = cf['train.n_epochs']
-    tubes_per_batch = cf['train.tubes_per_batch']
-    frames_per_tube = cf['train.frames_per_tube']
-    model.train()
-
-    BATCH_SIZE = 12
-    NUM_WORKERS = 8
-    for epoch in range(n_epochs):
-        tdataset_cl = TD_over_cl(cls_vf_train, dataset,
-                sampler_grid, frameloader_vsf)
-        loader = torch.utils.data.DataLoader(tdataset_cl,
-                batch_size=BATCH_SIZE, shuffle=True,
-                num_workers=NUM_WORKERS, pin_memory=True,
-                collate_fn=sequence_batch_collate_v2)
-        for i_batch, (data_input) in enumerate(loader):
-            frame_list, metas, = data_input
-            frame_list_f32c = [
-                to_gpu_normalize_permute(
-                    x, norm_mean_t, norm_std_t) for x in frame_list]
-            # bbox transformations
-            bboxes_np = [m['bboxes_tldr'] for m in metas]
-            counts = np.array([len(x) for x in bboxes_np])
-            batch_indices = np.repeat(np.arange(len(counts)), counts)
-            bboxes0 = np.c_[batch_indices, np.vstack(bboxes_np)]
-            bboxes0 = torch.from_numpy(bboxes0)
-            bboxes0_c = bboxes0.type(torch.cuda.FloatTensor)
-
-            # labels
-            labels_np = [m['labels'] for m in metas]
-            labels_np = np.hstack(labels_np)
-            labels_t = torch.from_numpy(labels_np)
-            labels_cuda = labels_t.cuda()
-
-            # pred
-            pred_train = model(frame_list_f32c, bboxes0_c)
-
-            # loss
-            loss = loss_fn(pred_train, labels_cuda)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-            Nb = len(loader)
-            log.info(f'{epoch=}, {i_batch=}/{Nb}: loss {loss.item()}')
-        if snippets.check_step_sslice(epoch, period_log):
-            model.eval()
-            # kacc_train = _quick_kf_eval(tkfeats_train, model, True)*100
-            # kacc_eval = _quick_kf_eval(tkfeats_eval, model, True)*100
-            model.train()
-            # log.info(f'{epoch}: {loss.item()} '
-            #         f'{kacc_train=:.2f} {kacc_eval=:.2f}')
-            log.info(f'{epoch}: {loss.item()} ')
-
-
 def finetune_preextracted_krgb(workfolder, cfg_dict, add_args):
+    """
+    Will finetune the c2d_1x1 model on preeextracted krgb frames only
+    """
     out, = snippets.get_subfolders(workfolder, ['out'])
     cfg = snippets.YConfig(cfg_dict)
     Ncfg_daly.set_defcfg(cfg)
@@ -938,21 +823,28 @@ def finetune_preextracted_krgb(workfolder, cfg_dict, add_args):
     cf = cfg.parse()
     initial_seed = cf['seed']
 
+    # General DALY level preparation
     dataset: Dataset_daly_ocv = Ncfg_daly.get_dataset(cf)
-    vgroup = Ncfg_daly.get_vids(cf, dataset)
+    vgroup: Dict[str, List[Vid_daly]] = Ncfg_daly.get_vids(cf, dataset)
     sset_train, sset_eval = cf['split_assignment'].split('/')
+    # wein tubes
     tubes_dwein_d, tubes_dgt_d = load_gt_and_wein_tubes(
             cf['inputs.tubes_dwein'], dataset, vgroup)
     tubes_dwein_eval = tubes_dwein_d[sset_eval]
     tubes_dgt_eval = tubes_dgt_d[sset_eval]
-
     # precomputed rgb
-    train_krgb_loader, eval_krgb_loader, keyframes_sseval = \
-        _prepare_krgb_datas(cf, dataset, vgroup, sset_train, sset_eval)
+    man_krgb = Manager_prepared_krgb(
+            cf['inputs.keyframes_rgb'], dataset)
+    train_krgb_loader = man_krgb.get_train_loader(
+        vgroup[sset_train], cf['train.batch_size.train'], initial_seed)
+    eval_krgb_loader, eval_krgb_keyframes = man_krgb.get_eval_loader(
+        vgroup[sset_eval], cf['train.batch_size.eval'])
 
+    # Training
     torch.manual_seed(initial_seed)
     torch.cuda.manual_seed(initial_seed)
-    man_mtrainer = Manager_model_trainer(cf)
+    man_mtrainer = Manager_model_trainer()
+    man_mtrainer.create_model_and_such(cf, 10)
     man_mtrainer.model.init_weights(0.01, seed=initial_seed)
     man_mtrainer.model_to_gpu()
 
@@ -969,17 +861,203 @@ def finetune_preextracted_krgb(workfolder, cfg_dict, add_args):
     start_epoch = (man_mtrainer.man_ckpt
             .restore_model_magic(checkpoint_path))
 
-    man_mtrainer.set_train()
+    train_looper = TrainLooper_finetune_krgb(man_mtrainer)
     for i_epoch in range(start_epoch, n_epochs):
+        # Train part
+        man_mtrainer.set_train()
         for i_batch, (data_input) in enumerate(train_krgb_loader):
-            loss = man_mtrainer.batch_forward(data_input)
+            loss = train_looper.train_batch_step(data_input)
             if snippets.check_step_sslice(
                     i_batch, period_ibatch_loss_log):
                 Nb = len(train_krgb_loader)
                 log.info(f'{i_epoch=}, {i_batch=}/{Nb}: loss {loss.item()}')
         man_mtrainer.man_ckpt.save_epoch(rundir, i_epoch)
+        # Eval part
         man_mtrainer.set_eval()
         log.info(f'Perf at {i_epoch=}')
-        man_mtrainer.evaluate_print(eval_krgb_loader, keyframes_sseval,
-                dataset, tubes_dgt_eval, tubes_dwein_eval)
+        train_looper.eval_step(eval_krgb_loader, eval_krgb_keyframes,
+            tubes_dwein_eval, tubes_dgt_eval, dataset)
+
+
+def finetune_on_tubefeats(workfolder, cfg_dict, add_args):
+    """
+    Will finetune the c2d_1x1 model directly on video frames
+    """
+    out, = snippets.get_subfolders(workfolder, ['out'])
+    cfg = snippets.YConfig(cfg_dict)
+    Ncfg_daly.set_defcfg(cfg)
+    cfg.set_deftype("""
+    seed: [42, int]
+    inputs:
+        tubes_dwein: [~, str]
+        keyframes_rgb: [~, str]
+    frame_coverage:
+        keyframes: [True, bool]
+        subsample: [4, int]
+    split_assignment: ['train/val', ['train/val', 'trainval/test']]
+    """)
+    cfg.set_defaults("""
+    freeze:
+        level: -1
+        freeze_bn: False
+    debug_outputs: False
+    ll_dropout: 0.5
+    train:
+        lr: 1.0e-5
+        weight_decay: 5.0e-2
+        batch_size:
+            train: 32
+            eval: 64
+        n_epochs: 40
+    period:
+        train_iepoch:
+            log: '::1'
+            eval_krgb:
+                trainset: '0::1'
+                evalset: '0::1'
+        train_ibatch:
+            log: '0::1'
+            eval_krgb:
+                trainset: '::'
+                evalset: '0::10'
+    cull:
+        train: ~
+        eval: ~
+    """)
+    cf = cfg.parse()
+    initial_seed = cf['seed']
+
+    dataset: Dataset_daly_ocv = Ncfg_daly.get_dataset(cf)
+    vgroup = Ncfg_daly.get_vids(cf, dataset)
+    sset_train, sset_eval = cf['split_assignment'].split('/')
+    # precomputed rgbs for keyframes
+    man_krgb = Manager_prepared_krgb(
+            cf['inputs.keyframes_rgb'], dataset)
+    eval_krgb_loader, eval_krgb_keyframes = man_krgb.get_eval_loader(
+        vgroup[sset_eval], cf['train.batch_size.eval'])
+    # wein tubes
+    tubes_dwein_d, tubes_dgt_d = load_gt_and_wein_tubes(
+            cf['inputs.tubes_dwein'], dataset, vgroup)
+    tubes_dwein_train = tubes_dwein_d[sset_train]
+    tubes_dwein_eval = tubes_dwein_d[sset_eval]
+    tubes_dgt_eval = tubes_dgt_d[sset_eval]
+    # tube preparation
+    dwti_to_label_train: Dict[I_dgt, int]
+    cls_labels, dwti_to_label_train = qload_synthetic_tube_labels(
+            tubes_dgt_d[sset_train], tubes_dwein_d[sset_train], dataset)
+    cls_vf_train: Dict[Tuple[Vid_daly, int], Bc_dwti_labeled] = \
+            _prepare_labeled_connections(
+                cf, dataset, tubes_dwein_train, dwti_to_label_train)
+
+    man_mtrainer = Manager_model_trainer()
+    sf_cfg = man_mtrainer.sf_cfg
+    # Sampling stuff
+    model_nframes = sf_cfg.DATA.NUM_FRAMES
+    model_sample = sf_cfg.DATA.SAMPLING_RATE
+    slowfast_alpha = sf_cfg.SLOWFAST.ALPHA
+
+    sampler_grid = Sampler_grid(model_nframes, model_sample)
+    frameloader_vsf = Frameloader_video_slowfast(
+            False, slowfast_alpha, 256)
+    # Training
+    torch.manual_seed(initial_seed)
+    torch.cuda.manual_seed(initial_seed)
+    rgen = np.random.default_rng(initial_seed)
+    train_sampler_rgen = np.random.default_rng(initial_seed)
+    man_mtrainer.create_model_and_such(cf, 11)
+    man_mtrainer.model.init_weights(0.01, seed=initial_seed)
+    man_mtrainer.model_to_gpu()
+
+    n_epochs = cf['train.n_epochs']
+
+    man_mtrainer.set_train()
+
+    BATCH_SIZE = 32
+    NUM_WORKERS = 8
+    period_train_ibatch_log = cf['period.train_ibatch.log']
+    period_train_ibatch_eval_krgb_evalset = cf['period.train_ibatch.eval_krgb.evalset']
+    for i_epoch in range(n_epochs):
         man_mtrainer.set_train()
+        td_bc_labeled = TDataset_over_box_connections_w_labels(
+            cls_vf_train, dataset, sampler_grid, frameloader_vsf)
+        sampler = NumpyRandomSampler(td_bc_labeled, train_sampler_rgen)
+        loader = torch.utils.data.DataLoader(td_bc_labeled,
+            batch_size=BATCH_SIZE, num_workers=NUM_WORKERS,
+            sampler=sampler, shuffle=False,
+            pin_memory=True,
+            collate_fn=sequence_batch_collate_v2)
+        for i_batch, (data_input) in enumerate(loader):
+            frame_list, metas, = data_input
+            frame_list_f32c = [
+                to_gpu_normalize_permute(
+                    x, man_mtrainer.norm_mean_cu,
+                    man_mtrainer.norm_std_cu) for x in frame_list]
+            # bbox transformations
+            bboxes_np = [m['bboxes_tldr'] for m in metas]
+            counts = np.array([len(x) for x in bboxes_np])
+            batch_indices = np.repeat(np.arange(len(counts)), counts)
+            bboxes0 = np.c_[batch_indices, np.vstack(bboxes_np)]
+            bboxes0 = torch.from_numpy(bboxes0)
+            bboxes0_c = bboxes0.type(torch.cuda.FloatTensor)
+
+            # labels
+            labels_np = [m['labels'] for m in metas]
+            labels_np = np.hstack(labels_np)
+            labels_t = torch.from_numpy(labels_np)
+            labels_cuda = labels_t.cuda()
+
+            # pred
+            result = man_mtrainer.model(frame_list_f32c, bboxes0_c)
+            pred_train = result['x_final']
+            pass
+
+            # loss
+            loss = man_mtrainer.loss_fn(pred_train, labels_cuda)
+            man_mtrainer.optimizer.zero_grad()
+            loss.backward()
+            man_mtrainer.optimizer.step()
+
+            Nb = len(loader)
+            if snippets.check_step_sslice(
+                    i_batch, period_train_ibatch_log):
+                log.info(f'{i_epoch=}, {i_batch=}/{Nb}: loss {loss.item()}')
+            if snippets.check_step_sslice(
+                    i_batch, period_train_ibatch_eval_krgb_evalset):
+                log.info(f'Perf at {i_epoch=}, {i_batch=}/{Nb}:')
+                # KRGB evaluation
+                man_mtrainer.set_eval()
+                all_softmaxes = _krgb_obtain_eval_softmaxes(
+                        man_mtrainer.model,
+                        eval_krgb_loader,
+                        man_mtrainer.norm_mean_cu,
+                        man_mtrainer.norm_std_cu)
+                # Cut off bg dimension
+                all_softmaxes_nobg = all_softmaxes[:, :-1]
+                gt_ids = np.array(
+                        [k['action_id'] for k in eval_krgb_keyframes])
+                # accuracy
+                preds = np.argmax(all_softmaxes_nobg, axis=1)
+                kf_acc = accuracy_score(gt_ids, preds)
+                # ap
+                av_stubes_cheat: AV_dict[T_dwein_scored] = \
+                    cheating_tube_scoring(
+                        all_softmaxes_nobg, eval_krgb_keyframes,
+                        tubes_dwein_eval, dataset)
+                df_ap_cheat, df_recall_cheat = \
+                    quick_tube_eval(av_stubes_cheat, tubes_dgt_eval)
+                df_ap_cheat = (df_ap_cheat*100).round(2)
+                cheating_apline = '/'.join(
+                        df_ap_cheat.loc['all'].values.astype(str))
+                log.info(' '.join((
+                    'K. Acc: {:.2f};'.format(kf_acc*100),
+                    'AP (cheating tubes): {}'.format(cheating_apline)
+                )))
+        # if snippets.check_step_sslice(epoch, period_log):
+        #     pass
+        #     model.eval()
+        #     # kacc_train = _quick_kf_eval(tkfeats_train, model, True)*100
+        #     # kacc_eval = _quick_kf_eval(tkfeats_eval, model, True)*100
+        #     model.train()
+        #     # log.info(f'{epoch}: {loss.item()} '
+        #     #         f'{kacc_train=:.2f} {kacc_eval=:.2f}')
+        #     log.info(f'{epoch}: {loss.item()} ')

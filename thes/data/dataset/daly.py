@@ -33,7 +33,7 @@ class Ncfg_daly:
         return dataset
 
     @staticmethod
-    def get_vids(cf, dataset):
+    def get_vids(cf, dataset) -> Dict[str, List[Vid_daly]]:
         v_fraction = cf['dataset.val_split.fraction']
         v_nsamplings = cf['dataset.val_split.nsamplings']
         v_seed = cf['dataset.val_split.seed']

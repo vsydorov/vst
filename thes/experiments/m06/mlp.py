@@ -2,11 +2,10 @@ import numpy as np
 import pandas as pd
 import logging
 from pathlib import Path
-from typing import (Dict, Any, Optional, List, cast, Tuple)
 from sklearn.preprocessing import (StandardScaler)
-from sklearn.metrics import (
-    accuracy_score, roc_auc_score)
-from scipy.special import softmax
+from sklearn.metrics import (accuracy_score,)
+from typing import (  # NOQA
+        Dict, Any, Optional, List, cast, Tuple, TypedDict, Iterable)
 
 import torch
 import torch.nn as nn
@@ -15,34 +14,37 @@ import torch.nn.functional as F
 
 from vsydorov_tools import small
 
-import slowfast.utils.weight_init_helper as init_helper
-
 from thes.data.dataset.daly import (
     Ncfg_daly, load_gt_and_wein_tubes)
 from thes.data.dataset.external import (
-    Dataset_daly_ocv, Vid_daly,
-    get_daly_split_vids, split_off_validation_set, Action_name_daly)
+    Dataset_daly_ocv, Vid_daly)
 from thes.data.tubes.types import (
     I_dwein, T_dwein, T_dwein_scored, I_dgt, T_dgt,
-    get_daly_gt_tubes, remove_hard_dgt_tubes, push_into_avdict,
-    AV_dict, loadconvert_tubes_dwein, Objaction_dets,
-    dtindex_filter_split, av_stubes_above_score,
-    Box_connections_dwti)
+    AV_dict, Box_connections_dwti)
 from thes.data.tubes.routines import (
-    score_ftubes_via_objaction_overlap_aggregation,
-    create_kinda_objaction_struct,
     qload_synthetic_tube_labels)
-from thes.data.tubes.nms import (
-    compute_nms_for_av_stubes,)
-from thes.evaluation.recall import (
-    compute_recall_for_avtubes_as_dfs,)
-from thes.evaluation.ap.convert import (
-    compute_ap_for_avtubes_as_df)
+from thes.evaluation.meta import (
+    keyframe_cls_scores, cheating_tube_scoring, quick_tube_eval)
 from thes.tools import snippets
-from thes.pytorch import (sequence_batch_collate_v2,
-        default_collate, NumpyRandomSampler)
+from thes.pytorch import (
+    sequence_batch_collate_v2, NumpyRandomSampler)
 
 log = logging.getLogger(__name__)
+
+
+# Envelopes for keyframe evaluation
+
+
+class E_kfeats(TypedDict):
+    X: np.ndarray
+    Y: np.ndarray
+    kf: dict
+
+
+class E_tkfeats(TypedDict):
+    X: torch.Tensor
+    Y: torch.Tensor
+    kf: dict
 
 
 class Ncfg_kfeats:
@@ -67,16 +69,16 @@ class Ncfg_kfeats:
         return result
 
     @staticmethod
-    def split_off_D(outputs, keyframes, vids):
+    def split_off_D(outputs, keyframes, vids) -> E_kfeats:
         global_kf_vids = [kf['vid'] for kf in keyframes]
-        d = dict()
-        d['X'] = Ncfg_kfeats.split_off(outputs, global_kf_vids, vids)
-        d['kf'] = Ncfg_kfeats.split_off(keyframes, global_kf_vids, vids)
-        d['Y'] = np.array([kf['action_id'] for kf in d['kf']])
+        X = Ncfg_kfeats.split_off(outputs, global_kf_vids, vids)
+        kf = Ncfg_kfeats.split_off(keyframes, global_kf_vids, vids)
+        Y = np.array([kf['action_id'] for kf in kf])
+        d: E_kfeats = {'X': X, 'kf': kf, 'Y': Y}
         return d
 
     @staticmethod
-    def load(cf, vgroup):
+    def load(cf, vgroup) -> Dict[str, E_kfeats]:
         # Produce keyframe datasets realquick
         featname = cf['inputs.keyframes.featname']
         keyframes_featfold = Path(cf['inputs.keyframes.fold'])
@@ -90,7 +92,7 @@ class Ncfg_kfeats:
         return kfeats_d
 
     @staticmethod
-    def to_torch(kfeats_d):
+    def to_torch(kfeats_d: Dict[str, E_kfeats]) -> Dict[str, E_tkfeats]:
         tkfeats_d = {}
         for sset, kfeats in kfeats_d.items():
             tkfeats = kfeats.copy()
@@ -262,17 +264,6 @@ def _quick_dataloader(BIG, batches, scaler):
     return loader
 
 
-def _quick_kf_eval(kfeat_t, model, cutoff_last_dim):
-    def _qacc(pred, Y):
-        return pred.argmax(1).eq(Y).sum().item()/len(Y)
-    with torch.no_grad():
-        pred_eval = model(kfeat_t['X'])['x_final']
-    if cutoff_last_dim:
-        pred_eval = pred_eval[:, :-1]
-    acc = _qacc(pred_eval, kfeat_t['Y'])
-    return acc
-
-
 class Data_access_big(object):
     def __init__(self, BIG, dwti_to_inds_big, scaler):
         self.BIG = BIG
@@ -297,7 +288,123 @@ class Data_access_big(object):
         return loader
 
 
-def _eval_tube_softmaxes(model, da_big, dwtis):
+class Train_sampler(object):
+    def train_step(self, model, optimizer, loss_fn, i_epoch):
+        raise NotImplementedError()
+
+
+class Full_train_sampler(Train_sampler):
+    def __init__(self, tkfeats_train):
+        self.tkfeats_train = tkfeats_train
+
+    def train_step(self, model, optimizer, loss_fn, i_epoch):
+        pred_train = model(self.tkfeats_train['X'])['x_final']
+        loss = loss_fn(pred_train, self.tkfeats_train['Y'])
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        return loss
+
+
+class TD_over_feats(torch.utils.data.Dataset):
+    def __init__(self, feats, labels, keyframes):
+        self.feats = feats
+        self.labels = labels
+        self.keyframes = keyframes
+
+    def __len__(self):
+        return len(self.feats)
+
+    def __getitem__(self, index):
+        feat = self.feats[index]
+        label = self.labels[index]
+        keyframe = self.keyframes[index]
+        keyframe['do_not_collate'] = True
+        return feat, label, keyframe
+
+
+class Partial_Train_sampler(Train_sampler):
+    def __init__(self, tkfeats_train, initial_seed, TRAIN_BATCH_SIZE):
+        td_sstrain = TD_over_feats(
+                tkfeats_train['X'],
+                tkfeats_train['Y'],
+                tkfeats_train['kf'])
+        train_sampler_rgen = np.random.default_rng(initial_seed)
+        sampler = NumpyRandomSampler(td_sstrain, train_sampler_rgen)
+
+        self.train_krgb_loader = torch.utils.data.DataLoader(td_sstrain,
+                batch_size=TRAIN_BATCH_SIZE,
+                num_workers=0, pin_memory=True,
+                sampler=sampler, shuffle=False,
+                collate_fn=sequence_batch_collate_v2)
+        self.period_ibatch_loss_log = '0::10'
+
+    def train_step(self, model, optimizer, loss_fn, i_epoch):
+        for i_batch, (data_input) in enumerate(self.train_krgb_loader):
+            feats, labels, keyframes = data_input
+            result = model(feats)
+            pred_train = result['x_final']
+            loss = loss_fn(pred_train, labels)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            if snippets.check_step_sslice(
+                    i_batch, self.period_ibatch_loss_log):
+                Nb = len(self.train_krgb_loader)
+                log.info(f'{i_epoch=}, {i_batch=}/{Nb}: loss {loss.item()}')
+        return loss
+
+
+def define_mlp_model(cf, D_in, D_out):
+    dropout_rate = cf['net.ll_dropout']
+    if cf['net.kind'] == 'layer0':
+        model = Net_mlp_zerolayer(
+            D_in, D_out, dropout_rate)
+    elif cf['net.kind'] == 'layer1':
+        model = Net_mlp_onelayer(
+            D_in, D_out, cf['net.layer1.H'], dropout_rate)
+    return model
+
+
+def _tubefeats_display_evalresults(result, sset_eval):
+    acc_flattube_synt = result['acc_flattube_synt']
+    df_ap_full = (result['df_ap_full']*100).round(2)
+    apline = '/'.join(df_ap_full.loc['all'].values.astype(str))
+    log.info('Tube evaluation results ({}): '.format(sset_eval))
+    log.debug('AP (full tube tubes):\n{}'.format(df_ap_full))
+    log.info(' '.join(
+        ('Flattube synthetic acc: {:.2f};'.format(acc_flattube_synt*100),
+        'Full tube AP357: {}'.format(apline))))
+
+
+def _mlp_set_defaults(cfg):
+    cfg.set_deftype("""
+    split_assignment: ['train/val', ['train/val', 'trainval/test']]
+    seed: [42, int]
+    inputs:
+        tubes_dwein: [~, str]
+        big:
+            fold: [~, ~]
+    data_scaler: ['keyframes', ['keyframes', 'no']]
+    net:
+        kind: ['layer1', ['layer0', 'layer1']]
+        layer1:
+            H: [32, int]
+        ll_dropout: [0.5, float]
+    """)
+
+
+# Inference
+
+
+def _predict_softmaxes_for_dwein_tubes_in_da_big(
+        model,
+        da_big: Data_access_big,
+        dwtis: Iterable[I_dwein]
+        ) -> Dict[I_dwein, np.ndarray]:
+    """
+    Predict softmaxes for dwein tubes in Data_access_big
+    """
     tube_sofmaxes = {}
     model.eval()
     with torch.no_grad():
@@ -307,23 +414,50 @@ def _eval_tube_softmaxes(model, da_big, dwtis):
     return tube_sofmaxes
 
 
-def _compute_flattube_syntlabel_acc(tube_softmaxes, dwti_to_label):
-    # Assert absence of background cls
+# Evaluation
+
+
+def _quick_accuracy_over_kfeat(
+        tkfeats: E_tkfeats, model, cutoff_last_dim):
+    """
+    Quick evaluation of E_tkfeat accuracy via torch methods
+    """
+    def _qacc(pred, Y):
+        return pred.argmax(1).eq(Y).sum().item()/len(Y)
+    with torch.no_grad():
+        pred_eval = model(tkfeats['X'])['x_final']
+    if cutoff_last_dim:
+        pred_eval = pred_eval[:, :-1]
+    acc = _qacc(pred_eval, tkfeats['Y'])
+    return acc
+
+
+def _compute_flattube_syntlabel_acc(
+        tube_softmaxes: Dict[I_dwein, np.ndarray],
+        dwti_to_label: Dict[I_dwein, int]) -> float:
+    """
+    Compute synthetic per-frame accuracy over dwein tubes
+    """
+    # Assert presence of background cls
     x = next(iter(tube_softmaxes.values()))
     assert x.shape[-1] == 11
 
-    flat_sm = []
-    flat_label = []
+    flat_sm_ = []
+    flat_label_ = []
     for dwti, label in dwti_to_label.items():
         softmaxes = tube_softmaxes[dwti]
-        flat_sm.append(softmaxes)
-        flat_label.append(np.repeat(label, len(softmaxes)))
-    flat_sm = np.vstack(flat_sm)
-    flat_label = np.hstack(flat_label)
+        flat_sm_.append(softmaxes)
+        flat_label_.append(np.repeat(label, len(softmaxes)))
+    flat_sm = np.vstack(flat_sm_)
+    flat_label = np.hstack(flat_label_)
     return accuracy_score(flat_label, flat_sm.argmax(axis=1))
 
 
-def _quick_fulltube_assign(tubes_dwein, tube_softmaxes, dataset):
+def _quick_assign_scores_to_dwein_tubes(
+        tubes_dwein: Dict[I_dwein, T_dwein],
+        tube_softmaxes: Dict[I_dwein, np.ndarray],
+        dataset: Dataset_daly_ocv
+        ) -> AV_dict[T_dwein_scored]:
     """
     Softmaxes should correspond to dataset.action_names
     """
@@ -337,7 +471,7 @@ def _quick_fulltube_assign(tubes_dwein, tube_softmaxes, dataset):
         scores = softmaxes.mean(axis=0)
         (vid, bunch_id, tube_id) = dwt_index
         for action_name, score in zip(dataset.action_names, scores):
-            stube = tube.copy()
+            stube = cast(T_dwein_scored, tube.copy())
             stube['score'] = score
             stube = cast(T_dwein_scored, stube)
             (av_stubes
@@ -345,51 +479,135 @@ def _quick_fulltube_assign(tubes_dwein, tube_softmaxes, dataset):
                     .setdefault(vid, []).append(stube))
     return av_stubes
 
-def _quick_tubeval(av_stubes, tubes_dgt):
-    av_stubes_ = av_stubes_above_score(av_stubes, 0.0)
-    av_stubes_ = compute_nms_for_av_stubes(av_stubes_, 0.3)
-    iou_thresholds = [.3, .5, .7]
-    av_gt_tubes_test: AV_dict[T_dgt] = push_into_avdict(tubes_dgt)
-    df_ap_s_nodiff = compute_ap_for_avtubes_as_df(
-            av_gt_tubes_test, av_stubes_, iou_thresholds, False, False)
-    return df_ap_s_nodiff
+
+def _tubefeats_trainset_perf(
+        model,
+        da_big: Data_access_big,
+        dwti_to_label_train: Dict[I_dwein, int]):
+    with small.QTimer() as t:
+        tube_sofmaxes_train: Dict[I_dwein, np.ndarray] = \
+            _predict_softmaxes_for_dwein_tubes_in_da_big(
+                model, da_big, dwti_to_label_train.keys())
+        acc_full_train = _compute_flattube_syntlabel_acc(
+                tube_sofmaxes_train, dwti_to_label_train)
+    tsec = t.time
+    return acc_full_train, tsec
+
+
+def _tubefeats_evalset_perf(
+        model,
+        da_big: Data_access_big,
+        dwti_to_label_eval: Dict[I_dwein, int],
+        dataset: Dataset_daly_ocv,
+        tubes_dwein_eval: Dict[I_dwein, T_dwein],
+        tubes_dgt_eval: Dict[I_dgt, T_dgt]
+            ) -> Dict:
+    tube_sofmaxes_eval: Dict[I_dwein, np.ndarray] = \
+        _predict_softmaxes_for_dwein_tubes_in_da_big(
+            model, da_big, tubes_dwein_eval.keys())
+    # Flat accuracy: only dwto_to_label_eval tubes and includes
+    # background cls, should be over 11 classes
+    acc_flattube_synt = _compute_flattube_syntlabel_acc(
+            tube_sofmaxes_eval, dwti_to_label_eval)
+    # MAP: all tubes in tubes_dwein_eval, excludes background (last cls)
+    tube_sofmaxes_eval_nobg = {k: v[:, :-1]
+            for k, v in tube_sofmaxes_eval.items()}
+    av_stubes_eval: AV_dict[T_dwein_scored] = \
+        _quick_assign_scores_to_dwein_tubes(
+            tubes_dwein_eval, tube_sofmaxes_eval_nobg, dataset)
+    df_ap_full, _ = quick_tube_eval(av_stubes_eval, tubes_dgt_eval)
+    result = {'acc_flattube_synt': acc_flattube_synt,
+            'df_ap_full': df_ap_full}
+    return result
+
+
+# kffeats_train_mlp
+
+
+def _kffeats_train_mlp_single_run(
+        cf, initial_seed, da_big,
+        tkfeats_train: E_tkfeats,
+        tkfeats_eval: E_tkfeats,
+        tubes_dwein_eval, tubes_dgt_eval,
+        dataset, sset_eval):
+
+    torch.manual_seed(initial_seed)
+    period_log = cf['train.period.log']
+    period_eval_evalset = cf['train.period.eval']
+
+    n_epochs = cf['train.n_epochs']
+    D_in = tkfeats_train['X'].shape[-1]
+    model = define_mlp_model(cf, D_in, 10)
+    model.init_weights(0.01, initial_seed)
+
+    loss_fn = torch.nn.CrossEntropyLoss(reduction='mean')
+    optimizer = torch.optim.AdamW(model.parameters(),
+            lr=cf['train.lr'], weight_decay=cf['train.weight_decay'])
+
+    trsampler: Train_sampler
+    if cf['train.mode'] == 'full':
+        trsampler = Full_train_sampler(tkfeats_train)
+    elif cf['train.mode'] == 'partial':
+        train_batch_size = cf['train.partial.train_batch_size']
+        trsampler = Partial_Train_sampler(
+                tkfeats_train, initial_seed, train_batch_size)
+    else:
+        raise NotImplementedError()
+
+    def evaluate(i_epoch):
+        model.eval()
+        result = _kffeats_eval(
+                cf, model, da_big, tkfeats_train, tkfeats_eval,
+                tubes_dwein_eval, tubes_dgt_eval, dataset)
+        model.train()
+        log.info(f'Perf at {i_epoch=}')
+        _kffeats_display_evalresults(result, sset_eval)
+        return result
+
+    for i_epoch in range(n_epochs):
+        loss = trsampler.train_step(model, optimizer, loss_fn, i_epoch)
+        if snippets.check_step_sslice(i_epoch, period_log):
+            model.eval()
+            kacc_train = _quick_accuracy_over_kfeat(tkfeats_train, model, False)
+            kacc_eval = _quick_accuracy_over_kfeat(tkfeats_eval, model, False)
+            model.train()
+            log.info(f'{i_epoch}: {loss.item():.4f} '
+                    f'K.Acc.Train: {kacc_train*100:.2f}; '
+                    f'K.Acc.Eval: {kacc_eval*100:.2f}')
+        if snippets.check_step_sslice(i_epoch, period_eval_evalset):
+            result = evaluate(i_epoch)
+    result = evaluate(i_epoch)
+    return result
 
 
 def _kffeats_eval(
-        cf, model, da_big, tkfeats_train, tkfeats_eval,
-        tubes_dwein_eval, tubes_dgt_eval, dataset):
-    # // Proxy results: Evaluation of kf classifier (acc, rauc) and cheating
-    # GT-overlap
-    kacc_train = _quick_kf_eval(tkfeats_train, model, False)
-    kacc_eval = _quick_kf_eval(tkfeats_eval, model, False)
-    model.eval()
+        cf, model,
+        da_big: Data_access_big,
+        tkfeats_train: E_tkfeats,
+        tkfeats_eval: E_tkfeats,
+        tubes_dwein_eval: Dict[I_dwein, T_dwein],
+        tubes_dgt_eval: Dict[I_dgt, T_dgt],
+        dataset: Dataset_daly_ocv) -> Dict:
+    """
+    Evaluation of keyframe feats includes a lot of stuff:
+     + kacc_train, kacc_eval - runtime E_tkfeats perf
+     + kf_acc, kf_roc_auc - perf for classification of keyframes
+     + df_ap_cheat - perf for cheating evaluation
+     + acc_flattube_synt - synthetic per-frame accuracy of dwein tubes
+     + df_ap_full - perf for full evaluation
+    """
+    assert not model.training, 'Wrong results in train mode'
+    # Already softmax when in eval mode
     with torch.no_grad():
-        # Already softmax when in eval mode
         Y_test_softmax = model(tkfeats_eval['X'])['x_final'].numpy()
-    Y_test_pred = np.argmax(Y_test_softmax, axis=1)
-    kf_acc = accuracy_score(tkfeats_eval['Y'], Y_test_pred)
-
-    kf_roc_auc = roc_auc_score(tkfeats_eval['Y'],
-            Y_test_softmax, multi_class='ovr')
-    # // Tube evaluation (via fake GT intersection)
-    av_gt_tubes: AV_dict[T_dgt] = push_into_avdict(
-            tubes_dgt_eval)
-    objactions_vf = create_kinda_objaction_struct(
-            dataset, tkfeats_eval['kf'], Y_test_softmax)
-    # Assigning scores based on intersections
-    av_stubes: AV_dict[T_dwein_scored] = \
-        score_ftubes_via_objaction_overlap_aggregation(
-            dataset, objactions_vf, tubes_dwein_eval, 'iou',
-            0.1, 0.0, enable_tqdm=False)
-    av_stubes_ = av_stubes_above_score(
-            av_stubes, 0.0)
-    av_stubes_ = compute_nms_for_av_stubes(
-            av_stubes_, 0.3)
-    iou_thresholds = [.3, .5, .7]
-    df_recall_cheat = compute_recall_for_avtubes_as_dfs(
-        av_gt_tubes, av_stubes_, iou_thresholds, False)[0]
-    df_ap_cheat = compute_ap_for_avtubes_as_df(
-        av_gt_tubes, av_stubes_, iou_thresholds, False, False)
+    kacc_train = _quick_accuracy_over_kfeat(tkfeats_train, model, False)
+    kacc_eval = _quick_accuracy_over_kfeat(tkfeats_eval, model, False)
+    kf_acc, kf_roc_auc = keyframe_cls_scores(
+            Y_test_softmax, tkfeats_eval['Y'])
+    av_stubes_cheat: AV_dict[T_dwein_scored] = cheating_tube_scoring(
+        Y_test_softmax, tkfeats_eval['kf'], tubes_dwein_eval, dataset)
+    df_ap_cheat, df_recall_cheat = \
+        quick_tube_eval(av_stubes_cheat, tubes_dgt_eval)
     result = {
         'kacc_train': kacc_train,
         'kacc_eval': kacc_eval,
@@ -403,15 +621,19 @@ def _kffeats_eval(
         # here we are mirroring '_tubefeats_evalset_perf'
         _, dwti_to_label_eval = qload_synthetic_tube_labels(
             tubes_dgt_eval, tubes_dwein_eval, dataset)
-        tube_sofmaxes_eval = _eval_tube_softmaxes(
-            model, da_big, tubes_dwein_eval.keys())
-        # Flattube, synthetic accuracy
+        tube_sofmaxes_eval: Dict[I_dwein, np.ndarray] = \
+            _predict_softmaxes_for_dwein_tubes_in_da_big(
+                model, da_big, tubes_dwein_eval.keys())
+        # When computing synt accuracy add dummy background prediction
         tube_sofmaxes_eval_0bg = {k: np.pad(v, ((0, 0), (0, 1)))
                 for k, v in tube_sofmaxes_eval.items()}
-        acc_flattube_synt = _compute_flattube_syntlabel_acc(tube_sofmaxes_eval_0bg, dwti_to_label_eval)
+        acc_flattube_synt = _compute_flattube_syntlabel_acc(
+                tube_sofmaxes_eval_0bg, dwti_to_label_eval)
         # MAP, all tubes
-        av_stubes_eval = _quick_fulltube_assign(tubes_dwein_eval, tube_sofmaxes_eval, dataset)
-        df_ap_full = _quick_tubeval(av_stubes_eval, tubes_dgt_eval)
+        av_stubes_eval: AV_dict[T_dwein_scored] = \
+            _quick_assign_scores_to_dwein_tubes(
+                tubes_dwein_eval, tube_sofmaxes_eval, dataset)
+        df_ap_full, _ = quick_tube_eval(av_stubes_eval, tubes_dgt_eval)
         result['acc_flattube_synt'] = acc_flattube_synt
         result['df_ap_full'] = df_ap_full
     return result
@@ -442,131 +664,13 @@ def _kffeats_display_evalresults(result, sset_eval):
         log.info('Full tube AP357: {}'.format(apline))
 
 
-class Full_train_sampler(object):
-    def __init__(self, tkfeats_train):
-        self.tkfeats_train = tkfeats_train
-
-    def train_step(self, model, optimizer, loss_fn, i_epoch):
-        pred_train = model(self.tkfeats_train['X'])['x_final']
-        loss = loss_fn(pred_train, self.tkfeats_train['Y'])
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        return loss
+# tubefeats_train_mlp
 
 
-def _kffeats_experiment(
-        cf, initial_seed, da_big, tkfeats_train,
-        tkfeats_eval, tubes_dwein_eval, tubes_dgt_eval,
-        dataset, sset_eval):
-
-    torch.manual_seed(initial_seed)
-    period_log = cf['train.period.log']
-    period_eval_evalset = cf['train.period.eval']
-
-    n_epochs = cf['train.n_epochs']
-    D_in = tkfeats_train['X'].shape[-1]
-    model = define_mlp_model(cf, D_in, 10)
-    model.init_weights(0.01, initial_seed)
-
-    loss_fn = torch.nn.CrossEntropyLoss(reduction='mean')
-    optimizer = torch.optim.AdamW(model.parameters(),
-            lr=cf['train.lr'], weight_decay=cf['train.weight_decay'])
-
-    if cf['train.mode'] == 'full':
-        trsampler = Full_train_sampler(tkfeats_train)
-    elif cf['train.mode'] == 'partial':
-        train_batch_size = cf['train.partial.train_batch_size']
-        trsampler = Partial_Train_sampler(
-                tkfeats_train, initial_seed, train_batch_size)
-    else:
-        raise NotImplementedError()
-
-    for i_epoch in range(n_epochs):
-        loss = trsampler.train_step(model, optimizer, loss_fn, i_epoch)
-        if snippets.check_step_sslice(i_epoch, period_log):
-            model.eval()
-            kacc_train = _quick_kf_eval(tkfeats_train, model, False)
-            kacc_eval = _quick_kf_eval(tkfeats_eval, model, False)
-            model.train()
-            log.info(f'{i_epoch}: {loss.item():.4f} '
-                    f'K.Acc.Train: {kacc_train*100:.2f}; '
-                    f'K.Acc.Eval: {kacc_eval*100:.2f}')
-        if snippets.check_step_sslice(i_epoch, period_eval_evalset):
-            model.eval()
-            result = _kffeats_eval(
-                    cf, model, da_big, tkfeats_train, tkfeats_eval,
-                    tubes_dwein_eval, tubes_dgt_eval, dataset)
-            model.train()
-            log.info(f'Perf at {i_epoch=}')
-            _kffeats_display_evalresults(result, sset_eval)
-    # / Final evaluation
-    model.eval()
-    result = _kffeats_eval(
-            cf, model, da_big, tkfeats_train, tkfeats_eval,
-            tubes_dwein_eval, tubes_dgt_eval, dataset)
-    log.info(f'Perf at {i_epoch=}')
-    _kffeats_display_evalresults(result, sset_eval)
-    return result
-
-
-class TD_over_feats(torch.utils.data.Dataset):
-    def __init__(self, feats, labels, keyframes):
-        self.feats = feats
-        self.labels = labels
-        self.keyframes = keyframes
-
-    def __len__(self):
-        return len(self.feats)
-
-    def __getitem__(self, index):
-        feat = self.feats[index]
-        label = self.labels[index]
-        keyframe = self.keyframes[index]
-        keyframe['do_not_collate'] = True
-        return feat, label, keyframe
-
-def define_mlp_model(cf, D_in, D_out):
-    dropout_rate = cf['net.ll_dropout']
-    if cf['net.kind'] == 'layer0':
-        model = Net_mlp_zerolayer(
-            D_in, D_out, dropout_rate)
-    elif cf['net.kind'] == 'layer1':
-        model = Net_mlp_onelayer(
-            D_in, D_out, cf['net.layer1.H'], dropout_rate)
-    return model
-
-class Partial_Train_sampler(object):
-    def __init__(self, tkfeats_train, initial_seed, TRAIN_BATCH_SIZE):
-        td_sstrain = TD_over_feats(tkfeats_train['X'], tkfeats_train['Y'], tkfeats_train['kf'])
-        train_sampler_rgen = np.random.default_rng(initial_seed)
-        sampler = NumpyRandomSampler(td_sstrain, train_sampler_rgen)
-
-        self.train_krgb_loader = torch.utils.data.DataLoader(td_sstrain,
-                batch_size=TRAIN_BATCH_SIZE,
-                num_workers=0, pin_memory=True,
-                sampler=sampler, shuffle=False,
-                collate_fn=sequence_batch_collate_v2)
-        self.period_ibatch_loss_log = '0::10'
-
-    def train_step(self, model, optimizer, loss_fn, i_epoch):
-        for i_batch, (data_input) in enumerate(self.train_krgb_loader):
-            feats, labels, keyframes = data_input
-            result = model(feats)
-            pred_train = result['x_final']
-            loss = loss_fn(pred_train, labels)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            if snippets.check_step_sslice(
-                    i_batch, self.period_ibatch_loss_log):
-                Nb = len(self.train_krgb_loader)
-                log.info(f'{i_epoch=}, {i_batch=}/{Nb}: loss {loss.item()}')
-        return loss
-
-
-def _tubefeats_pretraining(cf, model, loss_fn,
-        tkfeats_train, tkfeats_eval):
+def _tubefeats_train_mlp_single_run_pretraining(
+        cf, model, loss_fn,
+        tkfeats_train: E_tkfeats,
+        tkfeats_eval: E_tkfeats):
     pretrain_lr = cf['kf_pretrain.train.lr']
     pretrain_weight_decay = cf['kf_pretrain.train.weight_decay']
     pretrain_optimizer = torch.optim.AdamW(model.parameters(),
@@ -582,44 +686,28 @@ def _tubefeats_pretraining(cf, model, loss_fn,
         pretrain_optimizer.step()
         if snippets.check_step_sslice(epoch, pretrain_period_log):
             model.eval()
-            kacc_train = _quick_kf_eval(tkfeats_train, model, True)
-            kacc_eval = _quick_kf_eval(tkfeats_eval, model, True)
+            kacc_train = _quick_accuracy_over_kfeat(
+                    tkfeats_train, model, True)
+            kacc_eval = _quick_accuracy_over_kfeat(
+                    tkfeats_eval, model, True)
             model.train()
             log.info(f'{epoch}: {loss.item():.4f} '
                     f'K.Acc.Train: {kacc_train*100:.2f}; '
                     f'K.Acc.Eval: {kacc_eval*100:.2f}')
 
-def _tubefeats_trainset_perf(model, da_big, dwti_to_label_train):
-    with small.QTimer() as t:
-        tube_sofmaxes_train = _eval_tube_softmaxes(model, da_big, dwti_to_label_train.keys())
-        acc_full_train = _compute_flattube_syntlabel_acc(tube_sofmaxes_train, dwti_to_label_train)
-    tsec = t.time
-    return acc_full_train, tsec
 
-
-def _tubefeats_evalset_perf(model, da_big, dwti_to_label_eval,
-        dataset, tubes_dwein_eval, tubes_dgt_eval):
-    tube_sofmaxes_eval = _eval_tube_softmaxes(
-            model, da_big, tubes_dwein_eval.keys())
-    # Flat accuracy: only dwto_to_label_eval tubes and includes
-    # background cls, should be over 11 classes
-    acc_flattube_synt = _compute_flattube_syntlabel_acc(
-            tube_sofmaxes_eval, dwti_to_label_eval)
-    # MAP: all tubes in tubes_dwein_eval, excludes background (last cls)
-    tube_sofmaxes_eval_nobg = {k: v[:, :-1]
-            for k, v in tube_sofmaxes_eval.items()}
-    av_stubes_eval = _quick_fulltube_assign(
-            tubes_dwein_eval, tube_sofmaxes_eval_nobg, dataset)
-    df_ap_full = _quick_tubeval(av_stubes_eval, tubes_dgt_eval)
-    result = {'acc_flattube_synt': acc_flattube_synt,
-            'df_ap_full': df_ap_full}
-    return result
-
-
-def _tubefeats_training(cf, model, loss_fn, rgen, da_big,
-        dwti_to_label_train, dwti_to_label_eval,
-        tkfeats_train, tkfeats_eval,
-        tubes_dwein_eval, tubes_dgt_eval, sset_eval, dataset):
+def _tubefeats_train_mlp_single_run_training(
+        cf, model, loss_fn, rgen,
+        da_big: Data_access_big,
+        tkfeats_train: E_tkfeats,
+        tkfeats_eval: E_tkfeats,
+        dwti_to_label_train: Dict[I_dwein, int],
+        dwti_to_label_eval: Dict[I_dwein, int],
+        tubes_dwein_eval: Dict[I_dwein, T_dwein],
+        tubes_dgt_eval: Dict[I_dgt, T_dgt],
+        sset_eval,
+        dataset: Dataset_daly_ocv
+        ):
     optimizer = torch.optim.AdamW(model.parameters(),
             lr=cf['train.lr'], weight_decay=cf['train.weight_decay'])
     period_log = cf['train.period.log']
@@ -640,8 +728,10 @@ def _tubefeats_training(cf, model, loss_fn, rgen, da_big,
             optimizer.step()
         if snippets.check_step_sslice(epoch, period_log):
             model.eval()
-            kacc_train = _quick_kf_eval(tkfeats_train, model, True)*100
-            kacc_eval = _quick_kf_eval(tkfeats_eval, model, True)*100
+            kacc_train = _quick_accuracy_over_kfeat(
+                    tkfeats_train, model, True)*100
+            kacc_eval = _quick_accuracy_over_kfeat(
+                    tkfeats_eval, model, True)*100
             model.train()
             log.info(f'{epoch}: {loss.item()} '
                     f'{kacc_train=:.2f} {kacc_eval=:.2f}')
@@ -662,12 +752,19 @@ def _tubefeats_training(cf, model, loss_fn, rgen, da_big,
             _tubefeats_display_evalresults(evalset_result, sset_eval)
 
 
-def _tubefeats_experiment(
-        cf, initial_seed, da_big,
-        tkfeats_train, tkfeats_eval,
-        dwti_to_label_train, dwti_to_label_eval,
-        tubes_dwein_eval, tubes_dgt_eval,
-        sset_eval, dataset):
+def _tubefeats_train_mlp_single_run(
+        cf, initial_seed,
+        da_big: Data_access_big,
+        tkfeats_train: E_tkfeats,
+        tkfeats_eval: E_tkfeats,
+        dwti_to_label_train: Dict[I_dwein, int],
+        dwti_to_label_eval: Dict[I_dwein, int],
+        tubes_dwein_eval: Dict[I_dwein, T_dwein],
+        tubes_dgt_eval: Dict[I_dgt, T_dgt],
+        sset_eval,
+        dataset: Dataset_daly_ocv
+        ):
+
     torch.manual_seed(initial_seed)
     rgen = np.random.default_rng(initial_seed)
 
@@ -676,11 +773,12 @@ def _tubefeats_experiment(
     loss_fn = torch.nn.CrossEntropyLoss(reduction='mean')
     # pretraining
     if cf['kf_pretrain.enabled']:
-        _tubefeats_pretraining(cf, model, loss_fn,
-        tkfeats_train, tkfeats_eval)
-    _tubefeats_training(cf, model, loss_fn, rgen, da_big,
-        dwti_to_label_train, dwti_to_label_eval,
+        _tubefeats_train_mlp_single_run_pretraining(
+            cf, model, loss_fn, tkfeats_train, tkfeats_eval)
+    _tubefeats_train_mlp_single_run_training(
+        cf, model, loss_fn, rgen, da_big,
         tkfeats_train, tkfeats_eval,
+        dwti_to_label_train, dwti_to_label_eval,
         tubes_dwein_eval, tubes_dgt_eval,
         sset_eval, dataset)
 
@@ -689,17 +787,8 @@ def _tubefeats_experiment(
     result = _tubefeats_evalset_perf(
         model, da_big, dwti_to_label_eval, dataset,
         tubes_dwein_eval, tubes_dgt_eval)
+    _tubefeats_display_evalresults(result, sset_eval)
     return result
-
-def _tubefeats_display_evalresults(result, sset_eval):
-    acc_flattube_synt = result['acc_flattube_synt']
-    df_ap_full = (result['df_ap_full']*100).round(2)
-    apline = '/'.join(df_ap_full.loc['all'].values.astype(str))
-    log.info('Tube evaluation results ({}): '.format(sset_eval))
-    log.debug('AP (full tube tubes):\n{}'.format(df_ap_full))
-    log.info(' '.join(
-        ('Flattube synthetic acc: {:.2f};'.format(acc_flattube_synt*100),
-        'Full tube AP357: {}'.format(apline))))
 
 
 # Experiments
@@ -710,19 +799,8 @@ def kffeats_train_mlp(workfolder, cfg_dict, add_args):
     cfg = snippets.YConfig(cfg_dict)
     Ncfg_daly.set_defcfg(cfg)
     Ncfg_kfeats.set_defcfg(cfg)
+    _mlp_set_defaults(cfg)
     cfg.set_deftype("""
-    seed: [42, int]
-    inputs:
-        tubes_dwein: [~, str]
-        big:
-            fold: [~, ~]
-    data_scaler: ['keyframes', ['keyframes', 'no']]
-    split_assignment: ['train/val', ['train/val', 'trainval/test']]
-    net:
-        kind: ['layer1', ['layer0', 'layer1']]
-        layer1:
-            H: [32, int]
-        ll_dropout: [0.5, float]
     train:
         mode: ['full', ['full', 'partial']]
         partial:
@@ -755,16 +833,16 @@ def kffeats_train_mlp(workfolder, cfg_dict, add_args):
         scaler = None
     else:
         raise RuntimeError()
+    tubes_dwein_d, tubes_dgt_d = load_gt_and_wein_tubes(
+            cf['inputs.tubes_dwein'], dataset, vgroup)
     if cf['eval.full_tubes']:
         BIG, dwti_to_inds_big = load_big_features(cf['inputs.big.fold'])
         da_big = Data_access_big(BIG, dwti_to_inds_big, scaler)
     else:
         da_big = None
-    tubes_dwein_d, tubes_dgt_d = load_gt_and_wein_tubes(
-            cf['inputs.tubes_dwein'], dataset, vgroup)
 
     # / Torch section
-    tkfeats_d = Ncfg_kfeats.to_torch(kfeats_d)
+    tkfeats_d: Dict[str, E_tkfeats] = Ncfg_kfeats.to_torch(kfeats_d)
     tkfeats_train = tkfeats_d[sset_train]
     tkfeats_eval = tkfeats_d[sset_eval]
     tubes_dwein_eval = tubes_dwein_d[sset_eval]
@@ -774,7 +852,7 @@ def kffeats_train_mlp(workfolder, cfg_dict, add_args):
 
     def experiment(i):
         log.info(f'Experiment {i}')
-        result = _kffeats_experiment(
+        result = _kffeats_train_mlp_single_run(
             cf, initial_seed+i, da_big,
             tkfeats_train, tkfeats_eval,
             tubes_dwein_eval, tubes_dgt_eval,
@@ -813,20 +891,7 @@ def tubefeats_train_mlp(workfolder, cfg_dict, add_args):
     cfg = snippets.YConfig(cfg_dict)
     Ncfg_daly.set_defcfg(cfg)
     Ncfg_kfeats.set_defcfg(cfg)
-    cfg.set_deftype("""
-    seed: [42, int]
-    inputs:
-        tubes_dwein: [~, str]
-        big:
-            fold: [~, str]
-    data_scaler: ['keyframes', ['keyframes', 'no']]
-    split_assignment: ['train/val', ['train/val', 'trainval/test']]
-    net:
-        kind: ['layer1', ['layer0', 'layer1']]
-        layer1:
-            H: [32, int]
-        ll_dropout: [0.5, float]
-    """)
+    _mlp_set_defaults(cfg)
     cfg.set_defaults("""
     train:
         lr: 1.0e-5
@@ -848,7 +913,7 @@ def tubefeats_train_mlp(workfolder, cfg_dict, add_args):
         period:
             log: '0::500'
 
-    n_trials: 5
+    n_trials: 1
     """)
     cf = cfg.parse()
     # params
@@ -876,8 +941,7 @@ def tubefeats_train_mlp(workfolder, cfg_dict, add_args):
             tubes_dgt_d[sset_eval], tubes_dwein_d[sset_eval], dataset)
 
     # / Torch section
-    tkfeats_d = Ncfg_kfeats.to_torch(kfeats_d)
-
+    tkfeats_d: Dict[str, E_tkfeats] = Ncfg_kfeats.to_torch(kfeats_d)
     tkfeats_train = tkfeats_d[sset_train]
     tkfeats_eval = tkfeats_d[sset_eval]
     tubes_dwein_eval = tubes_dwein_d[sset_eval]
@@ -885,13 +949,12 @@ def tubefeats_train_mlp(workfolder, cfg_dict, add_args):
 
     def experiment(i):
         log.info(f'Experiment {i}')
-        result = _tubefeats_experiment(
+        result = _tubefeats_train_mlp_single_run(
             cf, initial_seed+i, da_big,
             tkfeats_train, tkfeats_eval,
             dwti_to_label_train, dwti_to_label_eval,
             tubes_dwein_eval, tubes_dgt_eval,
             sset_eval, dataset)
-        _tubefeats_display_evalresults(result, sset_eval)
         return result
 
     if n_trials == 1:
@@ -903,8 +966,11 @@ def tubefeats_train_mlp(workfolder, cfg_dict, add_args):
             range(n_trials), experiment)
     trial_results = isaver.run()
     avg_result = {}
-    avg_result['acc_flattube_synt'] = np.mean([tr['acc_flattube_synt'] for tr in trial_results])
+    avg_result['acc_flattube_synt'] = \
+            np.mean([tr['acc_flattube_synt'] for tr in trial_results])
     to_avg = [tr['df_ap_full'] for tr in trial_results]
-    avg_result['df_ap_full']= pd.concat(to_avg, keys=range(len(to_avg)), axis=1).mean(axis=1, level=1)
+    avg_result['df_ap_full'] = \
+        pd.concat(
+            to_avg, keys=range(len(to_avg)), axis=1).mean(axis=1, level=1)
     log.info('Results for average over {} trials'.format(n_trials))
     _tubefeats_display_evalresults(avg_result, sset_eval)
