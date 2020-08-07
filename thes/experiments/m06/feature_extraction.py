@@ -299,7 +299,7 @@ class Isaver_extract_rgb(snippets.isaver.Isaver_base):
             npy_cache.append(npy_part)
             if countra.check(i_batch):
                 flush_purge()
-                log.debug(snippets._tqdm_str(pbar))
+                log.debug(snippets.tqdm_str(pbar))
                 countra.tic(i_batch)
         flush_purge()
         return self.result, self.npy_array
