@@ -2,6 +2,8 @@ import yacs
 import numpy as np
 
 from detectron2.config import get_cfg
+from fvcore.common.config import CfgNode
+from detectron2.config.config import CfgNode as CfgNode_d2
 
 from thes.tools import snippets
 
@@ -64,10 +66,15 @@ def base_d2_frcnn_config():
     return d_cfg
 
 
+def cf_to_cfgnode(cf):
+    """ Flat config to detectron2 confignode """
+    cn = CfgNode(
+        snippets.unflatten_nested_dict(cf), [])
+    return cn
+
+
 def yacs_merge_additional_keys(d_cfg, cf_add_d2):
-    yacs_add_d2 = yacs.config.CfgNode(
-            snippets.unflatten_nested_dict(cf_add_d2), [])
-    d_cfg.merge_from_other_cfg(yacs_add_d2)
+    d_cfg.merge_from_other_cfg(cf_to_cfgnode(cf_add_d2))
     return d_cfg
 
 

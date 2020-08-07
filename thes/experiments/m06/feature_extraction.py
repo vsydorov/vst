@@ -225,7 +225,7 @@ class Ncfg_extractor:
         return norm_mean_t, norm_std_t, sampler_grid, frameloader_vsf, fextractor
 
 
-class Isaver_extract_rgb(snippets.Isaver_base):
+class Isaver_extract_rgb(snippets.isaver.Isaver_base):
     def __init__(
             self, folder,
             total, func, prepare_func,

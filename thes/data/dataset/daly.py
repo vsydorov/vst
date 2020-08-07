@@ -26,6 +26,18 @@ class Ncfg_daly:
                 seed: [42, int]
         """)
 
+    def set_defcfg_v2(cfg):
+        cfg.set_defaults_yaml("""
+        dataset:
+            name: 'daly'
+            cache_folder: ~
+            mirror: 'uname'
+            val_split:
+                fraction: 0.1
+                nsamplings: 20
+                seed: 42
+        """)
+
     @staticmethod
     def get_dataset(cf):
         dataset = Dataset_daly_ocv(cf['dataset.mirror'])

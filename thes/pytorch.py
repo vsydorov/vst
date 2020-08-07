@@ -329,7 +329,7 @@ def to_gpu_normalize_permute(Xt, norm_mean_t, norm_std_t):
 
 
 class Dataloader_isaver(
-        snippets.Isaver_mixin_restore_save, snippets.Isaver_base):
+        snippets.isaver.Isaver_mixin_restore_save, snippets.isaver.Isaver_base):
     """
     Will process a list with a 'func', 'prepare_func(start_i)' is to be run before processing
     """
