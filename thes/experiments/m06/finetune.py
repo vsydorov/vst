@@ -75,6 +75,13 @@ from thes.detectron.cfg import (cf_to_cfgnode)
 log = logging.getLogger(__name__)
 
 
+def get_ll_generator(initial_seed):
+    # For reproducibility, when freeze=5, dropout=0.0
+    ll_generator = torch.Generator()
+    ll_generator = ll_generator.manual_seed(67280421310679+initial_seed)
+    return ll_generator
+
+
 def _quick_shuffle_batches(dwti_to_inds_big, rgen, dwti_to_label,
         TUBES_PER_BATCH, FRAMES_PER_TUBE):
     # / Prepare dataset and data loader
@@ -447,17 +454,15 @@ class C2D_1x1_roitune(M_resnet):
         x = self.head(x, bboxes0)
         return x
 
-    def init_weights(self, init_std, seed=42):
+    def init_weights(self, init_std, ll_generator=None):
         # Init all weights
         init_helper.init_weights(
             self, init_std, False)
 
-        # Specifically init last layer
-        ll_generator = torch.Generator()
-        ll_generator = ll_generator.manual_seed(67280421310679+seed)
-        self.head.rt_projection.weight.data.normal_(
-                mean=0.0, std=init_std, generator=ll_generator)
-        self.head.rt_projection.bias.data.zero_()
+        if ll_generator is not None:
+            self.head.rt_projection.weight.data.normal_(
+                    mean=0.0, std=init_std, generator=ll_generator)
+            self.head.rt_projection.bias.data.zero_()
 
 
 class Manager_checkpoint_name(object):
@@ -686,30 +691,6 @@ def _prepare_labeled_connections(
     return cls_vf_train
 
 
-class Manager_data(object):
-    def __init__(self, cf, sf_cfg):
-        # General DALY level preparation
-        dataset: Dataset_daly_ocv = Ncfg_daly.get_dataset(cf)
-        vgroup: Dict[str, List[Vid_daly]] = \
-                Ncfg_daly.get_vids(cf, dataset)
-        sset_train, sset_eval = cf['split_assignment'].split('/')
-        # wein tubes
-        tubes_dwein_d, tubes_dgt_d = load_gt_and_wein_tubes(
-                cf['inputs.tubes_dwein'], dataset, vgroup)
-        # Means
-        norm_mean_cu = np_to_gpu(sf_cfg.DATA.MEAN)
-        norm_std_cu = np_to_gpu(sf_cfg.DATA.STD)
-
-        self.dataset = dataset
-        self.vgroup = vgroup
-        self.sset_train = sset_train
-        self.sset_eval = sset_eval
-        self.tubes_dwein_d = tubes_dwein_d
-        self.tubes_dgt_d = tubes_dgt_d
-        self.norm_mean_cu = norm_mean_cu
-        self.norm_std_cu = norm_std_cu
-
-
 class Manager_loader_krgb(object):
     def __init__(self, keyframes_rgb_fold, dataset,
             norm_mean_cu, norm_std_cu):
@@ -733,9 +714,8 @@ class Manager_loader_krgb(object):
             krgb_array, krgb_bboxes, keyframes)
         return tdataset
 
-    def get_train_loader(self, vids, batch_size, initial_seed):
+    def get_train_loader(self, vids, batch_size, train_sampler_rgen):
         tdataset = self.get_krgb_tdataset(vids)
-        train_sampler_rgen = np.random.default_rng(initial_seed)
         sampler = NumpyRandomSampler(tdataset, train_sampler_rgen)
         loader = torch.utils.data.DataLoader(tdataset,
                 batch_size=batch_size,
@@ -859,8 +839,7 @@ def _train_epoch(
 
 def _evaluate_krgb_perf(model_wf, eval_loader, eval_keyframes,
         tubes_dwein_eval, tubes_dgt_eval, dataset,
-        inputs_converter, i_epoch, cut_off_bg):
-    log.info(f'Perf at {i_epoch=}')
+        inputs_converter, cut_off_bg):
     eval_timers = snippets.TicToc(
             ['softmaxes', 'acc_roc', 'cheat_app'])
     # Obtain softmaxes
@@ -968,54 +947,58 @@ def finetune_preextracted_krgb(workfolder, cfg_dict, add_args):
     initial_seed = cf['seed']
     torch.manual_seed(initial_seed)
     torch.cuda.manual_seed(initial_seed)
+    train_sampler_rgen = np.random.default_rng(initial_seed)
 
-    # Data
-    man_data = Manager_data(cf, sf_cfg)
-    dataset = man_data.dataset
-    norm_mean_cu = man_data.norm_mean_cu
-    norm_std_cu = man_data.norm_std_cu
-    vgroup = man_data.vgroup
-    sset_train = man_data.sset_train
-    sset_eval = man_data.sset_eval
-    tubes_dwein_d = man_data.tubes_dwein_d
+    # / Data
+    # General DALY level preparation
+    dataset: Dataset_daly_ocv = Ncfg_daly.get_dataset(cf)
+    vgroup: Dict[str, List[Vid_daly]] = \
+            Ncfg_daly.get_vids(cf, dataset)
+    sset_train, sset_eval = cf['split_assignment'].split('/')
+    # wein tubes
+    tubes_dwein_d, tubes_dgt_d = load_gt_and_wein_tubes(
+            cf['inputs.tubes_dwein'], dataset, vgroup)
+    # Means
+    norm_mean_cu = np_to_gpu(sf_cfg.DATA.MEAN)
+    norm_std_cu = np_to_gpu(sf_cfg.DATA.STD)
+    # Sset
     tubes_dwein_eval = tubes_dwein_d[sset_eval]
-    tubes_dgt_d = man_data.tubes_dgt_d
     tubes_dgt_eval = tubes_dgt_d[sset_eval]
+    vids_eval = vgroup[sset_eval]
 
     # Model
     model_wf = Model_w_freezer(cf, sf_cfg, 10)
     optimizer = construct_optimizer(model_wf.model, cn_optim)
     loss_fn = torch.nn.CrossEntropyLoss(reduction='mean')
-    model_wf.model.init_weights(0.01, seed=initial_seed)
+    model_wf.model.init_weights(0.01)
     model_wf.model_to_gpu()
-    man_ckpt = Manager_model_checkpoints(model_wf.model, optimizer)
 
-    # Training
+    # / Training setup
     max_epoch = cn_optim.SOLVER.MAX_EPOCH
-    period_ibatch_loss_log = cf['period.ibatch.loss_log']
-    rundir = small.mkdir(out/'rundir')
-    if '--new' in add_args:
-        checkpoint_path = None
-    else:
-        checkpoint_path = (Manager_checkpoint_name.
-                find_last_checkpoint(rundir))
-
-    start_epoch = (man_ckpt
-            .restore_model_magic(checkpoint_path))
-
     man_lkrgb = Manager_loader_krgb(
             cf['inputs.keyframes_rgb'], dataset,
             norm_mean_cu, norm_std_cu)
     ibatch_actions = (
         (cf['period.ibatch.loss_log'], f_loss_log),
     )
+    man_ckpt = Manager_model_checkpoints(model_wf.model, optimizer)
 
+    # Restore previous run
+    rundir = small.mkdir(out/'rundir')
+    if '--new' in add_args:
+        checkpoint_path = None
+    else:
+        checkpoint_path = (Manager_checkpoint_name.
+                find_last_checkpoint(rundir))
+    start_epoch = (man_ckpt.restore_model_magic(checkpoint_path))
+
+    # Training
     for i_epoch in range(start_epoch, max_epoch):
         # Train part
         model_wf.set_train()
         train_loader = man_lkrgb.get_train_loader(
                 vgroup[sset_train],
-                cf['train.batch_size.train'], initial_seed)
+                cf['train.batch_size.train'], train_sampler_rgen)
         _train_epoch(model_wf, train_loader, optimizer,
                 loss_fn, cn_optim, man_lkrgb.preprocess_data, i_epoch,
                 ibatch_actions)
@@ -1023,11 +1006,12 @@ def finetune_preextracted_krgb(workfolder, cfg_dict, add_args):
         man_ckpt.save_epoch(rundir, i_epoch)
         # Eval part
         eval_krgb_loader, eval_krgb_keyframes = man_lkrgb.get_eval_loader(
-            vgroup[sset_eval], cf['train.batch_size.eval'])
+            vids_eval, cf['train.batch_size.eval'])
         model_wf.set_eval()
+        log.info(f'Perf at {i_epoch=}')
         _evaluate_krgb_perf(model_wf, eval_krgb_loader, eval_krgb_keyframes,
                 tubes_dwein_eval, tubes_dgt_eval, dataset,
-                man_lkrgb.preprocess_data, i_epoch, cut_off_bg=False)
+                man_lkrgb.preprocess_data, cut_off_bg=False)
 
 
 def finetune_on_tubefeats(workfolder, cfg_dict, add_args):
@@ -1057,54 +1041,63 @@ def finetune_on_tubefeats(workfolder, cfg_dict, add_args):
     train_sampler_rgen = np.random.default_rng(initial_seed)
 
     # Data
-    man_data = Manager_data(cf, sf_cfg)
-    dataset = man_data.dataset
-    norm_mean_cu = man_data.norm_mean_cu
-    norm_std_cu = man_data.norm_std_cu
-    vgroup = man_data.vgroup
-    sset_train = man_data.sset_train
-    sset_eval = man_data.sset_eval
-    tubes_dwein_d = man_data.tubes_dwein_d
+    # General DALY level preparation
+    dataset: Dataset_daly_ocv = Ncfg_daly.get_dataset(cf)
+    vgroup: Dict[str, List[Vid_daly]] = \
+            Ncfg_daly.get_vids(cf, dataset)
+    sset_train, sset_eval = cf['split_assignment'].split('/')
+    # wein tubes
+    tubes_dwein_d, tubes_dgt_d = load_gt_and_wein_tubes(
+            cf['inputs.tubes_dwein'], dataset, vgroup)
+    # Means
+    norm_mean_cu = np_to_gpu(sf_cfg.DATA.MEAN)
+    norm_std_cu = np_to_gpu(sf_cfg.DATA.STD)
+    # Sset
     tubes_dwein_eval = tubes_dwein_d[sset_eval]
-    tubes_dgt_d = man_data.tubes_dgt_d
-    tubes_dgt_eval = tubes_dgt_d[sset_train]
+    tubes_dgt_eval = tubes_dgt_d[sset_eval]
 
     # Model
     model_wf = Model_w_freezer(cf, sf_cfg, 11)
     optimizer = construct_optimizer(model_wf.model, cn_optim)
     loss_fn = torch.nn.CrossEntropyLoss(reduction='mean')
-    model_wf.model.init_weights(0.01, seed=initial_seed)
+    model_wf.model.init_weights(0.01)
     model_wf.model_to_gpu()
 
-    # Training
+    # / Training setup
     max_epoch = cn_optim.SOLVER.MAX_EPOCH
-    # period_train_ibatch_log = cf['period.train_ibatch.log']
-    # period_train_ibatch_eval_krgb_evalset = \
-    #         cf['period.train_ibatch.eval_krgb.evalset']
-
+    man_lkrgb = Manager_loader_krgb(
+            cf['inputs.keyframes_rgb'], dataset,
+            norm_mean_cu, norm_std_cu)
     man_lbox = Manager_loader_boxcons(
         tubes_dgt_d, tubes_dwein_d,
         sset_train, dataset, sf_cfg, cf,
         norm_mean_cu, norm_std_cu)
 
-    man_lkrgb = Manager_loader_krgb(
-            cf['inputs.keyframes_rgb'], dataset,
-            norm_mean_cu, norm_std_cu)
-
     def f_ibatch_eval_krgb_evalset(local_vars):
         model_wf.set_eval()
         eval_krgb_loader, eval_krgb_keyframes = man_lkrgb.get_eval_loader(
             vgroup[sset_eval], cf['train.batch_size.eval'])
+        log.info(f'Perf at {i_epoch=}')
         _evaluate_krgb_perf(model_wf, eval_krgb_loader, eval_krgb_keyframes,
                 tubes_dwein_eval, tubes_dgt_eval, dataset,
-                man_lkrgb.preprocess_data, i_epoch, cut_off_bg=True)
-
+                man_lkrgb.preprocess_data, cut_off_bg=True)
     ibatch_actions = (
         (cf['period.ibatch.loss_log'], f_loss_log),
         (cf['period.ibatch.eval_krgb.evalset'],
             f_ibatch_eval_krgb_evalset))
+    man_ckpt = Manager_model_checkpoints(model_wf.model, optimizer)
 
-    for i_epoch in range(max_epoch):
+    # Restore previous run
+    rundir = small.mkdir(out/'rundir')
+    if '--new' in add_args:
+        checkpoint_path = None
+    else:
+        checkpoint_path = (Manager_checkpoint_name.
+                find_last_checkpoint(rundir))
+    start_epoch = (man_ckpt.restore_model_magic(checkpoint_path))
+
+    # Training
+    for i_epoch in range(start_epoch, max_epoch):
         # Train part
         model_wf.set_train()
         train_loader = man_lbox.get_train_loader(
@@ -1112,18 +1105,3 @@ def finetune_on_tubefeats(workfolder, cfg_dict, add_args):
         _train_epoch(model_wf, train_loader, optimizer,
                 loss_fn, cn_optim, man_lbox.preprocess_data, i_epoch,
                 ibatch_actions)
-
-        # Save part
-
-        # if snippets.check_step_sslice(
-        #         i_batch, period_train_ibatch_log):
-        #     log.info(f'{i_epoch=}, {i_batch=}/{Nb}: loss {loss.item()}')
-        # if snippets.check_step_sslice(epoch, period_log):
-        #     pass
-        #     model.eval()
-        #     # kacc_train = _quick_kf_eval(tkfeats_train, model, True)*100
-        #     # kacc_eval = _quick_kf_eval(tkfeats_eval, model, True)*100
-        #     model.train()
-        #     # log.info(f'{epoch}: {loss.item()} '
-        #     #         f'{kacc_train=:.2f} {kacc_eval=:.2f}')
-        #     log.info(f'{epoch}: {loss.item()} ')
