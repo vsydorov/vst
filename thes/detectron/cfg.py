@@ -2,10 +2,8 @@ import yacs
 import numpy as np
 
 from detectron2.config import get_cfg
-from fvcore.common.config import CfgNode
-from detectron2.config.config import CfgNode as CfgNode_d2
 
-from thes.tools import snippets
+from thes.pytorch import merge_cf_into_cfgnode
 
 
 PRETRAINED_WEIGHTS_MODELPATH = '/home/vsydorov/projects/deployed/2019_12_Thesis/links/horus/pytorch_model_zoo/pascal_voc_baseline/model_final_b1acc2.pkl'
@@ -66,18 +64,6 @@ def base_d2_frcnn_config():
     return d_cfg
 
 
-def cf_to_cfgnode(cf):
-    """ Flat config to detectron2 confignode """
-    cn = CfgNode(
-        snippets.unflatten_nested_dict(cf), [])
-    return cn
-
-
-def yacs_merge_additional_keys(d_cfg, cf_add_d2):
-    d_cfg.merge_from_other_cfg(cf_to_cfgnode(cf_add_d2))
-    return d_cfg
-
-
 def set_d2_cthresh(d_cfg, CONFIDENCE_THRESHOLD=0.25):
     d_cfg.MODEL.RETINANET.SCORE_THRESH_TEST = CONFIDENCE_THRESHOLD
     d_cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = CONFIDENCE_THRESHOLD
@@ -128,7 +114,7 @@ def set_detectron_cfg_train(
     d_cfg.MODEL.WEIGHTS = PRETRAINED_WEIGHTS_MODELPATH
     d_cfg.DATASETS.TRAIN = (DATASET_NAME, )
     d_cfg.DATASETS.TEST = ()
-    yacs_merge_additional_keys(d_cfg, cf_add_d2)
+    merge_cf_into_cfgnode(d_cfg, cf_add_d2)
     if freeze:
         d_cfg.freeze()
     return d_cfg
@@ -142,7 +128,7 @@ def set_detectron_cfg_test(
     d_cfg.DATASETS.TRAIN = ()
     d_cfg.DATASETS.TEST = (DATASET_NAME, )
     set_d2_cthresh(d_cfg, conf_thresh)
-    yacs_merge_additional_keys(d_cfg, cf_add_d2)
+    merge_cf_into_cfgnode(d_cfg, cf_add_d2)
     if freeze:
         d_cfg.freeze()
     return d_cfg

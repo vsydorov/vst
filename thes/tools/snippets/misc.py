@@ -101,6 +101,42 @@ class Averager(object):
         return 'Averager[{:.4f} (A: {:.4f})]'.format(self.last, self.avg)
 
 
+class WindowAverager(object):
+    """
+    Adapted from Averager
+    """
+    def __init__(self, windowsize):
+        self.reset()
+        self.windowsize = windowsize
+
+    def reset(self):
+        self.values = []
+        self.weights = []
+
+    def update(self, value, weight=1):
+        self.values.append(value)
+        self.values = self.values[-self.windowsize:]
+
+        self.weights.append(weight)
+        self.weights = self.weights[-self.windowsize:]
+
+    @property
+    def avg(self):
+        return np.matmul(self.values, self.weights)/np.sum(self.weights)
+
+    @property
+    def last(self):
+        try:
+            return self.values[-1]
+        except IndexError as e:
+            log.warning(f'Caught {e}')
+            return None
+
+    def __repr__(self):
+        return 'WindowAverager{}[{:.4f} (A: {:.4f})]'.format(
+                self.windowsize, self.last, self.avg)
+
+
 class TicToc(object):
     def __init__(self, names):
         self.names = names

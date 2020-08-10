@@ -9,6 +9,7 @@ import av
 
 import torch
 from torch.utils.data.dataloader import default_collate  # type: ignore
+from fvcore.common.config import CfgNode
 
 from vsydorov_tools import small
 from vsydorov_tools import cv as vt_cv
@@ -308,6 +309,16 @@ def hforward_slowfast(self, x):
     return x
 
 # utilities
+
+
+def cf_to_cfgnode(cf):
+    cn = CfgNode(snippets.unflatten_nested_dict(cf), [])
+    return cn
+
+
+def merge_cf_into_cfgnode(d_cfg, cf_add_d2):
+    d_cfg.merge_from_other_cfg(cf_to_cfgnode(cf_add_d2))
+    return d_cfg
 
 
 def np_to_gpu(X):

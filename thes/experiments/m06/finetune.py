@@ -1,10 +1,14 @@
 import copy
+import string
+import random
+import shutil
 import pprint
 import yacs
 import re
 import numpy as np
 import logging
 from pathlib import Path
+from datetime import datetime
 from types import MethodType
 from typing import (  # NOQA
     Dict, Any, List, Optional, Tuple, TypedDict, Set)
@@ -24,10 +28,6 @@ from slowfast.models.batchnorm_helper import get_norm
 import slowfast.utils.weight_init_helper as init_helper
 from slowfast.models.video_model_builder import _POOL1 as SF_POOL1
 import slowfast.utils.misc as sf_misc
-
-
-from fvcore.common.config import CfgNode
-from detectron2.config.config import CfgNode as CfgNode_d2
 
 from vsydorov_tools import small
 from vsydorov_tools import cv as vt_cv
@@ -67,10 +67,10 @@ from thes.tools.video import (
 from thes.pytorch import (
     sequence_batch_collate_v2, np_to_gpu,
     to_gpu_normalize_permute, Sampler_grid,
-    Frameloader_video_slowfast, NumpyRandomSampler)
+    Frameloader_video_slowfast, NumpyRandomSampler,
+    merge_cf_into_cfgnode)
 
-from thes.slowfast.optimizer import (construct_optimizer, get_lr_at_epoch)
-from thes.detectron.cfg import (cf_to_cfgnode)
+from thes.slowfast import optimizer as tsf_optim
 
 log = logging.getLogger(__name__)
 
@@ -215,15 +215,15 @@ class TDataset_over_box_connections_w_labels(torch.utils.data.Dataset):
 
 
 class SlowFast_roitune(M_slowfast):
-    def __init__(self, sf_cfg, num_classes):
+    def __init__(self, cn, num_classes):
         super(M_slowfast, self).__init__()
-        self.norm_module = get_norm(sf_cfg)
-        self.enable_detection = sf_cfg.DETECTION.ENABLE
+        self.norm_module = get_norm(cn)
+        self.enable_detection = cn.DETECTION.ENABLE
         self.num_pathways = 2
-        self._construct_network(sf_cfg)
-        self._construct_roitune(sf_cfg, num_classes)
+        self._construct_network(cn)
+        self._construct_roitune(cn, num_classes)
         init_helper.init_weights(
-            self, sf_cfg.MODEL.FC_INIT_STD, sf_cfg.RESNET.ZERO_INIT_FINAL_BN
+            self, cn.MODEL.FC_INIT_STD, cn.RESNET.ZERO_INIT_FINAL_BN
         )
         # Weight init
         last_layer_generator = torch.Generator(2147483647)
@@ -231,23 +231,23 @@ class SlowFast_roitune(M_slowfast):
             mean=0.0, std=0.01, generator=last_layer_generator)
         self.rt_projection.weight.data.zero_()
 
-    def _construct_roitune(self, sf_cfg, num_classes):
+    def _construct_roitune(self, cn, num_classes):
         # DETECTION.ROI_XFORM_RESOLUTION
         xform_resolution = 7
         resolution = [[xform_resolution] * 2] * 2
         scale_factor = [32] * 2
         # since extraction mode is roi
         _POOL_SIZE = [[1, 1, 1], [1, 1, 1]]
-        model_nframes = sf_cfg.DATA.NUM_FRAMES
-        slowfast_alpha = sf_cfg.SLOWFAST.ALPHA
+        model_nframes = cn.DATA.NUM_FRAMES
+        slowfast_alpha = cn.SLOWFAST.ALPHA
         head_pool_size = [
             [model_nframes//slowfast_alpha//_POOL_SIZE[0][0], 1, 1],
             [model_nframes//_POOL_SIZE[1][0], 1, 1]]
         dropout_rate = 0.5
-        width_per_group = sf_cfg.RESNET.WIDTH_PER_GROUP
+        width_per_group = cn.RESNET.WIDTH_PER_GROUP
         dim_in=[
             width_per_group * 32,
-            width_per_group * 32 // sf_cfg.SLOWFAST.BETA_INV,
+            width_per_group * 32 // cn.SLOWFAST.BETA_INV,
         ]
 
         for pi in range(self.num_pathways):
@@ -318,26 +318,6 @@ class SlowFast_roitune(M_slowfast):
         return x
 
 
-def build_slowfast_roitune(num_classes):
-    rel_yml_path = 'Kinetics/c2/SLOWFAST_4x16_R50.yaml'
-    sf_cfg = basic_sf_cfg(rel_yml_path)
-    sf_cfg.NUM_GPUS = 1
-
-    # slowfast.models.build_model
-    model = SlowFast_roitune(sf_cfg, num_classes)
-    # Determine the GPU used by the current process
-    cur_device = torch.cuda.current_device()
-    # Transfer the model to the current GPU device
-    model = model.cuda(device=cur_device)
-    return model, sf_cfg
-
-def _prepare_keyframe_cls_labels():
-    pass
-
-def _build_model_addons():
-    pass
-
-
 class Freezer(object):
     def __init__(self, model, freeze_level, bn_freeze):
         self.model = model
@@ -368,18 +348,18 @@ class Freezer(object):
 
 
 class Head_roitune(nn.Module):
-    def __init__(self, sf_cfg, num_classes,
+    def __init__(self, cn, num_classes,
             dropout_rate, debug_outputs):
         super(Head_roitune, self).__init__()
-        self._construct_roitune(sf_cfg, num_classes, dropout_rate)
+        self._construct_roitune(cn, num_classes, dropout_rate)
         self.debug_outputs = debug_outputs
 
-    def _construct_roitune(self, sf_cfg, num_classes, dropout_rate):
+    def _construct_roitune(self, cn, num_classes, dropout_rate):
         # params
         xform_resolution = 7
         resolution = [[xform_resolution] * 2]
         scale_factor = [32]
-        dim_in = [sf_cfg.RESNET.WIDTH_PER_GROUP * 32]
+        dim_in = [cn.RESNET.WIDTH_PER_GROUP * 32]
 
         pi = 0
         roi_align = ROIAlign(
@@ -433,14 +413,14 @@ class Head_roitune(nn.Module):
 
 
 class C2D_1x1_roitune(M_resnet):
-    def __init__(self, sf_cfg, num_classes,
+    def __init__(self, cn, num_classes,
             dropout_rate, debug_outputs):
         super(M_resnet, self).__init__()
-        self.norm_module = get_norm(sf_cfg)
-        self.enable_detection = sf_cfg.DETECTION.ENABLE
+        self.norm_module = get_norm(cn)
+        self.enable_detection = cn.DETECTION.ENABLE
         self.num_pathways = 1
-        self._construct_network(sf_cfg)
-        self.head = Head_roitune(sf_cfg, num_classes,
+        self._construct_network(cn)
+        self.head = Head_roitune(cn, num_classes,
                 dropout_rate, debug_outputs)
 
     def forward(self, x, bboxes0):
@@ -568,10 +548,10 @@ class Manager_model_checkpoints(object):
 #     self.man_ckpt = man_ckpt
 
 class Model_w_freezer(object):
-    def __init__(self, cf, sf_cfg, n_inputs):
+    def __init__(self, cf, cn, n_inputs):
         # Build model
-        self.sf_cfg = sf_cfg
-        model = C2D_1x1_roitune(self.sf_cfg, n_inputs,
+        self.cn = cn
+        model = C2D_1x1_roitune(self.cn, n_inputs,
                 cf['ll_dropout'], cf['debug_outputs'])
         freezer = Freezer(model, cf['freeze.level'],
                 cf['freeze.freeze_bn'])
@@ -635,23 +615,17 @@ def set_lr(optimizer, new_lr):
         param_group["lr"] = new_lr
 
 
-def _config_preparations(cfg):
+def _config_preparations(cf_override):
     # / Configs
     # // CN for C2D_1x1 we are loading
     rel_yml_path = 'Kinetics/C2D_8x8_R50_IN1K.yaml'
-    sf_cfg = basic_sf_cfg(rel_yml_path)
-    sf_cfg.NUM_GPUS = 1
-    sf_cfg.DATA.NUM_FRAMES = 1
-    sf_cfg.DATA.SAMPLING_RATE = 1
-    # // Some stuff from that CN
-    # // CN that contains SOLVER and BN parts
-    cf_optremote = cfg.without_prefix('OPTIMIZER_REMOTE.')
-    cn_from_cf = cf_to_cfgnode(cf_optremote)
-    cn_optim = CfgNode()
-    cn_optim.BN = sf_cfg.BN
-    cn_optim.SOLVER = sf_cfg.SOLVER
-    cn_optim.merge_from_other_cfg(cn_from_cf)
-    return sf_cfg, cn_optim
+    cn = basic_sf_cfg(rel_yml_path)
+    merge_cf_into_cfgnode(cn, cf_override)
+    # Set up last, since necessary for C2D_1x1
+    cn.NUM_GPUS = 1
+    cn.DATA.NUM_FRAMES = 1
+    cn.DATA.SAMPLING_RATE = 1
+    return cn
 
 
 def _prepare_labeled_connections(
@@ -744,7 +718,7 @@ class Manager_loader_krgb(object):
 
 class Manager_loader_boxcons(object):
     def __init__(self, tubes_dgt_d, tubes_dwein_d,
-            sset_train, dataset, sf_cfg, cf,
+            sset_train, dataset, cn, cf,
             norm_mean_cu, norm_std_cu):
         self.dataset = dataset
         self.norm_mean_cu = norm_mean_cu
@@ -758,9 +732,9 @@ class Manager_loader_boxcons(object):
             _prepare_labeled_connections(
                 cf, dataset, tubes_dwein_d[sset_train], dwti_to_label_train)
         # Prepare sampler
-        model_nframes = sf_cfg.DATA.NUM_FRAMES
-        model_sample = sf_cfg.DATA.SAMPLING_RATE
-        slowfast_alpha = sf_cfg.SLOWFAST.ALPHA
+        model_nframes = cn.DATA.NUM_FRAMES
+        model_sample = cn.DATA.SAMPLING_RATE
+        slowfast_alpha = cn.SLOWFAST.ALPHA
         self.sampler_grid = Sampler_grid(model_nframes, model_sample)
         self.frameloader_vsf = Frameloader_video_slowfast(
                 False, slowfast_alpha, 256)
@@ -806,13 +780,16 @@ def _train_epoch(
     # Train part
     model_wf.set_train()
 
+    l_avg = snippets.misc.Averager()
+    l_wavg = snippets.misc.WindowAverager(10)
+
     for i_batch, (data_input) in enumerate(train_loader):
         # preprocess data, transfer to GPU
         inputs, boxes, labels = inputs_converter(data_input)
 
         # Update learning rate
         data_size = len(train_loader)
-        lr = get_lr_at_epoch(cn_optim,
+        lr = tsf_optim.get_lr_at_epoch(cn_optim,
                 i_epoch + float(i_batch) / data_size)
         set_lr(optimizer, lr)
 
@@ -822,7 +799,7 @@ def _train_epoch(
         # Compute loss
         loss = loss_fn(preds, labels)
 
-        # check Nan Loss.
+        # check nan Loss.
         sf_misc.check_nan_losses(loss)
 
         # Perform the backward pass.
@@ -830,6 +807,10 @@ def _train_epoch(
         loss.backward()
         # Update the parameters.
         optimizer.step()
+
+        # Loss update
+        l_avg.update(loss.item())
+        l_wavg.update(loss.item())
 
         # Interiv evaluations
         for sslice, func in ibatch_actions:
@@ -903,21 +884,36 @@ def _preset_defaults(cfg):
             train: 32
             eval: 64
     period:
-        ibatch:
+        i_batch:
             loss_log: '::10'
             eval_krgb:
-                trainset: '0::1'
-                evalset: '0::1'
-        iepoch:
+                trainset: '0::10'
+                evalset: '0,50::100'
+        i_epoch:
             log: '::1'
+    CN:
+        SOLVER:
+          BASE_LR: 0.0375
+          LR_POLICY: steps_with_relative_lrs
+          LRS: [1, 0.1, 0.01, 0.001, 0.0001, 0.00001]
+          STEPS: [0, 41, 49]
+          MAX_EPOCH: 57
+          MOMENTUM: 0.9
+          WEIGHT_DECAY: 1e-4
+          WARMUP_EPOCHS: 4.0
+          WARMUP_START_LR: 0.0001
+          OPTIMIZING_METHOD: sgd
     """)
 
 def f_loss_log(local_vars):
-    loss = local_vars['loss']
     i_epoch = local_vars['i_epoch']
     i_batch = local_vars['i_batch']
     data_size = local_vars['data_size']
-    log.info(f'{i_epoch=}, {i_batch=}/{data_size}: loss {loss.item()}')
+    lr = local_vars['lr']
+    l_avg = local_vars['l_avg']
+    l_wavg = local_vars['l_wavg']
+    log.info(f'[{i_epoch}, {i_batch}/{data_size}] {lr=} '
+            f'loss(all/10/last): {l_avg.avg}/{l_wavg.avg}/{l_avg.last}')
 
 # EXPERIMENTS
 
@@ -926,22 +922,20 @@ def finetune_preextracted_krgb(workfolder, cfg_dict, add_args):
     Will finetune the c2d_1x1 model on preeextracted krgb frames only
     """
     out, = snippets.get_subfolders(workfolder, ['out'])
-    cfg = snippets.yconfig.YConfig_v2(cfg_dict,
-            allowed_wo_defaults=['OPTIMIZER_REMOTE.'])
+    cfg = snippets.YConfig_v2(cfg_dict,
+            allowed_wo_defaults=['CN.'])
     Ncfg_daly.set_defcfg_v2(cfg)
     _preset_defaults(cfg)
     cfg.set_defaults_yaml("""
-    OPTIMIZER_REMOTE:
+    CN:
         SOLVER:
-          BASE_LR: 0.01
-    """)
-    cfg.set_defaults_yaml("""
+          BASE_LR: 0.001
     period:
-        ibatch:
+        i_batch:
             loss_log: '::10'
     """, allow_overwrite=True)
     cf = cfg.parse()
-    sf_cfg, cn_optim = _config_preparations(cfg)
+    cn = _config_preparations(cfg.without_prefix('CN.'))
 
     # Seeds
     initial_seed = cf['seed']
@@ -959,27 +953,27 @@ def finetune_preextracted_krgb(workfolder, cfg_dict, add_args):
     tubes_dwein_d, tubes_dgt_d = load_gt_and_wein_tubes(
             cf['inputs.tubes_dwein'], dataset, vgroup)
     # Means
-    norm_mean_cu = np_to_gpu(sf_cfg.DATA.MEAN)
-    norm_std_cu = np_to_gpu(sf_cfg.DATA.STD)
+    norm_mean_cu = np_to_gpu(cn.DATA.MEAN)
+    norm_std_cu = np_to_gpu(cn.DATA.STD)
     # Sset
     tubes_dwein_eval = tubes_dwein_d[sset_eval]
     tubes_dgt_eval = tubes_dgt_d[sset_eval]
     vids_eval = vgroup[sset_eval]
 
     # Model
-    model_wf = Model_w_freezer(cf, sf_cfg, 10)
-    optimizer = construct_optimizer(model_wf.model, cn_optim)
+    model_wf = Model_w_freezer(cf, cn, 10)
+    optimizer = tsf_optim.construct_optimizer(model_wf.model, cn)
     loss_fn = torch.nn.CrossEntropyLoss(reduction='mean')
     model_wf.model.init_weights(0.01)
     model_wf.model_to_gpu()
 
     # / Training setup
-    max_epoch = cn_optim.SOLVER.MAX_EPOCH
+    max_epoch = cn.SOLVER.MAX_EPOCH
     man_lkrgb = Manager_loader_krgb(
             cf['inputs.keyframes_rgb'], dataset,
             norm_mean_cu, norm_std_cu)
     ibatch_actions = (
-        (cf['period.ibatch.loss_log'], f_loss_log),
+        (cf['period.i_batch.loss_log'], f_loss_log),
     )
     man_ckpt = Manager_model_checkpoints(model_wf.model, optimizer)
 
@@ -987,6 +981,14 @@ def finetune_preextracted_krgb(workfolder, cfg_dict, add_args):
     rundir = small.mkdir(out/'rundir')
     if '--new' in add_args:
         checkpoint_path = None
+        if len(list(rundir.iterdir())) > 0:
+            timestamp = datetime.fromtimestamp(
+                    rundir.stat().st_mtime).strftime('%Y-%m-%d_%H:%M:%S')
+            str_rnd = ''.join(random.choices(string.ascii_uppercase, k=3))
+            new_foldname = f'old_{timestamp}_{str_rnd}'
+            log.info(f'Existing experiment moved to {new_foldname}')
+            shutil.move(rundir, rundir.parent/new_foldname)
+            small.mkdir(rundir)
     else:
         checkpoint_path = (Manager_checkpoint_name.
                 find_last_checkpoint(rundir))
@@ -1000,7 +1002,7 @@ def finetune_preextracted_krgb(workfolder, cfg_dict, add_args):
                 vgroup[sset_train],
                 cf['train.batch_size.train'], train_sampler_rgen)
         _train_epoch(model_wf, train_loader, optimizer,
-                loss_fn, cn_optim, man_lkrgb.preprocess_data, i_epoch,
+                loss_fn, cn, man_lkrgb.preprocess_data, i_epoch,
                 ibatch_actions)
         # Save part
         man_ckpt.save_epoch(rundir, i_epoch)
@@ -1019,20 +1021,17 @@ def finetune_on_tubefeats(workfolder, cfg_dict, add_args):
     Will finetune the c2d_1x1 model directly on video frames
     """
     out, = snippets.get_subfolders(workfolder, ['out'])
-    cfg = snippets.yconfig.YConfig_v2(cfg_dict,
-            allowed_wo_defaults=['OPTIMIZER_REMOTE.'])
+    cfg = snippets.YConfig_v2(cfg_dict,
+            allowed_wo_defaults=['CN.'])
     Ncfg_daly.set_defcfg_v2(cfg)
     _preset_defaults(cfg)
     cfg.set_defaults_yaml("""
-    OPTIMIZER_REMOTE:
-        SOLVER:
-          BASE_LR: 0.01
     frame_coverage:
         keyframes: True
         subsample: 4
     """)
     cf = cfg.parse()
-    sf_cfg, cn_optim = _config_preparations(cfg)
+    cn = _config_preparations(cfg.without_prefix('CN.'))
 
     # Seeds
     initial_seed = cf['seed']
@@ -1050,40 +1049,42 @@ def finetune_on_tubefeats(workfolder, cfg_dict, add_args):
     tubes_dwein_d, tubes_dgt_d = load_gt_and_wein_tubes(
             cf['inputs.tubes_dwein'], dataset, vgroup)
     # Means
-    norm_mean_cu = np_to_gpu(sf_cfg.DATA.MEAN)
-    norm_std_cu = np_to_gpu(sf_cfg.DATA.STD)
+    norm_mean_cu = np_to_gpu(cn.DATA.MEAN)
+    norm_std_cu = np_to_gpu(cn.DATA.STD)
     # Sset
     tubes_dwein_eval = tubes_dwein_d[sset_eval]
     tubes_dgt_eval = tubes_dgt_d[sset_eval]
 
     # Model
-    model_wf = Model_w_freezer(cf, sf_cfg, 11)
-    optimizer = construct_optimizer(model_wf.model, cn_optim)
+    model_wf = Model_w_freezer(cf, cn, 11)
+    optimizer = tsf_optim.construct_optimizer(model_wf.model, cn)
     loss_fn = torch.nn.CrossEntropyLoss(reduction='mean')
     model_wf.model.init_weights(0.01)
     model_wf.model_to_gpu()
 
     # / Training setup
-    max_epoch = cn_optim.SOLVER.MAX_EPOCH
+    max_epoch = cn.SOLVER.MAX_EPOCH
     man_lkrgb = Manager_loader_krgb(
             cf['inputs.keyframes_rgb'], dataset,
             norm_mean_cu, norm_std_cu)
     man_lbox = Manager_loader_boxcons(
         tubes_dgt_d, tubes_dwein_d,
-        sset_train, dataset, sf_cfg, cf,
+        sset_train, dataset, cn, cf,
         norm_mean_cu, norm_std_cu)
 
     def f_ibatch_eval_krgb_evalset(local_vars):
+        i_epoch = local_vars['i_epoch']
+        i_batch = local_vars['i_batch']
         model_wf.set_eval()
         eval_krgb_loader, eval_krgb_keyframes = man_lkrgb.get_eval_loader(
             vgroup[sset_eval], cf['train.batch_size.eval'])
-        log.info(f'Perf at {i_epoch=}')
+        log.info(f'Perf at {i_epoch=}/{i_batch=}')
         _evaluate_krgb_perf(model_wf, eval_krgb_loader, eval_krgb_keyframes,
                 tubes_dwein_eval, tubes_dgt_eval, dataset,
                 man_lkrgb.preprocess_data, cut_off_bg=True)
     ibatch_actions = (
-        (cf['period.ibatch.loss_log'], f_loss_log),
-        (cf['period.ibatch.eval_krgb.evalset'],
+        (cf['period.i_batch.loss_log'], f_loss_log),
+        (cf['period.i_batch.eval_krgb.evalset'],
             f_ibatch_eval_krgb_evalset))
     man_ckpt = Manager_model_checkpoints(model_wf.model, optimizer)
 
@@ -1103,5 +1104,5 @@ def finetune_on_tubefeats(workfolder, cfg_dict, add_args):
         train_loader = man_lbox.get_train_loader(
                 cf['train.batch_size.train'], train_sampler_rgen)
         _train_epoch(model_wf, train_loader, optimizer,
-                loss_fn, cn_optim, man_lbox.preprocess_data, i_epoch,
+                loss_fn, cn, man_lbox.preprocess_data, i_epoch,
                 ibatch_actions)
