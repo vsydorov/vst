@@ -1,3 +1,4 @@
+from tqdm import tqdm
 import copy
 import string
 import random
@@ -34,8 +35,9 @@ from vsydorov_tools import cv as vt_cv
 from vsydorov_tools import log as vt_log
 
 from thes.data.dataset.daly import (
-    Ncfg_daly, get_daly_keyframes_to_cover,
-    load_gt_and_wein_tubes, create_keyframelist)
+    Ncfg_daly, sample_daly_frames_from_instances,
+    load_gt_and_wein_tubes, create_keyframelist,
+    to_keyframedict)
 from thes.data.dataset.external import (
     Dataset_daly_ocv, Vid_daly)
 from thes.data.tubes.types import (
@@ -48,7 +50,9 @@ from thes.data.tubes.routines import (
     group_tubes_on_frame_level,
     score_ftubes_via_objaction_overlap_aggregation,
     create_kinda_objaction_struct,
-    qload_synthetic_tube_labels
+    qload_synthetic_tube_labels,
+    temporal_ious_where_positive,
+    spatial_tube_iou_v3
     )
 
 from thes.evaluation.recall import (
@@ -519,6 +523,7 @@ class Manager_model_checkpoints(object):
         else:
             self.load_model_initial(self.model)
             start_epoch = training_start_epoch
+            log.info('Starting new training from epoch {}'.format(start_epoch))
         return start_epoch
 
 # def create_optimizer():
@@ -628,48 +633,12 @@ def _config_preparations(cf_override):
     return cn
 
 
-def _prepare_labeled_connections(
-        cf, dataset, tubes_dwein_train, dwti_to_label_train):
-    # Frames to cover: keyframes and every 4th frame
-    vids = list(dataset.videos_ocv.keys())
-    frames_to_cover: Dict[Vid_daly, np.ndarray] = \
-            get_daly_keyframes_to_cover(dataset, vids,
-                    cf['frame_coverage.keyframes'],
-                    cf['frame_coverage.subsample'])
-    cs_vf_train_unlabeled: \
-            Dict[Tuple[Vid_daly, int], Box_connections_dwti]
-    cs_vf_train_unlabeled = group_tubes_on_frame_level(
-            tubes_dwein_train, frames_to_cover)
-    # Add labels
-    cls_vf_train: Dict[Tuple[Vid_daly, int], Bc_dwti_labeled] = {}
-    for (vid, f), bc_dwti in cs_vf_train_unlabeled.items():
-        good_i = []
-        labels = []
-        for i, dwti in enumerate(bc_dwti['dwti_sources']):
-            if dwti in dwti_to_label_train:
-                label = dwti_to_label_train[dwti]
-                good_i.append(i)
-                labels.append(label)
-        if len(good_i):
-            vid = bc_dwti['vid']
-            frame_ind = bc_dwti['frame_ind']
-            boxes = [bc_dwti['boxes'][i] for i in good_i]
-            dwti_sources = [bc_dwti['dwti_sources'][i] for i in good_i]
-            bc_dwti_labeled: Bc_dwti_labeled = {
-                    'vid': vid,
-                    'frame_ind': frame_ind,
-                    'dwti_sources': dwti_sources,
-                    'boxes': boxes,
-                    'labels': np.array(labels)}
-            cls_vf_train[(vid, f)] = bc_dwti_labeled
-    return cls_vf_train
-
-
 class Manager_loader_krgb(object):
     def __init__(self, keyframes_rgb_fold, dataset,
             norm_mean_cu, norm_std_cu):
         krgb_prefix = Path(keyframes_rgb_fold)
-        self.krgb_array = np.load(krgb_prefix/'rgb.npy')
+        with small.QTimer('Loading rgb.npy'):
+            self.krgb_array = np.load(krgb_prefix/'rgb.npy')
         self.krgb_dict_outputs = \
                 small.load_pkl(krgb_prefix/'dict_outputs.pkl')
         self.krgb_bboxes = np.vstack(self.krgb_dict_outputs['bboxes'])
@@ -716,6 +685,260 @@ class Manager_loader_krgb(object):
         labels_c = labels.cuda()
         return frame_list_f32c, bboxes0_c, labels_c
 
+
+def match_dwein_to_dgt(
+        tubes_dgt: Dict[I_dgt, T_dgt],
+        tubes_dwein: Dict[I_dwein, T_dwein]
+        ) -> Dict[I_dwein, Tuple[I_dgt, float]]:
+    """
+    - For each DWEIN, find matching DGT tubes
+    - Select the DGT with best avg spatial overlap
+    """
+    # Record overlap hits
+    overlap_hits: Dict[I_dwein, Dict[I_dgt, float]] = {}
+    for dgt_index, gt_tube in tubes_dgt.items():
+        vid, action_name, ins_id = dgt_index
+        matched_dwt_vids = {k: v for k, v in tubes_dwein.items()
+                if k[0] == vid}
+        dwt_vid_keys = list(matched_dwt_vids.keys())
+        dwt_vid_values = list(matched_dwt_vids.values())
+        dwt_frange = np.array([
+            (x['start_frame'], x['end_frame']) for x in dwt_vid_values])
+        # Temporal
+        t_ious, pids = temporal_ious_where_positive(
+            gt_tube['start_frame'], gt_tube['end_frame'], dwt_frange)
+        # Spatial (where temporal >0)
+        dwt_intersect = [dwt_vid_values[pid] for pid in pids]
+        sp_mious = [spatial_tube_iou_v3(p, gt_tube)
+                for p in dwt_intersect]
+        for p, t_iou, sp_miou in zip(pids, t_ious, sp_mious):
+            st_iou = t_iou * sp_miou
+            if st_iou > 0:
+                dwt_vid = dwt_vid_keys[p]
+                overlap_hits.setdefault(dwt_vid, {})[dgt_index] = sp_miou
+    # Return only best hit
+    best_hits: Dict[I_dwein, Tuple[I_dgt, float]] = {}
+    for dwt_index, hits in overlap_hits.items():
+        hits_list = list(hits.items())
+        hits_list_sorted = sorted(hits_list, key=lambda x: x[1])
+        dgt_index, overlap = hits_list_sorted[-1]
+        best_hits[dwt_index] = (dgt_index, overlap)
+    return best_hits
+
+class TDataset_over_fgroups(torch.utils.data.Dataset):
+    def __init__(self, frame_groups, dataset,
+            sampler_grid, frameloader_vsf):
+        self.frame_groups = frame_groups
+        self.keys_vf = list(self.frame_groups.keys())
+        self.dataset = dataset
+        self.sampler_grid = sampler_grid
+        self.frameloader_vsf = frameloader_vsf
+
+    def __len__(self):
+        return len(self.frame_groups)
+
+    def __getitem__(self, index):
+        key_vf = self.keys_vf[index]
+        boxes = self.frame_groups[key_vf]
+        vid = boxes[0]['vid']
+        i0 = boxes[0]['frame_ind']
+        assert key_vf == (vid, i0)
+
+        video_path = str(self.dataset.videos_ocv[vid]['path'])
+        nframes = self.dataset.videos_ocv[vid]['nframes']
+        finds_to_sample = self.sampler_grid.apply(i0, nframes)
+        frame_list, resize_params, ccrop_params = \
+            self.frameloader_vsf.prepare_frame_list(
+                    video_path, finds_to_sample)
+
+        # Boxes
+        prepared_bboxes = []
+        for box in boxes:
+            prepared_bbox_tldr = self.frameloader_vsf.prepare_box(
+                box['box'], resize_params, ccrop_params)
+            prepared_bboxes.append(prepared_bbox_tldr)
+        prepared_bboxes = np.stack(prepared_bboxes, axis=0)
+
+        # labels
+        labels = []
+        for box in boxes:
+            labels.append(box['label'])
+        labels = np.array(labels)
+
+        meta = {
+            'labels': labels,
+            'index': index,
+            'ckey': key_vf,
+            'bboxes_tldr': prepared_bboxes,
+            'do_not_collate': True}
+        return (frame_list, meta)
+
+class Manager_loader_boxcons_improved(object):
+    def __init__(self, tubes_dgt_d, tubes_dwein_d,
+            sset_train, dataset, cn, stride,
+            norm_mean_cu, norm_std_cu):
+        self.dataset = dataset
+        self.norm_mean_cu = norm_mean_cu
+        self.norm_std_cu = norm_std_cu
+
+        tubes_dwein_train = tubes_dwein_d[sset_train]
+        tubes_dgt_train = tubes_dgt_d[sset_train]
+        self.dist_boxes = self._create_dist_boxes(
+                dataset, stride, tubes_dwein_train, tubes_dgt_train)
+
+        # Create keyframes
+        keyframes = create_keyframelist(dataset)
+        self.keyframes_dict = to_keyframedict(keyframes)
+
+        model_nframes = cn.DATA.NUM_FRAMES
+        model_sample = cn.DATA.SAMPLING_RATE
+        slowfast_alpha = cn.SLOWFAST.ALPHA
+        self.sampler_grid = Sampler_grid(model_nframes, model_sample)
+        self.frameloader_vsf = Frameloader_video_slowfast(
+                False, slowfast_alpha, 256)
+
+    def get_train_loader(self, batch_size, rgen, max_distance, add_keyframes=True):
+        # Merge FG and BG
+        labeled_boxes = []
+        for i, boxes in self.dist_boxes.items():
+            if i > max_distance:
+                break
+            for box in boxes:
+                (vid, bunch_id, tube_id) = box['dwti']
+                if box['kind'] == 'fg':
+                    (vid, action_name, ins_id) = box['dgti']
+                    label = self.dataset.action_names.index(action_name)
+                else:
+                    label = len(self.dataset.action_names)
+                lbox = {
+                    'vid': vid,
+                    'frame_ind': box['frame_ind'],
+                    'box': box['box'],
+                    'label': label}
+                labeled_boxes.append(lbox)
+        if add_keyframes:
+            # Merge keyframes too
+            for kf_ind, kf in self.keyframes_dict.items():
+                action_name = kf['action_name']
+                label = self.dataset.action_names.index(action_name)
+                lbox = {'vid': kf['vid'],
+                        'frame_ind': kf['frame0'],
+                        'box': kf['bbox'],
+                        'label': label}
+                labeled_boxes.append(lbox)
+
+        # Group into frame_groups
+        frame_groups: Dict[Tuple[Vid_daly, int], Dict] = {}
+        for lbox in labeled_boxes:
+            vid = lbox['vid']
+            frame_ind = lbox['frame_ind']
+            frame_groups.setdefault((vid, frame_ind), []).append(lbox)
+
+        # # Permute
+        # fg_list = list(frame_groups.items())
+        # fg_order = rgen.permutation(len(fg_list))
+        # fg_list = [fg_list[i] for i in fg_order]
+        # frame_groups = dict(fg_list)
+
+        # Loader
+        NUM_WORKERS = 8
+        td = TDataset_over_fgroups(frame_groups, self.dataset,
+                self.sampler_grid, self.frameloader_vsf)
+        sampler = NumpyRandomSampler(td, rgen)
+        loader = torch.utils.data.DataLoader(td,
+            batch_size=batch_size, num_workers=NUM_WORKERS,
+            sampler=sampler, shuffle=False,
+            pin_memory=True,
+            collate_fn=sequence_batch_collate_v2)
+        return loader
+
+    def preprocess_data(self, data_input):
+        frame_list, metas, = data_input
+        frame_list_f32c = [
+            to_gpu_normalize_permute(
+                x, self.norm_mean_cu,
+                self.norm_std_cu) for x in frame_list]
+
+        # bbox transformations
+        bboxes_np = [m['bboxes_tldr'] for m in metas]
+        counts = np.array([len(x) for x in bboxes_np])
+        batch_indices = np.repeat(np.arange(len(counts)), counts)
+        bboxes0 = np.c_[batch_indices, np.vstack(bboxes_np)]
+        bboxes0 = torch.from_numpy(bboxes0)
+        bboxes0_c = bboxes0.type(torch.cuda.FloatTensor)
+
+        # labels
+        labels_np = [m['labels'] for m in metas]
+        labels_np = np.hstack(labels_np)
+        labels_t = torch.from_numpy(labels_np)
+        labels_c = labels_t.cuda()
+        return frame_list_f32c, bboxes0_c, labels_c
+
+    @staticmethod
+    def _create_dist_boxes(
+            dataset, stride, tubes_dwein_train, tubes_dgt_train):
+        # Keyframes by which we divide
+        vids_kf_nums: Dict[Vid_daly, np.ndarray] = \
+                sample_daly_frames_from_instances(dataset, stride=0)
+        # Frames which we consider
+        vids_good_nums: Dict[Vid_daly, np.ndarray] = \
+                sample_daly_frames_from_instances(dataset, stride=stride)
+        # keyframes per dwt
+        dwtis_kf_nums = {}
+        dwtis_good_nums = {}
+        for dwt_index, dwt in tubes_dwein_train.items():
+            (vid, bunch_id, tube_id) = dwt_index
+            s, e = dwt['start_frame'], dwt['end_frame']
+            # kf_nums
+            vid_kf_nums = vids_kf_nums[vid]
+            vid_kf_nums = vid_kf_nums[
+                    (vid_kf_nums >= s) & (vid_kf_nums <= e)]
+            dwtis_kf_nums[dwt_index] = vid_kf_nums
+            # good_nums
+            vid_good_nums = vids_good_nums[vid]
+            vid_good_nums = vid_good_nums[
+                    (vid_good_nums >= s) & (vid_good_nums <= e)]
+            dwtis_good_nums[dwt_index] = vid_good_nums
+
+        # Associate tubes
+        best_hits: Dict[I_dwein, Tuple[I_dgt, float]] = match_dwein_to_dgt(
+            tubes_dgt_train, tubes_dwein_train)
+
+        # Compute distance, disperse
+        dist_boxes = {}
+        for dwti, dwt in tubes_dwein_train.items():
+            dwt = tubes_dwein_train[dwti]
+            kf_nums = dwtis_kf_nums[dwti]
+            good_nums = dwtis_good_nums[dwti]
+            # Distance matrix
+            M = np.zeros((len(kf_nums), len(good_nums)), dtype=np.int)
+            for i, kf in enumerate(kf_nums):
+                M[i] = np.abs(good_nums-kf)
+            best_dist = M.min(axis=0)
+            # Associate kf_nums and boxes
+            assert np.in1d(good_nums, dwt['frame_inds'].tolist()).all()
+            rel_inds = np.searchsorted(dwt['frame_inds'], good_nums)
+            boxes = [dwt['boxes'][j] for j in rel_inds]
+
+            # Determine foreground vs background
+            foreground = False
+            if dwti in best_hits:
+                dgti, iou = best_hits[dwti]
+                if iou >= 0.5:
+                    foreground = True
+
+            # Disperse boxes per dist
+            for f0, box, dist in zip(dwt['frame_inds'], boxes, best_dist):
+                metabox = {
+                    'frame_ind': f0, 'box': box, 'dwti': dwti}
+                if foreground:
+                    metabox.update({'kind': 'fg', 'dgti': dgti, 'iou': iou})
+                else:
+                    metabox.update({'kind': 'bg'})
+                dist_boxes.setdefault(dist, []).append(metabox)
+        dist_boxes = dict(sorted(list(dist_boxes.items())))
+        return dist_boxes
+
 class Manager_loader_boxcons(object):
     def __init__(self, tubes_dgt_d, tubes_dwein_d,
             sset_train, dataset, cn, cf,
@@ -729,7 +952,7 @@ class Manager_loader_boxcons(object):
         cls_labels, dwti_to_label_train = qload_synthetic_tube_labels(
                 tubes_dgt_d[sset_train], tubes_dwein_d[sset_train], dataset)
         self.cls_vf_train: Dict[Tuple[Vid_daly, int], Bc_dwti_labeled] = \
-            _prepare_labeled_connections(
+            self._prepare_labeled_connections(
                 cf, dataset, tubes_dwein_d[sset_train], dwti_to_label_train)
         # Prepare sampler
         model_nframes = cn.DATA.NUM_FRAMES
@@ -738,6 +961,41 @@ class Manager_loader_boxcons(object):
         self.sampler_grid = Sampler_grid(model_nframes, model_sample)
         self.frameloader_vsf = Frameloader_video_slowfast(
                 False, slowfast_alpha, 256)
+
+    @staticmethod
+    def _prepare_labeled_connections(
+            cf, dataset, tubes_dwein_train, dwti_to_label_train):
+        # Frames to cover: keyframes and every 4th frame
+        frames_to_cover: Dict[Vid_daly, np.ndarray] = \
+            sample_daly_frames_from_instances(
+                    dataset, cf['frame_coverage.subsample'])
+        cs_vf_train_unlabeled: \
+                Dict[Tuple[Vid_daly, int], Box_connections_dwti]
+        cs_vf_train_unlabeled = group_tubes_on_frame_level(
+                tubes_dwein_train, frames_to_cover)
+        # Add labels
+        cls_vf_train: Dict[Tuple[Vid_daly, int], Bc_dwti_labeled] = {}
+        for (vid, f), bc_dwti in cs_vf_train_unlabeled.items():
+            good_i = []
+            labels = []
+            for i, dwti in enumerate(bc_dwti['dwti_sources']):
+                if dwti in dwti_to_label_train:
+                    label = dwti_to_label_train[dwti]
+                    good_i.append(i)
+                    labels.append(label)
+            if len(good_i):
+                vid = bc_dwti['vid']
+                frame_ind = bc_dwti['frame_ind']
+                boxes = [bc_dwti['boxes'][i] for i in good_i]
+                dwti_sources = [bc_dwti['dwti_sources'][i] for i in good_i]
+                bc_dwti_labeled: Bc_dwti_labeled = {
+                        'vid': vid,
+                        'frame_ind': frame_ind,
+                        'dwti_sources': dwti_sources,
+                        'boxes': boxes,
+                        'labels': np.array(labels)}
+                cls_vf_train[(vid, f)] = bc_dwti_labeled
+        return cls_vf_train
 
     def get_train_loader(self, batch_size, rgen):
         NUM_WORKERS = 8
@@ -771,8 +1029,8 @@ class Manager_loader_boxcons(object):
         labels_np = [m['labels'] for m in metas]
         labels_np = np.hstack(labels_np)
         labels_t = torch.from_numpy(labels_np)
-        labels_cuda = labels_t.cuda()
-        return frame_list_f32c, bboxes0_c, labels_cuda
+        labels_c = labels_t.cuda()
+        return frame_list_f32c, bboxes0_c, labels_c
 
 def _train_epoch(
         model_wf, train_loader, optimizer, loss_fn,
@@ -885,10 +1143,10 @@ def _preset_defaults(cfg):
             eval: 64
     period:
         i_batch:
-            loss_log: '::10'
+            loss_log: '0::10'
             eval_krgb:
                 trainset: '0::10'
-                evalset: '0,50::100'
+                evalset: '0,50::50'
         i_epoch:
             log: '::1'
     CN:
@@ -1027,7 +1285,6 @@ def finetune_on_tubefeats(workfolder, cfg_dict, add_args):
     _preset_defaults(cfg)
     cfg.set_defaults_yaml("""
     frame_coverage:
-        keyframes: True
         subsample: 4
     """)
     cf = cfg.parse()
@@ -1067,9 +1324,11 @@ def finetune_on_tubefeats(workfolder, cfg_dict, add_args):
     man_lkrgb = Manager_loader_krgb(
             cf['inputs.keyframes_rgb'], dataset,
             norm_mean_cu, norm_std_cu)
-    man_lbox = Manager_loader_boxcons(
+
+    stride = cf['frame_coverage.subsample']
+    man_lbox_improved = Manager_loader_boxcons_improved(
         tubes_dgt_d, tubes_dwein_d,
-        sset_train, dataset, cn, cf,
+        sset_train, dataset, cn, stride,
         norm_mean_cu, norm_std_cu)
 
     def f_ibatch_eval_krgb_evalset(local_vars):
@@ -1099,10 +1358,19 @@ def finetune_on_tubefeats(workfolder, cfg_dict, add_args):
 
     # Training
     for i_epoch in range(start_epoch, max_epoch):
+        log.info(f'New epoch {i_epoch}')
         # Train part
         model_wf.set_train()
-        train_loader = man_lbox.get_train_loader(
-                cf['train.batch_size.train'], train_sampler_rgen)
+        if i_epoch == 0:
+            max_distance = -1
+        elif i_epoch < 1:
+            max_distance = 0
+        elif i_epoch < 2:
+            max_distance = 4
+        else:
+            max_distance = 20
+        train_loader = man_lbox_improved.get_train_loader(
+                cf['train.batch_size.train'], train_sampler_rgen, max_distance)
         _train_epoch(model_wf, train_loader, optimizer,
-                loss_fn, cn, man_lbox.preprocess_data, i_epoch,
+                loss_fn, cn, man_lbox_improved.preprocess_data, i_epoch,
                 ibatch_actions)

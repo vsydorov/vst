@@ -61,9 +61,25 @@ class Ncfg_daly:
         return vgroup
 
 
-def get_daly_keyframes_to_cover(
-        dataset, vids, add_keyframes: bool, every_n: int,
+def sample_daly_frames_from_instances(
+        dataset: Dataset_daly_ocv,
+        stride: int,
+        add_keyframes: bool = True,
+        include_diff: bool = True,
+        vids: List[Vid_daly] = None,
         ) -> Dict[Vid_daly, np.ndarray]:
+    """
+    Universal helper function to get a subset of daly frame numbers,
+      corresponding to GT instance annotations
+    Args:
+        - stride: if > 0, will sample instance frames at this stride
+        - keyframes: include annotated keyframes
+        - include_diff: include difficult instances
+    Returns:
+        - frames numbers per each vid
+    """
+    if vids is None:
+        vids = list(dataset.videos_ocv.keys())
     frames_to_cover: Dict[Vid_daly, np.ndarray] = {}
     for vid in vids:
         v = dataset.videos_ocv[vid]
@@ -71,6 +87,10 @@ def get_daly_keyframes_to_cover(
         instance_ranges = []
         for action_name, instances in v['instances'].items():
             for ins_ind, instance in enumerate(instances):
+                fl = instance['flags']
+                diff = fl['isReflection'] or fl['isAmbiguous']
+                if not include_diff and diff:
+                    continue
                 s, e = instance['start_frame'], instance['end_frame']
                 keyframes = [int(kf['frame'])
                         for kf in instance['keyframes']]
@@ -79,8 +99,8 @@ def get_daly_keyframes_to_cover(
         for s, e, keyframes in instance_ranges:
             if add_keyframes:
                 good |= set(keyframes)
-            if every_n > 0:
-                good |= set(range(s, e+1, every_n))
+            if stride > 0:
+                good |= set(range(s, e+1, stride))
         frames_to_cover[vid] = np.array(sorted(good))
     return frames_to_cover
 

@@ -27,7 +27,7 @@ from vsydorov_tools import cv as vt_cv
 from vsydorov_tools import log as vt_log
 
 from thes.data.dataset.daly import (
-    get_daly_keyframes_to_cover, create_keyframelist)
+    sample_daly_frames_from_instances, create_keyframelist)
 from thes.data.dataset.external import (
     Dataset_daly_ocv, Vid_daly)
 from thes.data.tubes.types import (
@@ -405,7 +405,6 @@ def probe_philtubes_for_extraction(workfolder, cfg_dict, add_args):
         num_workers: [12, int]
         save_interval: [300, int]
     frame_coverage:
-        keyframes: [True, bool]
         subsample: [16, int]
     compute_split:
         enabled: [False, bool]
@@ -423,11 +422,9 @@ def probe_philtubes_for_extraction(workfolder, cfg_dict, add_args):
     tubes_dwein: Dict[I_dwein, T_dwein] = \
             loadconvert_tubes_dwein(cf['tubes_dwein'])
     # Frames to cover: keyframes and every 16th frame
-    vids = list(dataset.videos_ocv.keys())
     frames_to_cover: Dict[Vid_daly, np.ndarray] = \
-            get_daly_keyframes_to_cover(dataset, vids,
-                    cf['frame_coverage.keyframes'],
-                    cf['frame_coverage.subsample'])
+        sample_daly_frames_from_instances(
+                dataset, cf['frame_coverage.subsample'])
     connections_f: Dict[Tuple[Vid_daly, int], Box_connections_dwti]
     connections_f = group_tubes_on_frame_level(
             tubes_dwein, frames_to_cover)
@@ -585,7 +582,6 @@ def combine_probed_philtubes(workfolder, cfg_dict, add_args):
         mirror: ['uname', ~]
     tubes_dwein: [~, str]
     frame_coverage:
-        keyframes: [True, bool]
         subsample: [16, int]
     output_type: ['h5', ['h5', 'np', 'h5_chunked']]
     """)
@@ -599,11 +595,9 @@ def combine_probed_philtubes(workfolder, cfg_dict, add_args):
     tubes_dwein: Dict[I_dwein, T_dwein] = \
             loadconvert_tubes_dwein(cf['tubes_dwein'])
     # Frames to cover: keyframes and every 16th frame
-    vids = list(dataset.videos_ocv.keys())
     frames_to_cover: Dict[Vid_daly, np.ndarray] = \
-            get_daly_keyframes_to_cover(dataset, vids,
-                    cf['frame_coverage.keyframes'],
-                    cf['frame_coverage.subsample'])
+        sample_daly_frames_from_instances(
+                dataset, cf['frame_coverage.subsample'])
     connections_f: Dict[Tuple[Vid_daly, int], Box_connections_dwti]
     connections_f = group_tubes_on_frame_level(
             tubes_dwein, frames_to_cover)

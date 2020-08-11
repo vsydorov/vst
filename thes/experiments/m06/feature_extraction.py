@@ -26,7 +26,7 @@ from vsydorov_tools import log as vt_log
 from slowfast.models.video_model_builder import _POOL1 as SF_POOL1
 
 from thes.data.dataset.daly import (
-    Ncfg_daly, get_daly_keyframes_to_cover,
+    Ncfg_daly, sample_daly_frames_from_instances,
     create_keyframelist, to_keyframedict)
 from thes.data.dataset.external import (
     Dataset_daly_ocv, Vid_daly)
@@ -378,7 +378,6 @@ def extract_philtube_features(workfolder, cfg_dict, add_args):
     cfg.set_deftype("""
     tubes_dwein: [~, str]
     frame_coverage:
-        keyframes: [True, bool]
         subsample: [16, int]
     compute_split:
         enabled: [False, bool]
@@ -397,11 +396,8 @@ def extract_philtube_features(workfolder, cfg_dict, add_args):
     tubes_dwein: Dict[I_dwein, T_dwein] = \
             loadconvert_tubes_dwein(cf['tubes_dwein'])
     # // Frames to cover: keyframes and every 16th frame
-    vids = list(dataset.videos_ocv.keys())
     frames_to_cover: Dict[Vid_daly, np.ndarray] = \
-            get_daly_keyframes_to_cover(dataset, vids,
-                    cf['frame_coverage.keyframes'],
-                    cf['frame_coverage.subsample'])
+        sample_daly_frames_from_instances(dataset, cf['frame_coverage.subsample'])
     connections_f: Dict[Tuple[Vid_daly, int], Box_connections_dwti]
     connections_f = group_tubes_on_frame_level(
             tubes_dwein, frames_to_cover)
@@ -488,11 +484,8 @@ def combine_split_philtube_features(workfolder, cfg_dict, add_args):
     tubes_dwein: Dict[I_dwein, T_dwein] = \
             loadconvert_tubes_dwein(cf['tubes_dwein'])
     # // Frames to cover: keyframes and every 16th frame
-    vids = list(dataset.videos_ocv.keys())
     frames_to_cover: Dict[Vid_daly, np.ndarray] = \
-            get_daly_keyframes_to_cover(dataset, vids,
-                    cf['frame_coverage.keyframes'],
-                    cf['frame_coverage.subsample'])
+        sample_daly_frames_from_instances(dataset, cf['frame_coverage.subsample'])
     connections_f: Dict[Tuple[Vid_daly, int], Box_connections_dwti]
     connections_f = group_tubes_on_frame_level(
             tubes_dwein, frames_to_cover)

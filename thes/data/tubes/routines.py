@@ -266,14 +266,17 @@ def group_tubes_on_frame_level(
     return connections
 
 
-def record_overlaps(tubes_dgt, tubes_dwein):
-    overlap_hits = {}
+def record_overlaps(
+        tubes_dgt: Dict[I_dgt, T_dgt],
+        tubes_dwein: Dict[I_dwein, T_dwein]):
+    overlap_hits: Dict[I_dwein, List[
+        Tuple[Action_name_daly, Tuple[float, float, float]]]] = {}
     for dgt_index, gt_tube in tubes_dgt.items():
         vid, action_name, ins_id = dgt_index
-        dwt_vid = {k: v for k, v in tubes_dwein.items()
+        matched_dwt_vids = {k: v for k, v in tubes_dwein.items()
                 if k[0] == vid}
-        dwt_vid_keys = list(dwt_vid.keys())
-        dwt_vid_values = list(dwt_vid.values())
+        dwt_vid_keys = list(matched_dwt_vids.keys())
+        dwt_vid_values = list(matched_dwt_vids.values())
         dwt_frange = np.array([
             (x['start_frame'], x['end_frame']) for x in dwt_vid_values])
         # Temporal
@@ -288,7 +291,7 @@ def record_overlaps(tubes_dgt, tubes_dwein):
             if st_iou > 0:
                 dwt_vid = dwt_vid_keys[p]
                 overlap_hits.setdefault(dwt_vid, []).append(
-                        [action_name, (t_iou, sp_miou, st_iou)])
+                        (action_name, (t_iou, sp_miou, st_iou)))
     best_ious = {}
     for k, v in overlap_hits.items():
         vsorted_last = sorted(v, key=lambda x: x[1][0])[-1]
