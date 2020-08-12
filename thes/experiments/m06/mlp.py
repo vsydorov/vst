@@ -15,7 +15,8 @@ import torch.nn.functional as F
 from vsydorov_tools import small
 
 from thes.data.dataset.daly import (
-    Ncfg_daly, load_gt_and_wein_tubes)
+    Ncfg_daly, load_gt_and_wein_tubes,
+    group_dwein_frames_wrt_kf_distance)
 from thes.data.dataset.external import (
     Dataset_daly_ocv, Vid_daly)
 from thes.data.tubes.types import (
@@ -57,6 +58,14 @@ class Ncfg_kfeats:
                 featname: [~, ~]
         """)
 
+    def set_defcfg_v2(cfg):
+        cfg.set_defaults_yaml("""
+        inputs:
+            keyframes:
+                fold: ~
+                featname: ~
+        """)
+
     @staticmethod
     def split_off(X, linked_vids, good_vids):
         if isinstance(X, np.ndarray):
@@ -78,18 +87,38 @@ class Ncfg_kfeats:
         return d
 
     @staticmethod
-    def load(cf, vgroup) -> Dict[str, E_kfeats]:
+    def load_scale(cf, vgroup):
         # Produce keyframe datasets realquick
         featname = cf['inputs.keyframes.featname']
         keyframes_featfold = Path(cf['inputs.keyframes.fold'])
         keyframes = small.load_pkl(keyframes_featfold/'keyframes.pkl')
         outputs = small.load_pkl(
                 keyframes_featfold/'dict_outputs.pkl')[featname]
-        kfeats_d = {}
+
+        kfeats_d: Dict[str, E_kfeats] = {}
         for sset, vids in vgroup.items():
             kfeats_d[sset] = Ncfg_kfeats.split_off_D(
                     outputs, keyframes, vids)
-        return kfeats_d
+        # Scale
+        if cf['data_scaler'] == 'keyframes':
+            scaler = Ncfg_kfeats.fitscale_kfeats(kfeats_d)
+        elif cf['data_scaler'] == 'no':
+            scaler = None
+        else:
+            raise RuntimeError()
+
+        # To torch
+        tkfeats_d: Dict[str, E_tkfeats] = Ncfg_kfeats.to_torch(kfeats_d)
+        return tkfeats_d, scaler
+
+    @staticmethod
+    def fitscale_kfeats(kfeats_d):
+        # Optional standard scaling on trianval
+        scaler = StandardScaler()
+        scaler.fit(kfeats_d['trainval']['X'])
+        for sset, kfeats in kfeats_d.items():
+            kfeats['X'] = scaler.transform(kfeats['X'])
+        return scaler
 
     @staticmethod
     def to_torch(kfeats_d: Dict[str, E_kfeats]) -> Dict[str, E_tkfeats]:
@@ -170,100 +199,6 @@ class Net_mlp_onelayer(nn.Module):
         return result
 
 
-def fitscale_kfeats(kfeats_d):
-    # Optional standard scaling on trianval
-    scaler = StandardScaler()
-    scaler.fit(kfeats_d['trainval']['X'])
-    for sset, kfeats in kfeats_d.items():
-        kfeats['X'] = scaler.transform(kfeats['X'])
-    return scaler
-
-
-def get_dwti_big_mapping(
-        connections_f, box_inds2
-        ) -> Dict[I_dwein, np.ndarray]:
-    dwti_h5_inds: Dict[I_dwein, np.ndarray] = {}
-    for con, bi2 in zip(connections_f.values(), box_inds2):
-        bi_range = np.arange(bi2[0], bi2[1])
-        for dwti, bi in zip(con['dwti_sources'], bi_range):
-            dwti_h5_inds.setdefault(dwti, []).append(bi)
-    dwti_h5_inds = {k: np.array(sorted(v))
-            for k, v in dwti_h5_inds.items()}
-    return dwti_h5_inds
-
-
-def load_big_features(tubes_featfold):
-    """Load whole npy file"""
-    tubes_featfold = Path(tubes_featfold)
-    # Load connections, arrange back into dwt_index based structure
-    connections_f: Dict[Tuple[Vid_daly, int], Box_connections_dwti] = \
-            small.load_pkl(tubes_featfold/'connections_f.pkl')
-    # (N_frames, 2) ndarray of BIG indices
-    box_inds2 = small.load_pkl(tubes_featfold/'box_inds2.pkl')
-    # Mapping dwti -> 1D ndarray of BIG indices
-    dwti_to_inds_big = get_dwti_big_mapping(connections_f, box_inds2)
-    # Features
-    with small.QTimer('big numpy load'):
-        BIG = np.load(str(tubes_featfold/"feats.npy"))
-    return BIG, dwti_to_inds_big
-
-
-class TD_thin_over_BIG(torch.utils.data.Dataset):
-    def __init__(self, BIG, batches, scaler):
-        self.BIG = BIG
-        self.batches = batches
-        self.scaler = scaler
-
-    def __getitem__(self, index):
-        binds, labels = self.batches[index]
-        # Perform h5 feature extraction
-        feats = self.BIG[binds]
-        feats = feats.astype(np.float32)
-        if self.scaler is not None:
-            feats = self.scaler.transform(feats)
-        return feats, labels
-
-    def __len__(self):
-        return len(self.batches)
-
-
-def _quick_shuffle_batches(dwti_to_inds_big, rgen, dwti_to_label,
-        TUBES_PER_BATCH, FRAMES_PER_TUBE):
-    # / Prepare dataset and data loader
-    # // Batch tubes together (via their linds)
-    # 11k labeled trainval tubes
-    linds_order = rgen.permutation(np.arange(len(dwti_to_label)))
-    b = np.arange(0, len(linds_order), TUBES_PER_BATCH)[1:]
-    batched_linds = np.split(linds_order, b)
-
-    dwti_to_label_kv = list(dwti_to_label.items())
-
-    batches = []
-    for linds in batched_linds:
-        batch_binds = []
-        batch_labels = []
-        for li in linds:
-            dwti, label = dwti_to_label_kv[li]
-            binds = dwti_to_inds_big[dwti]
-            replace = FRAMES_PER_TUBE > len(binds)
-            chosen_binds = rgen.choice(binds, FRAMES_PER_TUBE, replace)
-            batch_binds.extend(chosen_binds)
-            batch_labels.extend([label]*FRAMES_PER_TUBE)
-        batch_binds = np.array(batch_binds)
-        batch_labels = np.array(batch_labels)
-        batches.append([batch_binds, batch_labels])
-    return batches
-
-
-def _quick_dataloader(BIG, batches, scaler):
-    # // torch dataset
-    td_h5 = TD_thin_over_BIG(BIG, batches, scaler)
-    loader = torch.utils.data.DataLoader(td_h5,
-        batch_size=None, num_workers=0,
-        collate_fn=None)
-    return loader
-
-
 class Data_access_big(object):
     def __init__(self, BIG, dwti_to_inds_big, scaler):
         self.BIG = BIG
@@ -281,10 +216,202 @@ class Data_access_big(object):
 
     def produce_loader(self, rgen, dwti_to_label_train,
             tubes_per_batch, frames_per_tube):
-        batches = _quick_shuffle_batches(
+        batches = Data_access_big._quick_shuffle_batches(
             self.dwti_to_inds_big, rgen, dwti_to_label_train,
             tubes_per_batch, frames_per_tube)
-        loader = _quick_dataloader(self.BIG, batches, self.scaler)
+        loader = Data_access_big._quick_dataloader(self.BIG, batches, self.scaler)
+        return loader
+
+    @staticmethod
+    def _quick_shuffle_batches(dwti_to_inds_big, rgen, dwti_to_label,
+            TUBES_PER_BATCH, FRAMES_PER_TUBE):
+        # / Prepare dataset and data loader
+        # // Batch tubes together (via their linds)
+        # 11k labeled trainval tubes
+        linds_order = rgen.permutation(np.arange(len(dwti_to_label)))
+        b = np.arange(0, len(linds_order), TUBES_PER_BATCH)[1:]
+        batched_linds = np.split(linds_order, b)
+
+        dwti_to_label_kv = list(dwti_to_label.items())
+
+        batches = []
+        for linds in batched_linds:
+            batch_binds = []
+            batch_labels = []
+            for li in linds:
+                dwti, label = dwti_to_label_kv[li]
+                binds = dwti_to_inds_big[dwti]
+                replace = FRAMES_PER_TUBE > len(binds)
+                chosen_binds = rgen.choice(binds, FRAMES_PER_TUBE, replace)
+                batch_binds.extend(chosen_binds)
+                batch_labels.extend([label]*FRAMES_PER_TUBE)
+            batch_binds = np.array(batch_binds)
+            batch_labels = np.array(batch_labels)
+            batches.append([batch_binds, batch_labels])
+        return batches
+
+    class TD_thin_over_BIG(torch.utils.data.Dataset):
+        def __init__(self, BIG, batches, scaler):
+            self.BIG = BIG
+            self.batches = batches
+            self.scaler = scaler
+
+        def __getitem__(self, index):
+            binds, labels = self.batches[index]
+            # Perform h5 feature extraction
+            feats = self.BIG[binds]
+            feats = feats.astype(np.float32)
+            if self.scaler is not None:
+                feats = self.scaler.transform(feats)
+            return feats, labels
+
+        def __len__(self):
+            return len(self.batches)
+
+    @staticmethod
+    def _quick_dataloader(BIG, batches, scaler):
+        # // torch dataset
+        td_h5 = Data_access_big.TD_thin_over_BIG(
+                BIG, batches, scaler)
+        loader = torch.utils.data.DataLoader(td_h5,
+            batch_size=None, num_workers=0,
+            collate_fn=None)
+        return loader
+
+    @staticmethod
+    def get_dwti_big_mapping(
+            connections_f: Dict[Tuple[Vid_daly, int], Box_connections_dwti],
+            box_inds2
+            ) -> Dict[I_dwein, np.ndarray]:
+        dwti_h5_inds: Dict[I_dwein, np.ndarray] = {}
+        for con, bi2 in zip(connections_f.values(), box_inds2):
+            bi_range = np.arange(bi2[0], bi2[1])
+            for dwti, bi in zip(con['dwti_sources'], bi_range):
+                dwti_h5_inds.setdefault(dwti, []).append(bi)
+        dwti_h5_inds = {k: np.array(sorted(v))
+                for k, v in dwti_h5_inds.items()}
+        return dwti_h5_inds
+
+    @staticmethod
+    def load_big_features(tubes_featfold):
+        """Load whole npy file"""
+        tubes_featfold = Path(tubes_featfold)
+        # Load connections, arrange back into dwt_index based structure
+        connections_f: Dict[Tuple[Vid_daly, int], Box_connections_dwti] = \
+                small.load_pkl(tubes_featfold/'connections_f.pkl')
+        # (N_frames, 2) ndarray of BIG indices
+        box_inds2 = small.load_pkl(tubes_featfold/'box_inds2.pkl')
+        # Mapping dwti -> 1D ndarray of BIG indices
+        dwti_to_inds_big = Data_access_big.get_dwti_big_mapping(
+                connections_f, box_inds2)
+        # Features
+        with small.QTimer('big numpy load'):
+            BIG = np.load(str(tubes_featfold/"feats.npy"))
+        return BIG, dwti_to_inds_big
+
+
+class TDataset_over_bilinked_boxes(torch.utils.data.Dataset):
+    def __init__(self, frame_groups, BIG, scaler):
+        self.frame_groups = frame_groups
+        self.keys_vf = list(frame_groups.keys())
+        self.BIG = BIG
+        self.scaler = scaler
+
+    def __getitem__(self, index):
+        key_vf = self.keys_vf[index]
+        boxes = self.frame_groups[key_vf]
+
+        # Features
+        bis = np.array([b['bi'] for b in boxes])
+        feats = self.BIG[bis]
+        feats = feats.astype(np.float32)
+        if self.scaler is not None:
+            feats = self.scaler.transform(feats)
+
+        # Labels
+        labels = np.array([b['label'] for b in boxes])
+
+        meta = {'feats': feats, 'labels': labels, 'do_not_collate': True}
+        return (meta,)
+
+    def __len__(self):
+        return len(self.frame_groups)
+
+
+class Manager_loader_big_v2(object):
+    def __init__(self, tubes_featfold, scaler, stride,
+            dataset, tubes_dwein_train, tubes_dgt_train):
+        self.dataset = dataset
+        self.scaler = scaler
+
+        tubes_featfold = Path(tubes_featfold)
+        connections_f: Dict[Tuple[Vid_daly, int], Box_connections_dwti] = \
+                small.load_pkl(tubes_featfold/'connections_f.pkl')
+        box_inds2 = small.load_pkl(tubes_featfold/'box_inds2.pkl')
+        # DWTI -> Frame -> bi (big index)
+        with small.QTimer('Creating dwti -> big index structure'):
+            dwti_f_bi = {}
+            for con, bi2 in zip(connections_f.values(), box_inds2):
+                bi_range = np.arange(bi2[0], bi2[1])
+                for dwti, bi in zip(con['dwti_sources'], bi_range):
+                    dwti_f_bi.setdefault(dwti, {})[con['frame_ind']] = bi
+        # Features
+        with small.QTimer('big numpy load'):
+            BIG = np.load(str(tubes_featfold/"feats.npy"))
+        self.dwti_f_bi = dwti_f_bi
+        self.BIG = BIG
+
+        # Boxes sorted by distance
+        self.dist_boxes_train = group_dwein_frames_wrt_kf_distance(
+            dataset, stride, tubes_dwein_train, tubes_dgt_train)
+
+    def get(self, model, dwti):
+        inds_big = np.array(list(self.dwti_f_bi[dwti].values()))
+        feats = self.BIG[inds_big]
+        feats = feats.astype(np.float32)
+        if self.scaler is not None:
+            feats = self.scaler.transform(feats)
+        feats = torch.from_numpy(feats)
+        return feats
+
+    def get_train_loader(
+            self, batch_size, rgen, max_distance, add_keyframes=True):
+        labeled_boxes = []
+        for i, boxes in self.dist_boxes_train.items():
+            if i > max_distance:
+                break
+            for box in boxes:
+                (vid, bunch_id, tube_id) = box['dwti']
+                bi = self.dwti_f_bi[box['dwti']][box['frame_ind']]
+                if box['kind'] == 'fg':
+                    (vid, action_name, ins_id) = box['dgti']
+                    label = self.dataset.action_names.index(action_name)
+                else:
+                    label = len(self.dataset.action_names)
+                lbox = {
+                    'vid': vid,
+                    'frame_ind': box['frame_ind'],
+                    'bi': bi,
+                    'box': box['box'],
+                    'label': label}
+                labeled_boxes.append(lbox)
+
+        # Group into frame_groups
+        frame_groups: Dict[Tuple[Vid_daly, int], Dict] = {}
+        for lbox in labeled_boxes:
+            vid = lbox['vid']
+            frame_ind = lbox['frame_ind']
+            frame_groups.setdefault((vid, frame_ind), []).append(lbox)
+
+        # Loader
+        NUM_WORKERS = 0
+        td = TDataset_over_bilinked_boxes(frame_groups, self.BIG, self.scaler)
+        sampler = NumpyRandomSampler(td, rgen)
+        loader = torch.utils.data.DataLoader(td,
+            batch_size=batch_size, num_workers=NUM_WORKERS,
+            sampler=sampler, shuffle=False,
+            pin_memory=True,
+            collate_fn=sequence_batch_collate_v2)
         return loader
 
 
@@ -306,26 +433,26 @@ class Full_train_sampler(Train_sampler):
         return loss
 
 
-class TD_over_feats(torch.utils.data.Dataset):
-    def __init__(self, feats, labels, keyframes):
-        self.feats = feats
-        self.labels = labels
-        self.keyframes = keyframes
-
-    def __len__(self):
-        return len(self.feats)
-
-    def __getitem__(self, index):
-        feat = self.feats[index]
-        label = self.labels[index]
-        keyframe = self.keyframes[index]
-        keyframe['do_not_collate'] = True
-        return feat, label, keyframe
-
-
 class Partial_Train_sampler(Train_sampler):
+
+    class TD_over_feats(torch.utils.data.Dataset):
+        def __init__(self, feats, labels, keyframes):
+            self.feats = feats
+            self.labels = labels
+            self.keyframes = keyframes
+
+        def __len__(self):
+            return len(self.feats)
+
+        def __getitem__(self, index):
+            feat = self.feats[index]
+            label = self.labels[index]
+            keyframe = self.keyframes[index]
+            keyframe['do_not_collate'] = True
+            return feat, label, keyframe
+
     def __init__(self, tkfeats_train, initial_seed, TRAIN_BATCH_SIZE):
-        td_sstrain = TD_over_feats(
+        td_sstrain = Partial_Train_sampler.TD_over_feats(
                 tkfeats_train['X'],
                 tkfeats_train['Y'],
                 tkfeats_train['kf'])
@@ -826,23 +953,17 @@ def kffeats_train_mlp(workfolder, cfg_dict, add_args):
     # Inputs
     dataset = Ncfg_daly.get_dataset(cf)
     vgroup = Ncfg_daly.get_vids(cf, dataset)
-    kfeats_d = Ncfg_kfeats.load(cf, vgroup)
-    if cf['data_scaler'] == 'keyframes':
-        scaler = fitscale_kfeats(kfeats_d)
-    elif cf['data_scaler'] == 'no':
-        scaler = None
-    else:
-        raise RuntimeError()
+    tkfeats_d, scaler = Ncfg_kfeats.load_scale(cf, vgroup)
     tubes_dwein_d, tubes_dgt_d = load_gt_and_wein_tubes(
             cf['inputs.tubes_dwein'], dataset, vgroup)
     if cf['eval.full_tubes']:
-        BIG, dwti_to_inds_big = load_big_features(cf['inputs.big.fold'])
+        BIG, dwti_to_inds_big = Data_access_big.load_big_features(
+                cf['inputs.big.fold'])
         da_big = Data_access_big(BIG, dwti_to_inds_big, scaler)
     else:
         da_big = None
 
     # / Torch section
-    tkfeats_d: Dict[str, E_tkfeats] = Ncfg_kfeats.to_torch(kfeats_d)
     tkfeats_train = tkfeats_d[sset_train]
     tkfeats_eval = tkfeats_d[sset_eval]
     tubes_dwein_eval = tubes_dwein_d[sset_eval]
@@ -923,16 +1044,12 @@ def tubefeats_train_mlp(workfolder, cfg_dict, add_args):
     # Inputs
     dataset = Ncfg_daly.get_dataset(cf)
     vgroup = Ncfg_daly.get_vids(cf, dataset)
-    kfeats_d = Ncfg_kfeats.load(cf, vgroup)
-    if cf['data_scaler'] == 'keyframes':
-        scaler = fitscale_kfeats(kfeats_d)
-    elif cf['data_scaler'] == 'no':
-        scaler = None
-    else:
-        raise RuntimeError()
+    tkfeats_d, scaler = Ncfg_kfeats.load_scale(cf, vgroup)
+
     tubes_dwein_d, tubes_dgt_d = load_gt_and_wein_tubes(
             cf['inputs.tubes_dwein'], dataset, vgroup)
-    BIG, dwti_to_inds_big = load_big_features(cf['inputs.big.fold'])
+    BIG, dwti_to_inds_big = Data_access_big.load_big_features(
+            cf['inputs.big.fold'])
     da_big = Data_access_big(BIG, dwti_to_inds_big, scaler)
 
     cls_labels, dwti_to_label_train = qload_synthetic_tube_labels(
@@ -941,7 +1058,6 @@ def tubefeats_train_mlp(workfolder, cfg_dict, add_args):
             tubes_dgt_d[sset_eval], tubes_dwein_d[sset_eval], dataset)
 
     # / Torch section
-    tkfeats_d: Dict[str, E_tkfeats] = Ncfg_kfeats.to_torch(kfeats_d)
     tkfeats_train = tkfeats_d[sset_train]
     tkfeats_eval = tkfeats_d[sset_eval]
     tubes_dwein_eval = tubes_dwein_d[sset_eval]
@@ -974,3 +1090,150 @@ def tubefeats_train_mlp(workfolder, cfg_dict, add_args):
             to_avg, keys=range(len(to_avg)), axis=1).mean(axis=1, level=1)
     log.info('Results for average over {} trials'.format(n_trials))
     _tubefeats_display_evalresults(avg_result, sset_eval)
+
+
+def tubefeats_dist_train_mlp(workfolder, cfg_dict, add_args):
+    """
+    Training of MLP trainfeats in the same way as we finetune stuff
+    """
+    out, = snippets.get_subfolders(workfolder, ['out'])
+    cfg = snippets.YConfig_v2(cfg_dict)
+    Ncfg_daly.set_defcfg_v2(cfg)
+    Ncfg_kfeats.set_defcfg_v2(cfg)
+    cfg.set_defaults_yaml("""
+    inputs:
+        tubes_dwein: ~
+        big:
+            fold: ~
+    seed: 42
+    split_assignment: !def ['train/val',
+        ['train/val', 'trainval/test']]
+    data_scaler: !def ['keyframes',
+        ['keyframes', 'no']]
+    net:
+        kind: !def ['layer1',
+            ['layer0', 'layer1']]
+        layer1:
+            H: 32
+        ll_dropout: 0.5
+    train:
+        lr: 1.0e-5
+        weight_decay: 5.0e-2
+        n_epochs: 120
+        tubes_per_batch: 500
+        frames_per_tube: 2
+        period:
+            log: '::1'
+            eval:
+                trainset: '::'
+                evalset: '0::20'
+    kf_pretrain:
+        enabled: True
+        train:
+            lr: 5.0e-5
+            weight_decay: 5.0e-2
+            n_epochs: 2001
+        period:
+            log: '0::500'
+    frame_coverage:
+        subsample: 4
+    """)
+    cf = cfg.parse()
+
+    # Seeds
+    initial_seed = cf['seed']
+    torch.manual_seed(initial_seed)
+    rgen = np.random.default_rng(initial_seed)
+
+    # Data
+    # General DALY level preparation
+    dataset = Ncfg_daly.get_dataset(cf)
+    vgroup = Ncfg_daly.get_vids(cf, dataset)
+    sset_train, sset_eval = cf['split_assignment'].split('/')
+    # keyframe feats
+    tkfeats_d, scaler = Ncfg_kfeats.load_scale(cf, vgroup)
+    # wein tubes
+    tubes_dwein_d, tubes_dgt_d = load_gt_and_wein_tubes(
+            cf['inputs.tubes_dwein'], dataset, vgroup)
+    # extracted tube features
+    # BIG, dwti_to_inds_big = Data_access_big.load_big_features(
+    #         cf['inputs.big.fold'])
+    # da_big = Data_access_big(BIG, dwti_to_inds_big, scaler)
+
+    # synthetic tube labels
+    cls_labels, dwti_to_label_train = qload_synthetic_tube_labels(
+            tubes_dgt_d[sset_train], tubes_dwein_d[sset_train], dataset)
+    _, dwti_to_label_eval = qload_synthetic_tube_labels(
+            tubes_dgt_d[sset_eval], tubes_dwein_d[sset_eval], dataset)
+
+    # Ssset
+    tkfeats_train = tkfeats_d[sset_train]
+    tkfeats_eval = tkfeats_d[sset_eval]
+    tubes_dwein_train = tubes_dwein_d[sset_train]
+    tubes_dwein_eval = tubes_dwein_d[sset_eval]
+    tubes_dgt_train = tubes_dgt_d[sset_train]
+    tubes_dgt_eval = tubes_dgt_d[sset_eval]
+
+    # Interacting with big
+    stride = cf['frame_coverage.subsample']
+    man_bigv2 = Manager_loader_big_v2(cf['inputs.big.fold'], scaler, stride,
+            dataset, tubes_dwein_train, tubes_dgt_train)
+
+    # Model
+    D_in = man_bigv2.BIG.shape[-1]
+    model = define_mlp_model(cf, D_in, 11)
+    loss_fn = torch.nn.CrossEntropyLoss(reduction='mean')
+
+    # # pretraining
+    # if cf['kf_pretrain.enabled']:
+    #     _tubefeats_train_mlp_single_run_pretraining(
+    #         cf, model, loss_fn, tkfeats_train, tkfeats_eval)
+
+    optimizer = torch.optim.AdamW(model.parameters(),
+            lr=cf['train.lr'], weight_decay=cf['train.weight_decay'])
+    n_epochs = cf['train.n_epochs']
+    batch_size = 32
+    model.train()
+
+    period_ibatch_loss_log = '0::10'
+    period_log = '0::1'
+    period_eval_evalset = '0::1'
+
+    for i_epoch in range(n_epochs):
+        loader = man_bigv2.get_train_loader(batch_size, rgen, 16)
+        for i_batch, (data_input) in enumerate(loader):
+            # inputs converter
+            (meta,) = data_input
+            flat_labels = np.hstack([m['labels'] for m in meta])
+            flat_feats = np.vstack([m['feats'] for m in meta])
+
+            flat_labels_t = torch.from_numpy(flat_labels)
+            flat_feats_t = torch.from_numpy(flat_feats)
+
+            result = model(flat_feats_t)
+            pred_train = result['x_final']
+            loss = loss_fn(pred_train, flat_labels_t)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            if snippets.check_step_sslice(
+                    i_batch, period_ibatch_loss_log):
+                Nb = len(loader)
+                log.info(f'{i_epoch=}, {i_batch=}/{Nb}: loss {loss.item()}')
+        if snippets.check_step_sslice(i_epoch, period_log):
+            model.eval()
+            kacc_train = _quick_accuracy_over_kfeat(
+                    tkfeats_train, model, True)*100
+            kacc_eval = _quick_accuracy_over_kfeat(
+                    tkfeats_eval, model, True)*100
+            model.train()
+            log.info(f'{i_epoch}: {loss.item()} '
+                    f'{kacc_train=:.2f} {kacc_eval=:.2f}')
+        if snippets.check_step_sslice(i_epoch, period_eval_evalset):
+            model.eval()
+            evalset_result = _tubefeats_evalset_perf(
+                    model, man_bigv2, dwti_to_label_eval,
+                    dataset, tubes_dwein_eval, tubes_dgt_eval)
+            model.train()
+            log.info(f'Evalset perf at {i_epoch=}')
+            _tubefeats_display_evalresults(evalset_result, sset_eval)

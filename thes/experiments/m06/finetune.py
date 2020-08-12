@@ -34,10 +34,6 @@ from vsydorov_tools import small
 from vsydorov_tools import cv as vt_cv
 from vsydorov_tools import log as vt_log
 
-from thes.data.dataset.daly import (
-    Ncfg_daly, sample_daly_frames_from_instances,
-    load_gt_and_wein_tubes, create_keyframelist,
-    to_keyframedict)
 from thes.data.dataset.external import (
     Dataset_daly_ocv, Vid_daly)
 from thes.data.tubes.types import (
@@ -54,6 +50,11 @@ from thes.data.tubes.routines import (
     temporal_ious_where_positive,
     spatial_tube_iou_v3
     )
+
+from thes.data.dataset.daly import (
+    Ncfg_daly, sample_daly_frames_from_instances,
+    load_gt_and_wein_tubes, create_keyframelist,
+    to_keyframedict, group_dwein_frames_wrt_kf_distance)
 
 from thes.evaluation.recall import (
     compute_recall_for_avtubes_as_dfs,)
@@ -686,45 +687,6 @@ class Manager_loader_krgb(object):
         return frame_list_f32c, bboxes0_c, labels_c
 
 
-def match_dwein_to_dgt(
-        tubes_dgt: Dict[I_dgt, T_dgt],
-        tubes_dwein: Dict[I_dwein, T_dwein]
-        ) -> Dict[I_dwein, Tuple[I_dgt, float]]:
-    """
-    - For each DWEIN, find matching DGT tubes
-    - Select the DGT with best avg spatial overlap
-    """
-    # Record overlap hits
-    overlap_hits: Dict[I_dwein, Dict[I_dgt, float]] = {}
-    for dgt_index, gt_tube in tubes_dgt.items():
-        vid, action_name, ins_id = dgt_index
-        matched_dwt_vids = {k: v for k, v in tubes_dwein.items()
-                if k[0] == vid}
-        dwt_vid_keys = list(matched_dwt_vids.keys())
-        dwt_vid_values = list(matched_dwt_vids.values())
-        dwt_frange = np.array([
-            (x['start_frame'], x['end_frame']) for x in dwt_vid_values])
-        # Temporal
-        t_ious, pids = temporal_ious_where_positive(
-            gt_tube['start_frame'], gt_tube['end_frame'], dwt_frange)
-        # Spatial (where temporal >0)
-        dwt_intersect = [dwt_vid_values[pid] for pid in pids]
-        sp_mious = [spatial_tube_iou_v3(p, gt_tube)
-                for p in dwt_intersect]
-        for p, t_iou, sp_miou in zip(pids, t_ious, sp_mious):
-            st_iou = t_iou * sp_miou
-            if st_iou > 0:
-                dwt_vid = dwt_vid_keys[p]
-                overlap_hits.setdefault(dwt_vid, {})[dgt_index] = sp_miou
-    # Return only best hit
-    best_hits: Dict[I_dwein, Tuple[I_dgt, float]] = {}
-    for dwt_index, hits in overlap_hits.items():
-        hits_list = list(hits.items())
-        hits_list_sorted = sorted(hits_list, key=lambda x: x[1])
-        dgt_index, overlap = hits_list_sorted[-1]
-        best_hits[dwt_index] = (dgt_index, overlap)
-    return best_hits
-
 class TDataset_over_fgroups(torch.utils.data.Dataset):
     def __init__(self, frame_groups, dataset,
             sampler_grid, frameloader_vsf):
@@ -760,10 +722,7 @@ class TDataset_over_fgroups(torch.utils.data.Dataset):
         prepared_bboxes = np.stack(prepared_bboxes, axis=0)
 
         # labels
-        labels = []
-        for box in boxes:
-            labels.append(box['label'])
-        labels = np.array(labels)
+        labels = np.array([box['label'] for box in boxes])
 
         meta = {
             'labels': labels,
@@ -783,7 +742,7 @@ class Manager_loader_boxcons_improved(object):
 
         tubes_dwein_train = tubes_dwein_d[sset_train]
         tubes_dgt_train = tubes_dgt_d[sset_train]
-        self.dist_boxes = self._create_dist_boxes(
+        self.dist_boxes = group_dwein_frames_wrt_kf_distance(
                 dataset, stride, tubes_dwein_train, tubes_dgt_train)
 
         # Create keyframes
@@ -797,8 +756,9 @@ class Manager_loader_boxcons_improved(object):
         self.frameloader_vsf = Frameloader_video_slowfast(
                 False, slowfast_alpha, 256)
 
-    def get_train_loader(self, batch_size, rgen, max_distance, add_keyframes=True):
-        # Merge FG and BG
+    def get_train_loader(
+            self, batch_size, rgen, max_distance, add_keyframes=True):
+        # fg/bf boxes -> labels
         labeled_boxes = []
         for i, boxes in self.dist_boxes.items():
             if i > max_distance:
@@ -874,70 +834,6 @@ class Manager_loader_boxcons_improved(object):
         labels_c = labels_t.cuda()
         return frame_list_f32c, bboxes0_c, labels_c
 
-    @staticmethod
-    def _create_dist_boxes(
-            dataset, stride, tubes_dwein_train, tubes_dgt_train):
-        # Keyframes by which we divide
-        vids_kf_nums: Dict[Vid_daly, np.ndarray] = \
-                sample_daly_frames_from_instances(dataset, stride=0)
-        # Frames which we consider
-        vids_good_nums: Dict[Vid_daly, np.ndarray] = \
-                sample_daly_frames_from_instances(dataset, stride=stride)
-        # keyframes per dwt
-        dwtis_kf_nums = {}
-        dwtis_good_nums = {}
-        for dwt_index, dwt in tubes_dwein_train.items():
-            (vid, bunch_id, tube_id) = dwt_index
-            s, e = dwt['start_frame'], dwt['end_frame']
-            # kf_nums
-            vid_kf_nums = vids_kf_nums[vid]
-            vid_kf_nums = vid_kf_nums[
-                    (vid_kf_nums >= s) & (vid_kf_nums <= e)]
-            dwtis_kf_nums[dwt_index] = vid_kf_nums
-            # good_nums
-            vid_good_nums = vids_good_nums[vid]
-            vid_good_nums = vid_good_nums[
-                    (vid_good_nums >= s) & (vid_good_nums <= e)]
-            dwtis_good_nums[dwt_index] = vid_good_nums
-
-        # Associate tubes
-        best_hits: Dict[I_dwein, Tuple[I_dgt, float]] = match_dwein_to_dgt(
-            tubes_dgt_train, tubes_dwein_train)
-
-        # Compute distance, disperse
-        dist_boxes = {}
-        for dwti, dwt in tubes_dwein_train.items():
-            dwt = tubes_dwein_train[dwti]
-            kf_nums = dwtis_kf_nums[dwti]
-            good_nums = dwtis_good_nums[dwti]
-            # Distance matrix
-            M = np.zeros((len(kf_nums), len(good_nums)), dtype=np.int)
-            for i, kf in enumerate(kf_nums):
-                M[i] = np.abs(good_nums-kf)
-            best_dist = M.min(axis=0)
-            # Associate kf_nums and boxes
-            assert np.in1d(good_nums, dwt['frame_inds'].tolist()).all()
-            rel_inds = np.searchsorted(dwt['frame_inds'], good_nums)
-            boxes = [dwt['boxes'][j] for j in rel_inds]
-
-            # Determine foreground vs background
-            foreground = False
-            if dwti in best_hits:
-                dgti, iou = best_hits[dwti]
-                if iou >= 0.5:
-                    foreground = True
-
-            # Disperse boxes per dist
-            for f0, box, dist in zip(dwt['frame_inds'], boxes, best_dist):
-                metabox = {
-                    'frame_ind': f0, 'box': box, 'dwti': dwti}
-                if foreground:
-                    metabox.update({'kind': 'fg', 'dgti': dgti, 'iou': iou})
-                else:
-                    metabox.update({'kind': 'bg'})
-                dist_boxes.setdefault(dist, []).append(metabox)
-        dist_boxes = dict(sorted(list(dist_boxes.items())))
-        return dist_boxes
 
 class Manager_loader_boxcons(object):
     def __init__(self, tubes_dgt_d, tubes_dwein_d,
@@ -1374,3 +1270,8 @@ def finetune_on_tubefeats(workfolder, cfg_dict, add_args):
         _train_epoch(model_wf, train_loader, optimizer,
                 loss_fn, cn, man_lbox_improved.preprocess_data, i_epoch,
                 ibatch_actions)
+        # Save part
+        man_ckpt.save_epoch(rundir, i_epoch)
+        # Eval aprt
+        f_ibatch_eval_krgb_evalset({
+            'i_epoch': i_epoch, 'i_batch': np.inf})

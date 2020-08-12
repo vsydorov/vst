@@ -1,3 +1,6 @@
+"""
+General tube routines that can function without a tight dataset connections
+"""
 import logging
 import numpy as np
 from tqdm import tqdm
@@ -168,6 +171,49 @@ def temporal_ious_NN(x_frange, y_frange):
     return inter/union
 
 
+"""
+OVERLAP SCORING
+
+I use these guys to score tubes based on intersections with box detections
+- Helps with transfering detection information to tubes
+- Usecases:
+  - Score DWEIN tubes via RCNN objdect detection overlap
+  - Cheating evalutiaon of DWEIN tubes via keyframe-only predictions
+"""
+
+
+def create_kinda_objaction_struct(dataset, test_kfs, Y_conf_scores_sm):
+    # // Creating kinda objaction structure
+    # Group vid -> frame
+    grouped_kfscores_vf: Dict[Vid_daly, Dict[int, Any]] = {}
+    for kf, scores in zip(test_kfs, Y_conf_scores_sm):
+        vid = kf['vid']
+        frame0 = kf['frame0']
+        pred_box = kf['bbox']
+        (grouped_kfscores_vf
+                .setdefault(vid, {})
+                .setdefault(frame0, [])
+                .append([pred_box, scores]))
+    # fake objactions
+    objactions_vf: Dict[Vid_daly, Dict[int, Objaction_dets]] = {}
+    for vid, grouped_kfscores_f in grouped_kfscores_vf.items():
+        for frame_ind, gkfscores in grouped_kfscores_f.items():
+            all_scores, all_boxes, all_classes = [], [], []
+            for (box, scores) in gkfscores:
+                all_boxes.append(np.tile(box, (len(scores), 1)))
+                all_classes.append(np.array(dataset.action_names))
+                all_scores.append(scores)
+            all_scores_ = np.hstack(all_scores)
+            all_classes_ = np.hstack(all_classes)
+            all_boxes_ = np.vstack(all_boxes)
+            detections = {
+                    'pred_boxes': all_boxes_,
+                    'scores': all_scores_,
+                    'pred_classes': all_classes_}
+            objactions_vf.setdefault(vid, {})[frame_ind] = detections
+    return objactions_vf
+
+
 def score_ftubes_via_objaction_overlap_aggregation(
         dataset: Dataset_daly_ocv,
         objactions_vf: Dict[Vid_daly, Dict[int, Objaction_dets]],
@@ -230,6 +276,19 @@ def score_ftubes_via_objaction_overlap_aggregation(
     return av_stubes
 
 
+"""
+DGT, DWEIN rubbish
+
+These functions are connected to DALY dataset and should probably be in a
+separate module, but we assumed that connection is not inherent and can be
+removed in the future
+
+"""
+
+
+# Box_connections code
+
+
 def group_tubes_on_frame_level(
         tubes_dwein: Dict[I_dwein, T_dwein],
         frames_to_cover: Optional[Dict[Vid_daly, np.ndarray]]
@@ -266,6 +325,31 @@ def group_tubes_on_frame_level(
     return connections
 
 
+def perform_connections_split(connections_f, cc, ct):
+    ckeys = list(connections_f.keys())
+    weights_dict = {k: len(v['boxes'])
+            for k, v in connections_f.items()}
+    weights = np.array(list(weights_dict.values()))
+    ii_ckeys_split = snippets.weighted_array_split(
+            np.arange(len(ckeys)), weights, ct)
+    ckeys_split = [[ckeys[i] for i in ii] for ii in ii_ckeys_split]
+    ktw = dict(zip(ckeys, weights))
+    weights_split = []
+    for ckeys_ in ckeys_split:
+        weight = np.sum([ktw[ckey] for ckey in ckeys_])
+        weights_split.append(weight)
+    chunk_ckeys = ckeys_split[cc]
+    log.info(f'Quick split stats [{cc,ct=}]: '
+        'Frames(boxes): {}({}) -> {}({})'.format(
+            len(ckeys), np.sum(weights),
+            len(chunk_ckeys), weights_split[cc]))
+    chunk_connections_f = {k: connections_f[k] for k in chunk_ckeys}
+    return chunk_connections_f
+
+
+# Overlap matching code
+
+
 def record_overlaps(
         tubes_dgt: Dict[I_dgt, T_dgt],
         tubes_dwein: Dict[I_dwein, T_dwein]):
@@ -299,6 +383,49 @@ def record_overlaps(
         st_miou = vsorted_last[1][2]
         best_ious[k] = (action_name, st_miou)
     return best_ious
+
+
+def match_dwein_to_dgt(
+        tubes_dgt: Dict[I_dgt, T_dgt],
+        tubes_dwein: Dict[I_dwein, T_dwein]
+        ) -> Dict[I_dwein, Tuple[I_dgt, float]]:
+    """
+    - For each DWEIN, find matching DGT tubes
+    - Select the DGT with best avg spatial overlap
+    """
+    # Record overlap hits
+    overlap_hits: Dict[I_dwein, Dict[I_dgt, float]] = {}
+    for dgt_index, gt_tube in tubes_dgt.items():
+        vid, action_name, ins_id = dgt_index
+        matched_dwt_vids = {k: v for k, v in tubes_dwein.items()
+                if k[0] == vid}
+        dwt_vid_keys = list(matched_dwt_vids.keys())
+        dwt_vid_values = list(matched_dwt_vids.values())
+        dwt_frange = np.array([
+            (x['start_frame'], x['end_frame']) for x in dwt_vid_values])
+        # Temporal
+        t_ious, pids = temporal_ious_where_positive(
+            gt_tube['start_frame'], gt_tube['end_frame'], dwt_frange)
+        # Spatial (where temporal >0)
+        dwt_intersect = [dwt_vid_values[pid] for pid in pids]
+        sp_mious = [spatial_tube_iou_v3(p, gt_tube)
+                for p in dwt_intersect]
+        for p, t_iou, sp_miou in zip(pids, t_ious, sp_mious):
+            st_iou = t_iou * sp_miou
+            if st_iou > 0:
+                dwt_vid = dwt_vid_keys[p]
+                overlap_hits.setdefault(dwt_vid, {})[dgt_index] = sp_miou
+    # Return only best hit
+    best_hits: Dict[I_dwein, Tuple[I_dgt, float]] = {}
+    for dwt_index, hits in overlap_hits.items():
+        hits_list = list(hits.items())
+        hits_list_sorted = sorted(hits_list, key=lambda x: x[1])
+        dgt_index, overlap = hits_list_sorted[-1]
+        best_hits[dwt_index] = (dgt_index, overlap)
+    return best_hits
+
+
+# Trying to create synthetic labels based on overlaps
 
 
 def create_synthetic_tube_labels(
@@ -348,55 +475,3 @@ def qload_synthetic_tube_labels(
     return cls_labels, dwti_to_label
 
 
-def perform_connections_split(connections_f, cc, ct):
-    ckeys = list(connections_f.keys())
-    weights_dict = {k: len(v['boxes'])
-            for k, v in connections_f.items()}
-    weights = np.array(list(weights_dict.values()))
-    ii_ckeys_split = snippets.weighted_array_split(
-            np.arange(len(ckeys)), weights, ct)
-    ckeys_split = [[ckeys[i] for i in ii] for ii in ii_ckeys_split]
-    ktw = dict(zip(ckeys, weights))
-    weights_split = []
-    for ckeys_ in ckeys_split:
-        weight = np.sum([ktw[ckey] for ckey in ckeys_])
-        weights_split.append(weight)
-    chunk_ckeys = ckeys_split[cc]
-    log.info(f'Quick split stats [{cc,ct=}]: '
-        'Frames(boxes): {}({}) -> {}({})'.format(
-            len(ckeys), np.sum(weights),
-            len(chunk_ckeys), weights_split[cc]))
-    chunk_connections_f = {k: connections_f[k] for k in chunk_ckeys}
-    return chunk_connections_f
-
-
-def create_kinda_objaction_struct(dataset, test_kfs, Y_conf_scores_sm):
-    # // Creating kinda objaction structure
-    # Group vid -> frame
-    grouped_kfscores_vf: Dict[Vid_daly, Dict[int, Any]] = {}
-    for kf, scores in zip(test_kfs, Y_conf_scores_sm):
-        vid = kf['vid']
-        frame0 = kf['frame0']
-        pred_box = kf['bbox']
-        (grouped_kfscores_vf
-                .setdefault(vid, {})
-                .setdefault(frame0, [])
-                .append([pred_box, scores]))
-    # fake objactions
-    objactions_vf: Dict[Vid_daly, Dict[int, Objaction_dets]] = {}
-    for vid, grouped_kfscores_f in grouped_kfscores_vf.items():
-        for frame_ind, gkfscores in grouped_kfscores_f.items():
-            all_scores, all_boxes, all_classes = [], [], []
-            for (box, scores) in gkfscores:
-                all_boxes.append(np.tile(box, (len(scores), 1)))
-                all_classes.append(np.array(dataset.action_names))
-                all_scores.append(scores)
-            all_scores_ = np.hstack(all_scores)
-            all_classes_ = np.hstack(all_classes)
-            all_boxes_ = np.vstack(all_boxes)
-            detections = {
-                    'pred_boxes': all_boxes_,
-                    'scores': all_scores_,
-                    'pred_classes': all_classes_}
-            objactions_vf.setdefault(vid, {})[frame_ind] = detections
-    return objactions_vf
