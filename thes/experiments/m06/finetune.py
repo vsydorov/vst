@@ -74,6 +74,8 @@ from thes.pytorch import (
     to_gpu_normalize_permute, Sampler_grid,
     Frameloader_video_slowfast, NumpyRandomSampler,
     merge_cf_into_cfgnode)
+from thes.training import (
+    Manager_checkpoint_name)
 
 from thes.slowfast import optimizer as tsf_optim
 
@@ -448,35 +450,6 @@ class C2D_1x1_roitune(M_resnet):
             self.head.rt_projection.weight.data.normal_(
                     mean=0.0, std=init_std, generator=ll_generator)
             self.head.rt_projection.bias.data.zero_()
-
-
-class Manager_checkpoint_name(object):
-    ckpt_re = r'model_at_epoch_(?P<i_epoch>\d*).pth.tar'
-    ckpt_format = 'model_at_epoch_{:03d}.pth.tar'
-
-    @classmethod
-    def get_checkpoint_path(self, rundir, i_epoch) -> Path:
-        save_filepath = rundir/self.ckpt_format.format(i_epoch)
-        return save_filepath
-
-    @classmethod
-    def find_checkpoints(self, rundir):
-        checkpoints = {}
-        for subfolder_item in rundir.iterdir():
-            search = re.search(self.ckpt_re, subfolder_item.name)
-            if search:
-                i_epoch = int(search.groupdict()['i_epoch'])
-                checkpoints[i_epoch] = subfolder_item
-        return checkpoints
-
-    @classmethod
-    def find_last_checkpoint(self, rundir):
-        checkpoints = self.find_checkpoints(rundir)
-        if len(checkpoints):
-            checkpoint_path = max(checkpoints.items())[1]
-        else:
-            checkpoint_path = None
-        return checkpoint_path
 
 
 class Manager_model_checkpoints(object):

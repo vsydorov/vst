@@ -29,6 +29,8 @@ from thes.evaluation.meta import (
 from thes.tools import snippets
 from thes.pytorch import (
     sequence_batch_collate_v2, NumpyRandomSampler)
+from thes.training import (
+    Manager_checkpoint_name)
 
 log = logging.getLogger(__name__)
 
@@ -311,20 +313,34 @@ class Data_access_big(object):
 
 
 class TDataset_over_bilinked_boxes(torch.utils.data.Dataset):
-    def __init__(self, frame_groups, BIG, scaler):
+    def __init__(self, frame_groups, BIG, scaler, KFX):
         self.frame_groups = frame_groups
         self.keys_vf = list(frame_groups.keys())
         self.BIG = BIG
         self.scaler = scaler
+        self.KFX = KFX
 
     def __getitem__(self, index):
         key_vf = self.keys_vf[index]
         boxes = self.frame_groups[key_vf]
 
         # Features
-        bis = np.array([b['bi'] for b in boxes])
-        feats = self.BIG[bis]
-        feats = feats.astype(np.float32)
+        bi_presence = np.array(['bi' in b for b in boxes])
+        if bi_presence.all():
+            bis = np.array([b['bi'] for b in boxes])
+            feats = self.BIG[bis]
+            feats = feats.astype(np.float32)
+        else:
+            feats = np.zeros((len(boxes),
+                self.BIG.shape[-1]), dtype=np.float32)
+            for i, box in enumerate(boxes):
+                if 'bi' in box:
+                    feats[i] = self.BIG[box['bi']]
+                elif 'kfi' in box:
+                    feats[i] = self.KFX[box['kfi']]
+                else:
+                    raise RuntimeError()
+
         if self.scaler is not None:
             feats = self.scaler.transform(feats)
 
@@ -340,9 +356,10 @@ class TDataset_over_bilinked_boxes(torch.utils.data.Dataset):
 
 class Manager_loader_big_v2(object):
     def __init__(self, tubes_featfold, scaler, stride,
-            dataset, tubes_dwein_train, tubes_dgt_train):
+            dataset, tubes_dwein_train, tubes_dgt_train, tkfeats_train):
         self.dataset = dataset
         self.scaler = scaler
+        self.tkfeats_train = tkfeats_train
 
         tubes_featfold = Path(tubes_featfold)
         connections_f: Dict[Tuple[Vid_daly, int], Box_connections_dwti] = \
@@ -395,6 +412,15 @@ class Manager_loader_big_v2(object):
                     'box': box['box'],
                     'label': label}
                 labeled_boxes.append(lbox)
+        if add_keyframes:
+            for kfi, kf in enumerate(self.tkfeats_train['kf']):
+                lbox = {
+                    'vid': kf['vid'],
+                    'frame_ind': kf['frame0'],
+                    'kfi': kfi,
+                    'box': kf['bbox'],
+                    'label': kf['action_id']}
+                labeled_boxes.append(lbox)
 
         # Group into frame_groups
         frame_groups: Dict[Tuple[Vid_daly, int], Dict] = {}
@@ -405,7 +431,9 @@ class Manager_loader_big_v2(object):
 
         # Loader
         NUM_WORKERS = 0
-        td = TDataset_over_bilinked_boxes(frame_groups, self.BIG, self.scaler)
+        td = TDataset_over_bilinked_boxes(
+                frame_groups, self.BIG, self.scaler,
+                self.tkfeats_train['X'].numpy())
         sampler = NumpyRandomSampler(td, rgen)
         loader = torch.utils.data.DataLoader(td,
             batch_size=batch_size, num_workers=NUM_WORKERS,
@@ -918,6 +946,41 @@ def _tubefeats_train_mlp_single_run(
     return result
 
 
+class Checkpointer(object):
+    def __init__(self, model, optimizer):
+        self.model = model
+        self.optimizer = optimizer
+
+    def save_epoch(self, rundir, i_epoch):
+        # model_{epoch} - "after epoch was finished"
+        save_filepath = (Manager_checkpoint_name
+                .get_checkpoint_path(rundir, i_epoch))
+        states = {
+            'i_epoch': i_epoch,
+            'model_sdict': self.model.state_dict(),
+            'optimizer_sdict': self.optimizer.state_dict(),
+        }
+        with small.QTimer() as qtr:
+            torch.save(states, str(save_filepath))
+        log.info(f'Saved model. Epoch {i_epoch}')
+        log.debug('Saved to {}. Took {:.2f}s'.format(
+            save_filepath, qtr.time))
+
+    def restore_model_magic(
+            self, checkpoint_path, training_start_epoch=0):
+        if checkpoint_path is not None:
+            states = torch.load(checkpoint_path)
+            self.model.load_state_dict(states['model_sdict'])
+            self.optimizer.load_state_dict(states['optimizer_sdict'])
+            start_epoch = states['i_epoch']
+            start_epoch += 1
+            log.info('Continuing training from checkpoint {}. '
+                    'Epoch {} (ckpt + 1)'.format(checkpoint_path, start_epoch))
+        else:
+            start_epoch = training_start_epoch
+            log.info('Starting new training from epoch {}'.format(start_epoch))
+        return start_epoch
+
 # Experiments
 
 
@@ -1108,7 +1171,7 @@ def tubefeats_dist_train_mlp(workfolder, cfg_dict, add_args):
     seed: 42
     split_assignment: !def ['train/val',
         ['train/val', 'trainval/test']]
-    data_scaler: !def ['keyframes',
+    data_scaler: !def ['no',
         ['keyframes', 'no']]
     net:
         kind: !def ['layer1',
@@ -1117,24 +1180,18 @@ def tubefeats_dist_train_mlp(workfolder, cfg_dict, add_args):
             H: 32
         ll_dropout: 0.5
     train:
-        lr: 1.0e-5
+        lr: 1.0e-4
         weight_decay: 5.0e-2
         n_epochs: 120
-        tubes_per_batch: 500
-        frames_per_tube: 2
-        period:
-            log: '::1'
-            eval:
-                trainset: '::'
-                evalset: '0::20'
-    kf_pretrain:
-        enabled: True
-        train:
-            lr: 5.0e-5
-            weight_decay: 5.0e-2
-            n_epochs: 2001
-        period:
-            log: '0::500'
+        batch_size: 32
+        frame_dist: 16
+    period:
+        i_batch:
+            loss_log: '::'
+        i_epoch:
+            save: '0::1'
+            loss_log: '0::1'
+            full_eval: '0::1'
     frame_coverage:
         subsample: 4
     """)
@@ -1155,14 +1212,8 @@ def tubefeats_dist_train_mlp(workfolder, cfg_dict, add_args):
     # wein tubes
     tubes_dwein_d, tubes_dgt_d = load_gt_and_wein_tubes(
             cf['inputs.tubes_dwein'], dataset, vgroup)
-    # extracted tube features
-    # BIG, dwti_to_inds_big = Data_access_big.load_big_features(
-    #         cf['inputs.big.fold'])
-    # da_big = Data_access_big(BIG, dwti_to_inds_big, scaler)
 
     # synthetic tube labels
-    cls_labels, dwti_to_label_train = qload_synthetic_tube_labels(
-            tubes_dgt_d[sset_train], tubes_dwein_d[sset_train], dataset)
     _, dwti_to_label_eval = qload_synthetic_tube_labels(
             tubes_dgt_d[sset_eval], tubes_dwein_d[sset_eval], dataset)
 
@@ -1177,30 +1228,35 @@ def tubefeats_dist_train_mlp(workfolder, cfg_dict, add_args):
     # Interacting with big
     stride = cf['frame_coverage.subsample']
     man_bigv2 = Manager_loader_big_v2(cf['inputs.big.fold'], scaler, stride,
-            dataset, tubes_dwein_train, tubes_dgt_train)
+            dataset, tubes_dwein_train, tubes_dgt_train, tkfeats_train)
 
     # Model
     D_in = man_bigv2.BIG.shape[-1]
     model = define_mlp_model(cf, D_in, 11)
     loss_fn = torch.nn.CrossEntropyLoss(reduction='mean')
-
-    # # pretraining
-    # if cf['kf_pretrain.enabled']:
-    #     _tubefeats_train_mlp_single_run_pretraining(
-    #         cf, model, loss_fn, tkfeats_train, tkfeats_eval)
-
     optimizer = torch.optim.AdamW(model.parameters(),
             lr=cf['train.lr'], weight_decay=cf['train.weight_decay'])
+
+    ckpt = Checkpointer(model, optimizer)
+
+    # Restore previous run
+    rundir = small.mkdir(out/'rundir')
+    if '--new' in add_args:
+        checkpoint_path = None
+    else:
+        checkpoint_path = (Manager_checkpoint_name.
+                find_last_checkpoint(rundir))
+    start_epoch = (ckpt.restore_model_magic(checkpoint_path))
+
+    # Training
     n_epochs = cf['train.n_epochs']
-    batch_size = 32
-    model.train()
-
-    period_ibatch_loss_log = '0::10'
-    period_log = '0::1'
-    period_eval_evalset = '0::1'
-
-    for i_epoch in range(n_epochs):
-        loader = man_bigv2.get_train_loader(batch_size, rgen, 16)
+    for i_epoch in range(start_epoch, n_epochs):
+        loader = man_bigv2.get_train_loader(
+            cf['train.batch_size'], rgen, cf['train.frame_dist'])
+        # loader = man_bigv2.get_train_loader(batch_size, rgen, 64)
+        model.train()
+        l_avg = snippets.misc.Averager()
+        avg_bs = snippets.misc.Averager()
         for i_batch, (data_input) in enumerate(loader):
             # inputs converter
             (meta,) = data_input
@@ -1216,20 +1272,33 @@ def tubefeats_dist_train_mlp(workfolder, cfg_dict, add_args):
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            if snippets.check_step_sslice(
-                    i_batch, period_ibatch_loss_log):
+
+            avg_bs.update(len(flat_labels))
+            l_avg.update(loss.item())
+
+            if snippets.check_step_sslice(i_batch,
+                    cf['period.i_batch.loss_log']):
                 Nb = len(loader)
-                log.info(f'{i_epoch=}, {i_batch=}/{Nb}: loss {loss.item()}')
-        if snippets.check_step_sslice(i_epoch, period_log):
+                loss_str = (f'loss(all/10/last):{l_avg.avg:.4f}/{l_avg.last:.4f}')
+                log.info(f'{i_epoch=}, {i_batch=}/{Nb}; {loss_str}')
+        log.info('Epoch stats: avg_batchsize {}, loader_size {} '.format(
+            avg_bs.avg, len(loader)))
+        if snippets.check_step_sslice(i_epoch,
+                cf['period.i_epoch.save']):
+            ckpt.save_epoch(rundir, i_epoch)
+        if snippets.check_step_sslice(i_epoch,
+                cf['period.i_epoch.loss_log']):
             model.eval()
             kacc_train = _quick_accuracy_over_kfeat(
                     tkfeats_train, model, True)*100
             kacc_eval = _quick_accuracy_over_kfeat(
                     tkfeats_eval, model, True)*100
             model.train()
-            log.info(f'{i_epoch}: {loss.item()} '
+            loss_str = (f'loss(all/10/last):{l_avg.avg:.4f}/{l_avg.last:.4f}')
+            log.info(f'{i_epoch=}: {loss_str} '
                     f'{kacc_train=:.2f} {kacc_eval=:.2f}')
-        if snippets.check_step_sslice(i_epoch, period_eval_evalset):
+        if snippets.check_step_sslice(i_epoch,
+                cf['period.i_epoch.full_eval']):
             model.eval()
             evalset_result = _tubefeats_evalset_perf(
                     model, man_bigv2, dwti_to_label_eval,
