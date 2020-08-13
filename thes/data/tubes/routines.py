@@ -385,7 +385,7 @@ def record_overlaps(
     return best_ious
 
 
-def match_dwein_to_dgt(
+def get_best_overlaping_dgt_per_dwein(
         tubes_dgt: Dict[I_dgt, T_dgt],
         tubes_dwein: Dict[I_dwein, T_dwein]
         ) -> Dict[I_dwein, Tuple[I_dgt, float]]:
@@ -424,8 +424,70 @@ def match_dwein_to_dgt(
         best_hits[dwt_index] = (dgt_index, overlap)
     return best_hits
 
+def get_dwein_overlaps_per_dgt(
+        tubes_dgt: Dict[I_dgt, T_dgt],
+        tubes_dwein: Dict[I_dwein, T_dwein]
+        ) -> Dict[I_dgt, Dict[I_dwein, float]]:
+    """
+    For each DGT, match DWEINs, sort by spatial overlaps
+    """
+    matched_dwts: Dict[I_dgt, Dict[I_dwein, float]] = {}  # spatial mious
+    for dgt_index, gt_tube in tubes_dgt.items():
+        vid, action_name, ins_id = dgt_index
+        matched_dwt_vids = {k: v for k, v in tubes_dwein.items()
+                if k[0] == vid}
+        dwt_vid_keys = list(matched_dwt_vids.keys())
+        dwt_vid_values = list(matched_dwt_vids.values())
+        dwt_frange = np.array([
+            (x['start_frame'], x['end_frame']) for x in dwt_vid_values])
+        # Temporal
+        t_ious, pids = temporal_ious_where_positive(
+                gt_tube['start_frame'], gt_tube['end_frame'], dwt_frange)
+        # Spatial (where temporal >0)
+        dwt_intersect = [dwt_vid_values[pid] for pid in pids]
+        sp_mious = [spatial_tube_iou_v3(p, gt_tube)
+                for p in dwt_intersect]
+        matched: Dict[I_dwein, float] = {}
+        for p, t_iou, sp_miou in zip(pids, t_ious, sp_mious):
+            st_iou = t_iou * sp_miou
+            if st_iou > 0:
+                dwt_vid = dwt_vid_keys[p]
+                matched[dwt_vid] = sp_miou
+        # Sort by overlap
+        matched = dict(sorted(matched.items(),
+            key=lambda x: x[1], reverse=True))
+        matched_dwts[dgt_index] = matched
+    return matched_dwts
+
 
 # Trying to create synthetic labels based on overlaps
+
+
+def select_fg_bg_tubes(
+        matched_dwts: Dict[I_dgt, Dict[I_dwein, float]],
+        top_n=None):
+    # / Create FG and BG tubes
+    fg_meta: Dict[I_dwein, Dict] = {}
+    for dgti, matched in matched_dwts.items():
+        overlaps = np.array([m for m in matched.values()])
+        # take "top_n" matches with overlap > 0.5
+        ii = np.flatnonzero(overlaps > 0.5)
+        if top_n is not None:
+            ii = ii[:top_n]
+        for i in ii:
+            dwti, overlap = list(matched.items())[i]
+            fg_meta[dwti] = {'kind': 'fg', 'dgti': dgti, 'overlap': overlap}
+    bg_meta: Dict[I_dwein, Dict] = {}
+    for dgti, matched in matched_dwts.items():
+        overlaps = np.array([m for m in matched.values()])
+        # take "top_n" matches with 0 < overlap <= 0.3
+        ii = np.flatnonzero((overlaps <= 0.3) & (overlaps > 0))
+        if top_n is not None:
+            ii = ii[:top_n]
+        for i in ii:
+            dwti, overlap = list(matched.items())[i]
+            bg_meta[dwti] = {'kind': 'bg', 'dgti': dgti, 'overlap': overlap}
+    return fg_meta, bg_meta
 
 
 def create_synthetic_tube_labels(

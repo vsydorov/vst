@@ -10,8 +10,6 @@ from thes.data.tubes.types import (
     I_dwein, T_dwein, T_dwein_scored, I_dgt, T_dgt,
     get_daly_gt_tubes, remove_hard_dgt_tubes,
     loadconvert_tubes_dwein, dtindex_filter_split)
-from thes.data.tubes.routines import (
-    match_dwein_to_dgt)
 
 
 class Ncfg_daly:
@@ -161,8 +159,14 @@ def to_keyframedict(keyframes):
         result[kf_ind] = kf
     return result
 
+
 def group_dwein_frames_wrt_kf_distance(
-        dataset, stride, tubes_dwein_train, tubes_dgt_train):
+        dataset, stride, tubes_dwein, tube_metas: Dict[I_dwein, Dict]):
+    """
+    Will only work with tubes in tube_metas
+    """
+    tubes_dwein_proper = {k: tubes_dwein[k] for k in tube_metas}
+
     # Keyframes by which we divide
     vids_kf_nums: Dict[Vid_daly, np.ndarray] = \
             sample_daly_frames_from_instances(dataset, stride=0)
@@ -172,7 +176,7 @@ def group_dwein_frames_wrt_kf_distance(
     # keyframes per dwt
     dwtis_kf_nums = {}
     dwtis_good_nums = {}
-    for dwt_index, dwt in tubes_dwein_train.items():
+    for dwt_index, dwt in tubes_dwein_proper.items():
         (vid, bunch_id, tube_id) = dwt_index
         s, e = dwt['start_frame'], dwt['end_frame']
         # kf_nums
@@ -186,14 +190,9 @@ def group_dwein_frames_wrt_kf_distance(
                 (vid_good_nums >= s) & (vid_good_nums <= e)]
         dwtis_good_nums[dwt_index] = vid_good_nums
 
-    # Associate tubes
-    best_hits: Dict[I_dwein, Tuple[I_dgt, float]] = match_dwein_to_dgt(
-        tubes_dgt_train, tubes_dwein_train)
-
     # Compute distance, disperse
-    dist_boxes = {}
-    for dwti, dwt in tubes_dwein_train.items():
-        dwt = tubes_dwein_train[dwti]
+    dist_boxes: Dict[I_dwein, List[Dict]] = {}
+    for dwti, dwt in tubes_dwein_proper.items():
         kf_nums = dwtis_kf_nums[dwti]
         good_nums = dwtis_good_nums[dwti]
         # Distance matrix
@@ -206,21 +205,14 @@ def group_dwein_frames_wrt_kf_distance(
         rel_inds = np.searchsorted(dwt['frame_inds'], good_nums)
         boxes = [dwt['boxes'][j] for j in rel_inds]
 
-        # Determine foreground vs background
-        foreground = False
-        if dwti in best_hits:
-            dgti, iou = best_hits[dwti]
-            if iou >= 0.5:
-                foreground = True
+        # Possible FG/BG computations
+        tube_meta = tube_metas[dwti]
 
         # Disperse boxes per dist
         for f0, box, dist in zip(good_nums, boxes, best_dist):
             metabox = {
                 'frame_ind': f0, 'box': box, 'dwti': dwti}
-            if foreground:
-                metabox.update({'kind': 'fg', 'dgti': dgti, 'iou': iou})
-            else:
-                metabox.update({'kind': 'bg'})
+            metabox.update(tube_meta)
             dist_boxes.setdefault(dist, []).append(metabox)
     dist_boxes = dict(sorted(list(dist_boxes.items())))
     return dist_boxes

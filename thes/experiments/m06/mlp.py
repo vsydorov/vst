@@ -24,6 +24,9 @@ from thes.data.tubes.types import (
     AV_dict, Box_connections_dwti)
 from thes.data.tubes.routines import (
     qload_synthetic_tube_labels)
+from thes.data.tubes.routines import (
+    temporal_ious_where_positive, spatial_tube_iou_v3,
+    get_dwein_overlaps_per_dgt, select_fg_bg_tubes)
 from thes.evaluation.meta import (
     keyframe_cls_scores, cheating_tube_scoring, quick_tube_eval)
 from thes.tools import snippets
@@ -355,7 +358,8 @@ class TDataset_over_bilinked_boxes(torch.utils.data.Dataset):
 
 
 class Manager_loader_big_v2(object):
-    def __init__(self, tubes_featfold, scaler, stride,
+    def __init__(self, tubes_featfold, scaler,
+            stride, top_n_matches,
             dataset, tubes_dwein_train, tubes_dgt_train, tkfeats_train):
         self.dataset = dataset
         self.scaler = scaler
@@ -377,10 +381,23 @@ class Manager_loader_big_v2(object):
             BIG = np.load(str(tubes_featfold/"feats.npy"))
         self.dwti_f_bi = dwti_f_bi
         self.BIG = BIG
+        # from thes.dataset.daly import ()
+        tubes_dgt = tubes_dgt_train
+        tubes_dwein = tubes_dwein_train
 
-        # Boxes sorted by distance
+        # // Associate tubes
+        matched_dwts: Dict[I_dgt, Dict[I_dwein, float]] = \
+                get_dwein_overlaps_per_dgt(tubes_dgt, tubes_dwein)
+        fg_meta, bg_meta = select_fg_bg_tubes(matched_dwts, top_n_matches)
+        log.info('Selected {} FG and {} BG tubes from a total of {}'.format(
+            len(fg_meta), len(bg_meta), len(tubes_dwein)))
+        # Merge fg/bg
+        tube_metas = {}
+        tube_metas.update(fg_meta)
+        tube_metas.update(bg_meta)
+        # Break into frames, sort by distance
         self.dist_boxes_train = group_dwein_frames_wrt_kf_distance(
-            dataset, stride, tubes_dwein_train, tubes_dgt_train)
+            dataset, stride, tubes_dwein_train, tube_metas)
 
     def get(self, model, dwti):
         inds_big = np.array(list(self.dwti_f_bi[dwti].values()))
@@ -967,8 +984,9 @@ class Checkpointer(object):
             save_filepath, qtr.time))
 
     def restore_model_magic(
-            self, checkpoint_path, training_start_epoch=0):
+            self, checkpoint_path, starting_model=None, training_start_epoch=0):
         if checkpoint_path is not None:
+            # Continue training
             states = torch.load(checkpoint_path)
             self.model.load_state_dict(states['model_sdict'])
             self.optimizer.load_state_dict(states['optimizer_sdict'])
@@ -978,7 +996,14 @@ class Checkpointer(object):
                     'Epoch {} (ckpt + 1)'.format(checkpoint_path, start_epoch))
         else:
             start_epoch = training_start_epoch
-            log.info('Starting new training from epoch {}'.format(start_epoch))
+            if starting_model is not None:
+                states = torch.load(starting_model)
+                self.model.load_state_dict(states['model_sdict'])
+                log.info(('Starting new training, '
+                    'initialized from model {}, at epoch {}').format(
+                        starting_model, start_epoch))
+            log.info(('Starting new training, '
+                'empty model, at epoch {}').format(start_epoch))
         return start_epoch
 
 # Experiments
@@ -1168,6 +1193,7 @@ def tubefeats_dist_train_mlp(workfolder, cfg_dict, add_args):
         tubes_dwein: ~
         big:
             fold: ~
+        ckpt: ~
     seed: 42
     split_assignment: !def ['train/val',
         ['train/val', 'trainval/test']]
@@ -1182,9 +1208,14 @@ def tubefeats_dist_train_mlp(workfolder, cfg_dict, add_args):
     train:
         lr: 1.0e-4
         weight_decay: 5.0e-2
+        start_epoch: 0
         n_epochs: 120
         batch_size: 32
-        frame_dist: 16
+        tubes:
+            top_n_matches: 1
+            stride: 4
+            frame_dist: 16
+            add_keyframes: True
     period:
         i_batch:
             loss_log: '::'
@@ -1192,8 +1223,6 @@ def tubefeats_dist_train_mlp(workfolder, cfg_dict, add_args):
             save: '0::1'
             loss_log: '0::1'
             full_eval: '0::1'
-    frame_coverage:
-        subsample: 4
     """)
     cf = cfg.parse()
 
@@ -1226,8 +1255,9 @@ def tubefeats_dist_train_mlp(workfolder, cfg_dict, add_args):
     tubes_dgt_eval = tubes_dgt_d[sset_eval]
 
     # Interacting with big
-    stride = cf['frame_coverage.subsample']
-    man_bigv2 = Manager_loader_big_v2(cf['inputs.big.fold'], scaler, stride,
+    man_bigv2 = Manager_loader_big_v2(cf['inputs.big.fold'], scaler,
+            cf['train.tubes.stride'],
+            cf['train.tubes.top_n_matches'],
             dataset, tubes_dwein_train, tubes_dgt_train, tkfeats_train)
 
     # Model
@@ -1241,18 +1271,19 @@ def tubefeats_dist_train_mlp(workfolder, cfg_dict, add_args):
 
     # Restore previous run
     rundir = small.mkdir(out/'rundir')
+    checkpoint_path = (Manager_checkpoint_name.find_last_checkpoint(rundir))
     if '--new' in add_args:
         checkpoint_path = None
-    else:
-        checkpoint_path = (Manager_checkpoint_name.
-                find_last_checkpoint(rundir))
-    start_epoch = (ckpt.restore_model_magic(checkpoint_path))
+    start_epoch = (ckpt.restore_model_magic(checkpoint_path,
+        cf['inputs.ckpt'], cf['train.start_epoch']))
 
     # Training
     n_epochs = cf['train.n_epochs']
     for i_epoch in range(start_epoch, n_epochs):
         loader = man_bigv2.get_train_loader(
-            cf['train.batch_size'], rgen, cf['train.frame_dist'])
+            cf['train.batch_size'], rgen,
+            cf['train.tubes.frame_dist'],
+            cf['train.tubes.add_keyframes'])
         # loader = man_bigv2.get_train_loader(batch_size, rgen, 64)
         model.train()
         l_avg = snippets.misc.Averager()
@@ -1279,7 +1310,7 @@ def tubefeats_dist_train_mlp(workfolder, cfg_dict, add_args):
             if snippets.check_step_sslice(i_batch,
                     cf['period.i_batch.loss_log']):
                 Nb = len(loader)
-                loss_str = (f'loss(all/10/last):{l_avg.avg:.4f}/{l_avg.last:.4f}')
+                loss_str = (f'loss(all/last):{l_avg.avg:.4f}/{l_avg.last:.4f}')
                 log.info(f'{i_epoch=}, {i_batch=}/{Nb}; {loss_str}')
         log.info('Epoch stats: avg_batchsize {}, loader_size {} '.format(
             avg_bs.avg, len(loader)))
@@ -1294,7 +1325,7 @@ def tubefeats_dist_train_mlp(workfolder, cfg_dict, add_args):
             kacc_eval = _quick_accuracy_over_kfeat(
                     tkfeats_eval, model, True)*100
             model.train()
-            loss_str = (f'loss(all/10/last):{l_avg.avg:.4f}/{l_avg.last:.4f}')
+            loss_str = (f'loss(all/last):{l_avg.avg:.4f}/{l_avg.last:.4f}')
             log.info(f'{i_epoch=}: {loss_str} '
                     f'{kacc_train=:.2f} {kacc_eval=:.2f}')
         if snippets.check_step_sslice(i_epoch,

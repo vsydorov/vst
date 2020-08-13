@@ -1108,14 +1108,6 @@ def finetune_preextracted_krgb(workfolder, cfg_dict, add_args):
     rundir = small.mkdir(out/'rundir')
     if '--new' in add_args:
         checkpoint_path = None
-        if len(list(rundir.iterdir())) > 0:
-            timestamp = datetime.fromtimestamp(
-                    rundir.stat().st_mtime).strftime('%Y-%m-%d_%H:%M:%S')
-            str_rnd = ''.join(random.choices(string.ascii_uppercase, k=3))
-            new_foldname = f'old_{timestamp}_{str_rnd}'
-            log.info(f'Existing experiment moved to {new_foldname}')
-            shutil.move(rundir, rundir.parent/new_foldname)
-            small.mkdir(rundir)
     else:
         checkpoint_path = (Manager_checkpoint_name.
                 find_last_checkpoint(rundir))
@@ -1218,11 +1210,10 @@ def finetune_on_tubefeats(workfolder, cfg_dict, add_args):
 
     # Restore previous run
     rundir = small.mkdir(out/'rundir')
+    checkpoint_path = (Manager_checkpoint_name.find_last_checkpoint(rundir))
     if '--new' in add_args:
+        Manager_model_checkpoints.rename_old_rundir(rundir)
         checkpoint_path = None
-    else:
-        checkpoint_path = (Manager_checkpoint_name.
-                find_last_checkpoint(rundir))
     start_epoch = (man_ckpt.restore_model_magic(checkpoint_path))
 
     # Training
