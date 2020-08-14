@@ -23,10 +23,9 @@ from thes.data.tubes.types import (
     I_dwein, T_dwein, T_dwein_scored, I_dgt, T_dgt,
     AV_dict, Box_connections_dwti)
 from thes.data.tubes.routines import (
-    qload_synthetic_tube_labels)
-from thes.data.tubes.routines import (
     temporal_ious_where_positive, spatial_tube_iou_v3,
-    get_dwein_overlaps_per_dgt, select_fg_bg_tubes)
+    get_dwein_overlaps_per_dgt, select_fg_bg_tubes,
+    qload_synthetic_tube_labels)
 from thes.evaluation.meta import (
     keyframe_cls_scores, cheating_tube_scoring, quick_tube_eval)
 from thes.tools import snippets
@@ -381,16 +380,13 @@ class Manager_loader_big_v2(object):
             BIG = np.load(str(tubes_featfold/"feats.npy"))
         self.dwti_f_bi = dwti_f_bi
         self.BIG = BIG
-        # from thes.dataset.daly import ()
-        tubes_dgt = tubes_dgt_train
-        tubes_dwein = tubes_dwein_train
 
         # // Associate tubes
         matched_dwts: Dict[I_dgt, Dict[I_dwein, float]] = \
-                get_dwein_overlaps_per_dgt(tubes_dgt, tubes_dwein)
+            get_dwein_overlaps_per_dgt(tubes_dgt_train, tubes_dwein_train)
         fg_meta, bg_meta = select_fg_bg_tubes(matched_dwts, top_n_matches)
         log.info('Selected {} FG and {} BG tubes from a total of {}'.format(
-            len(fg_meta), len(bg_meta), len(tubes_dwein)))
+            len(fg_meta), len(bg_meta), len(tubes_dwein_train)))
         # Merge fg/bg
         tube_metas = {}
         tube_metas.update(fg_meta)
@@ -1273,6 +1269,7 @@ def tubefeats_dist_train_mlp(workfolder, cfg_dict, add_args):
     rundir = small.mkdir(out/'rundir')
     checkpoint_path = (Manager_checkpoint_name.find_last_checkpoint(rundir))
     if '--new' in add_args:
+        Manager_checkpoint_name.rename_old_rundir(rundir)
         checkpoint_path = None
     start_epoch = (ckpt.restore_model_magic(checkpoint_path,
         cf['inputs.ckpt'], cf['train.start_epoch']))
@@ -1284,7 +1281,6 @@ def tubefeats_dist_train_mlp(workfolder, cfg_dict, add_args):
             cf['train.batch_size'], rgen,
             cf['train.tubes.frame_dist'],
             cf['train.tubes.add_keyframes'])
-        # loader = man_bigv2.get_train_loader(batch_size, rgen, 64)
         model.train()
         l_avg = snippets.misc.Averager()
         avg_bs = snippets.misc.Averager()

@@ -309,6 +309,8 @@ class YConfig_v2(object):
         """ Set defaults from YAML string """
         assert isinstance(merge_from, str)
         yaml_loaded = yaml.load(merge_from, yaml.Loader)
+        if not yaml_loaded:
+            return
         loaded_flat = flatten_nested_dict(yaml_loaded)
         # Convert everything to Ydefault
         for k, v in loaded_flat.items():

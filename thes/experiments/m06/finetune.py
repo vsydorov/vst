@@ -48,7 +48,9 @@ from thes.data.tubes.routines import (
     create_kinda_objaction_struct,
     qload_synthetic_tube_labels,
     temporal_ious_where_positive,
-    spatial_tube_iou_v3
+    spatial_tube_iou_v3,
+    get_dwein_overlaps_per_dgt,
+    select_fg_bg_tubes,
     )
 
 from thes.data.dataset.daly import (
@@ -67,6 +69,7 @@ from thes.data.tubes.nms import (
     compute_nms_for_av_stubes,)
 from thes.slowfast.cfg import (basic_sf_cfg)
 from thes.tools import snippets
+from thes.tools.snippets import check_step_sslice as check_step
 from thes.tools.video import (
     tfm_video_resize_threaded, tfm_video_center_crop)
 from thes.pytorch import (
@@ -565,24 +568,6 @@ def add_roi_batch_indices(bboxes_t, counts=None):
 # krgb stuff
 
 
-class TDataset_over_krgb(torch.utils.data.Dataset):
-    def __init__(self, array, bboxes, keyframes):
-        self.array = array
-        self.bboxes = bboxes
-        self.keyframes = keyframes
-
-    def __len__(self):
-        return len(self.keyframes)
-
-    def __getitem__(self, index):
-        rgb = self.array[index]
-        bbox = self.bboxes[index]
-        keyframe = self.keyframes[index]
-        keyframe['do_not_collate'] = True
-        label = keyframe['action_id']
-        return rgb, bbox, label, keyframe
-
-
 def set_lr(optimizer, new_lr):
     """
     Sets the optimizer lr to the specified value.
@@ -608,6 +593,24 @@ def _config_preparations(cf_override):
 
 
 class Manager_loader_krgb(object):
+
+    class TDataset_over_krgb(torch.utils.data.Dataset):
+        def __init__(self, array, bboxes, keyframes):
+            self.array = array
+            self.bboxes = bboxes
+            self.keyframes = keyframes
+
+        def __len__(self):
+            return len(self.keyframes)
+
+        def __getitem__(self, index):
+            rgb = self.array[index]
+            bbox = self.bboxes[index]
+            keyframe = self.keyframes[index]
+            keyframe['do_not_collate'] = True
+            label = keyframe['action_id']
+            return rgb, bbox, label, keyframe
+
     def __init__(self, keyframes_rgb_fold, dataset,
             norm_mean_cu, norm_std_cu):
         krgb_prefix = Path(keyframes_rgb_fold)
@@ -627,7 +630,7 @@ class Manager_loader_krgb(object):
         krgb_array = self.krgb_array[inds_kf]
         krgb_bboxes = self.krgb_bboxes[inds_kf]
         keyframes = [self.keyframes[i] for i in inds_kf]
-        tdataset = TDataset_over_krgb(
+        tdataset = Manager_loader_krgb.TDataset_over_krgb(
             krgb_array, krgb_bboxes, keyframes)
         return tdataset
 
@@ -707,7 +710,8 @@ class TDataset_over_fgroups(torch.utils.data.Dataset):
 
 class Manager_loader_boxcons_improved(object):
     def __init__(self, tubes_dgt_d, tubes_dwein_d,
-            sset_train, dataset, cn, stride,
+            sset_train, dataset, cn,
+            stride, top_n_matches,
             norm_mean_cu, norm_std_cu):
         self.dataset = dataset
         self.norm_mean_cu = norm_mean_cu
@@ -715,8 +719,20 @@ class Manager_loader_boxcons_improved(object):
 
         tubes_dwein_train = tubes_dwein_d[sset_train]
         tubes_dgt_train = tubes_dgt_d[sset_train]
-        self.dist_boxes = group_dwein_frames_wrt_kf_distance(
-                dataset, stride, tubes_dwein_train, tubes_dgt_train)
+
+        # // Associate tubes
+        matched_dwts: Dict[I_dgt, Dict[I_dwein, float]] = \
+            get_dwein_overlaps_per_dgt(tubes_dgt_train, tubes_dwein_train)
+        fg_meta, bg_meta = select_fg_bg_tubes(matched_dwts, top_n_matches)
+        log.info('Selected {} FG and {} BG tubes from a total of {}'.format(
+            len(fg_meta), len(bg_meta), len(tubes_dwein_train)))
+        # Merge fg/bg
+        tube_metas = {}
+        tube_metas.update(fg_meta)
+        tube_metas.update(bg_meta)
+        # Break into frames, sort by distance
+        self.dist_boxes_train = group_dwein_frames_wrt_kf_distance(
+            dataset, stride, tubes_dwein_train, tube_metas)
 
         # Create keyframes
         keyframes = create_keyframelist(dataset)
@@ -733,7 +749,7 @@ class Manager_loader_boxcons_improved(object):
             self, batch_size, rgen, max_distance, add_keyframes=True):
         # fg/bf boxes -> labels
         labeled_boxes = []
-        for i, boxes in self.dist_boxes.items():
+        for i, boxes in self.dist_boxes_train.items():
             if i > max_distance:
                 break
             for box in boxes:
@@ -901,6 +917,7 @@ class Manager_loader_boxcons(object):
         labels_c = labels_t.cuda()
         return frame_list_f32c, bboxes0_c, labels_c
 
+
 def _train_epoch(
         model_wf, train_loader, optimizer, loss_fn,
         cn_optim, inputs_converter, i_epoch, ibatch_actions):
@@ -925,10 +942,8 @@ def _train_epoch(
 
         # Compute loss
         loss = loss_fn(preds, labels)
-
         # check nan Loss.
         sf_misc.check_nan_losses(loss)
-
         # Perform the backward pass.
         optimizer.zero_grad()
         loss.backward()
@@ -947,7 +962,7 @@ def _train_epoch(
 
 def _evaluate_krgb_perf(model_wf, eval_loader, eval_keyframes,
         tubes_dwein_eval, tubes_dgt_eval, dataset,
-        inputs_converter, cut_off_bg):
+        inputs_converter, cut_off_bg, print_timers=False):
     eval_timers = snippets.TicToc(
             ['softmaxes', 'acc_roc', 'cheat_app'])
     # Obtain softmaxes
@@ -990,7 +1005,8 @@ def _evaluate_krgb_perf(model_wf, eval_loader, eval_keyframes,
         'K. Acc: {:.2f};'.format(kf_acc*100),
         'AP (cheating tubes): {}'.format(cheating_apline)
     )))
-    log.info('Eval_timers: {}'.format(eval_timers.time_str))
+    if print_timers:
+        log.info('Eval_timers: {}'.format(eval_timers.time_str))
 
 
 def _preset_defaults(cfg):
@@ -1010,12 +1026,15 @@ def _preset_defaults(cfg):
         batch_size:
             train: 32
             eval: 64
+        tubes:
+            top_n_matches: 1
+            stride: 4
+            frame_dist: 16
+            add_keyframes: True
     period:
         i_batch:
             loss_log: '0::10'
-            eval_krgb:
-                trainset: '0::10'
-                evalset: '0,50::50'
+            eval_krgb: '0,50::50'
         i_epoch:
             log: '::1'
     CN:
@@ -1059,7 +1078,8 @@ def finetune_preextracted_krgb(workfolder, cfg_dict, add_args):
           BASE_LR: 0.001
     period:
         i_batch:
-            loss_log: '::10'
+            loss_log: '0::10'
+            eval_krgb: '::95'
     """, allow_overwrite=True)
     cf = cfg.parse()
     cn = _config_preparations(cfg.without_prefix('CN.'))
@@ -1068,7 +1088,7 @@ def finetune_preextracted_krgb(workfolder, cfg_dict, add_args):
     initial_seed = cf['seed']
     torch.manual_seed(initial_seed)
     torch.cuda.manual_seed(initial_seed)
-    train_sampler_rgen = np.random.default_rng(initial_seed)
+    ts_rgen = np.random.default_rng(initial_seed)
 
     # / Data
     # General DALY level preparation
@@ -1099,40 +1119,80 @@ def finetune_preextracted_krgb(workfolder, cfg_dict, add_args):
     man_lkrgb = Manager_loader_krgb(
             cf['inputs.keyframes_rgb'], dataset,
             norm_mean_cu, norm_std_cu)
-    ibatch_actions = (
-        (cf['period.i_batch.loss_log'], f_loss_log),
-    )
     man_ckpt = Manager_model_checkpoints(model_wf.model, optimizer)
 
     # Restore previous run
     rundir = small.mkdir(out/'rundir')
+    checkpoint_path = (Manager_checkpoint_name.find_last_checkpoint(rundir))
     if '--new' in add_args:
+        Manager_checkpoint_name.rename_old_rundir(rundir)
         checkpoint_path = None
-    else:
-        checkpoint_path = (Manager_checkpoint_name.
-                find_last_checkpoint(rundir))
     start_epoch = (man_ckpt.restore_model_magic(checkpoint_path))
+
+    eval_krgb_loader, eval_krgb_keyframes = man_lkrgb.get_eval_loader(
+        vids_eval, cf['train.batch_size.eval'])
 
     # Training
     for i_epoch in range(start_epoch, max_epoch):
+        # Reset seed to i_epoch + seed
+        torch.manual_seed(initial_seed+i_epoch)
+        torch.cuda.manual_seed(initial_seed+i_epoch)
+        ts_rgen = np.random.default_rng(initial_seed+i_epoch)
+
         # Train part
         model_wf.set_train()
         train_loader = man_lkrgb.get_train_loader(
                 vgroup[sset_train],
-                cf['train.batch_size.train'], train_sampler_rgen)
-        _train_epoch(model_wf, train_loader, optimizer,
-                loss_fn, cn, man_lkrgb.preprocess_data, i_epoch,
-                ibatch_actions)
+                cf['train.batch_size.train'], ts_rgen)
+        inputs_converter = man_lkrgb.preprocess_data
+
+        wavg_loss = snippets.misc.WindowAverager(10)
+
+        for i_batch, (data_input) in enumerate(train_loader):
+            # preprocess data, transfer to GPU
+            inputs, boxes, labels = inputs_converter(data_input)
+
+            # Update learning rate
+            data_size = len(train_loader)
+            lr = tsf_optim.get_lr_at_epoch(cn,
+                    i_epoch + float(i_batch) / data_size)
+            set_lr(optimizer, lr)
+
+            result = model_wf.model(inputs, boxes)
+            preds = result['x_final']
+
+            # Compute loss
+            loss = loss_fn(preds, labels)
+            # check nan Loss.
+            sf_misc.check_nan_losses(loss)
+            # Perform the backward pass.
+            optimizer.zero_grad()
+            loss.backward()
+            # Update the parameters.
+            optimizer.step()
+
+            # Loss update
+            wavg_loss.update(loss.item())
+
+            if check_step(i_batch, cf['period.i_batch.loss_log']):
+                log.info(f'[{i_epoch}, {i_batch}/{data_size}]'
+                    f' {lr=} loss={wavg_loss}')
+            if check_step(i_batch, cf['period.i_batch.eval_krgb']):
+                log.info(f'Perf at [{i_epoch}, {i_batch}]')
+                model_wf.set_eval()
+                _evaluate_krgb_perf(model_wf, eval_krgb_loader,
+                    eval_krgb_keyframes, tubes_dwein_eval, tubes_dgt_eval,
+                    dataset, man_lkrgb.preprocess_data, cut_off_bg=False)
+                model_wf.set_train()
+
         # Save part
         man_ckpt.save_epoch(rundir, i_epoch)
         # Eval part
-        eval_krgb_loader, eval_krgb_keyframes = man_lkrgb.get_eval_loader(
-            vids_eval, cf['train.batch_size.eval'])
         model_wf.set_eval()
-        log.info(f'Perf at {i_epoch=}')
-        _evaluate_krgb_perf(model_wf, eval_krgb_loader, eval_krgb_keyframes,
-                tubes_dwein_eval, tubes_dgt_eval, dataset,
-                man_lkrgb.preprocess_data, cut_off_bg=False)
+        log.info(f'Perf at [{i_epoch}]')
+        _evaluate_krgb_perf(model_wf, eval_krgb_loader,
+            eval_krgb_keyframes, tubes_dwein_eval, tubes_dgt_eval,
+            dataset, man_lkrgb.preprocess_data, cut_off_bg=False)
 
 
 def finetune_on_tubefeats(workfolder, cfg_dict, add_args):
@@ -1145,8 +1205,6 @@ def finetune_on_tubefeats(workfolder, cfg_dict, add_args):
     Ncfg_daly.set_defcfg_v2(cfg)
     _preset_defaults(cfg)
     cfg.set_defaults_yaml("""
-    frame_coverage:
-        subsample: 4
     """)
     cf = cfg.parse()
     cn = _config_preparations(cfg.without_prefix('CN.'))
@@ -1186,10 +1244,11 @@ def finetune_on_tubefeats(workfolder, cfg_dict, add_args):
             cf['inputs.keyframes_rgb'], dataset,
             norm_mean_cu, norm_std_cu)
 
-    stride = cf['frame_coverage.subsample']
     man_lbox_improved = Manager_loader_boxcons_improved(
         tubes_dgt_d, tubes_dwein_d,
-        sset_train, dataset, cn, stride,
+        sset_train, dataset, cn,
+        cf['train.tubes.stride'],
+        cf['train.tubes.top_n_matches'],
         norm_mean_cu, norm_std_cu)
 
     def f_ibatch_eval_krgb_evalset(local_vars):
@@ -1204,7 +1263,7 @@ def finetune_on_tubefeats(workfolder, cfg_dict, add_args):
                 man_lkrgb.preprocess_data, cut_off_bg=True)
     ibatch_actions = (
         (cf['period.i_batch.loss_log'], f_loss_log),
-        (cf['period.i_batch.eval_krgb.evalset'],
+        (cf['period.i_batch.eval_krgb'],
             f_ibatch_eval_krgb_evalset))
     man_ckpt = Manager_model_checkpoints(model_wf.model, optimizer)
 
@@ -1212,25 +1271,21 @@ def finetune_on_tubefeats(workfolder, cfg_dict, add_args):
     rundir = small.mkdir(out/'rundir')
     checkpoint_path = (Manager_checkpoint_name.find_last_checkpoint(rundir))
     if '--new' in add_args:
-        Manager_model_checkpoints.rename_old_rundir(rundir)
+        Manager_checkpoint_name.rename_old_rundir(rundir)
         checkpoint_path = None
     start_epoch = (man_ckpt.restore_model_magic(checkpoint_path))
 
+    train_batch_size = cf['train.batch_size.train']
+    frame_dist = cf['train.tubes.frame_dist']
+    add_keyframes = cf['train.tubes.add_keyframes']
     # Training
     for i_epoch in range(start_epoch, max_epoch):
         log.info(f'New epoch {i_epoch}')
         # Train part
         model_wf.set_train()
-        if i_epoch == 0:
-            max_distance = -1
-        elif i_epoch < 1:
-            max_distance = 0
-        elif i_epoch < 2:
-            max_distance = 4
-        else:
-            max_distance = 20
         train_loader = man_lbox_improved.get_train_loader(
-                cf['train.batch_size.train'], train_sampler_rgen, max_distance)
+                train_batch_size, train_sampler_rgen,
+                frame_dist, add_keyframes)
         _train_epoch(model_wf, train_loader, optimizer,
                 loss_fn, cn, man_lbox_improved.preprocess_data, i_epoch,
                 ibatch_actions)

@@ -535,5 +535,3 @@ def qload_synthetic_tube_labels(
             raise RuntimeError()
         dwti_to_label[dwti] = ilabel
     return cls_labels, dwti_to_label
-
-
