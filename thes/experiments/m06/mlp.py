@@ -980,7 +980,8 @@ class Checkpointer(object):
             save_filepath, qtr.time))
 
     def restore_model_magic(
-            self, checkpoint_path, starting_model=None, training_start_epoch=0):
+            self, checkpoint_path,
+            starting_model=None, training_start_epoch=0):
         if checkpoint_path is not None:
             # Continue training
             states = torch.load(checkpoint_path)
@@ -998,8 +999,9 @@ class Checkpointer(object):
                 log.info(('Starting new training, '
                     'initialized from model {}, at epoch {}').format(
                         starting_model, start_epoch))
-            log.info(('Starting new training, '
-                'empty model, at epoch {}').format(start_epoch))
+            else:
+                log.info(('Starting new training, '
+                    'empty model, at epoch {}').format(start_epoch))
         return start_epoch
 
 # Experiments

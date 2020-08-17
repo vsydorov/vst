@@ -488,7 +488,8 @@ class Manager_model_checkpoints(object):
             save_filepath, qtr.time))
 
     def restore_model_magic(
-            self, checkpoint_path, training_start_epoch=0):
+            self, checkpoint_path, starting_model=None,
+            training_start_epoch=0):
         if checkpoint_path is not None:
             states = torch.load(checkpoint_path)
             self.model.load_state_dict(states['model_sdict'])
@@ -498,9 +499,17 @@ class Manager_model_checkpoints(object):
             log.info('Continuing training from checkpoint {}. '
                     'Epoch {} (ckpt + 1)'.format(checkpoint_path, start_epoch))
         else:
-            self.load_model_initial(self.model)
             start_epoch = training_start_epoch
-            log.info('Starting new training from epoch {}'.format(start_epoch))
+            if starting_model is not None:
+                states = torch.load(starting_model)
+                self.model.load_state_dict(states['model_sdict'])
+                log.info(('Starting new training, '
+                    'initialized from model {}, at epoch {}').format(
+                        starting_model, start_epoch))
+            else:
+                self.load_model_initial(self.model)
+                log.info('Starting new training from epoch {}'.format(
+                    start_epoch))
         return start_epoch
 
 # def create_optimizer():
@@ -743,8 +752,7 @@ class Manager_loader_boxcons_improved(object):
         self.frameloader_vsf = Frameloader_video_slowfast(
                 False, slowfast_alpha, 256)
 
-    def get_train_loader(
-            self, batch_size, rgen, max_distance, add_keyframes=True):
+    def get_labeled_boxes(self, max_distance, add_keyframes):
         # fg/bf boxes -> labels
         labeled_boxes = []
         for i, boxes in self.dist_boxes_train.items():
@@ -773,13 +781,23 @@ class Manager_loader_boxcons_improved(object):
                         'box': kf['bbox'],
                         'label': label}
                 labeled_boxes.append(lbox)
+        return labeled_boxes
 
+    @staticmethod
+    def get_frame_groups(labeled_boxes):
         # Group into frame_groups
         frame_groups: Dict[Tuple[Vid_daly, int], Dict] = {}
         for lbox in labeled_boxes:
             vid = lbox['vid']
             frame_ind = lbox['frame_ind']
             frame_groups.setdefault((vid, frame_ind), []).append(lbox)
+        return frame_groups
+
+    def get_train_loader(
+            self, batch_size, rgen, max_distance, add_keyframes=True):
+
+        labeled_boxes = self.get_labeled_boxes(max_distance, add_keyframes)
+        frame_groups = self.get_frame_groups(labeled_boxes)
 
         # # Permute
         # fg_list = list(frame_groups.items())
@@ -1013,6 +1031,7 @@ def _preset_defaults(cfg):
     inputs:
         tubes_dwein: ~
         keyframes_rgb: ~
+        ckpt: ~
     split_assignment: !def ['train/val',
         ['train/val', 'trainval/test']]
     freeze:
@@ -1021,6 +1040,8 @@ def _preset_defaults(cfg):
     debug_outputs: False
     ll_dropout: 0.5
     train:
+        start_epoch: 0
+        batch_save_interval_seconds: 60
         batch_size:
             train: 32
             eval: 64
@@ -1049,15 +1070,85 @@ def _preset_defaults(cfg):
           OPTIMIZING_METHOD: sgd
     """)
 
-def f_loss_log(local_vars):
-    i_epoch = local_vars['i_epoch']
-    i_batch = local_vars['i_batch']
-    data_size = local_vars['data_size']
-    lr = local_vars['lr']
-    l_avg = local_vars['l_avg']
-    l_wavg = local_vars['l_wavg']
-    log.info(f'[{i_epoch}, {i_batch}/{data_size}] {lr=} '
-            f'loss(all/10/last): {l_avg.avg}/{l_wavg.avg}/{l_avg.last}')
+
+class Isaver_train_epoch(snippets.isaver.Isaver_base):
+    def __init__(
+            self, folder, total,
+            f_init, f_forward,
+            i_epoch, model, optimizer,
+            interval_iters=None,
+            interval_seconds=120,  # every 2 minutes by default
+                ):
+        super(Isaver_train_epoch, self).__init__(folder, total)
+        self.f_init = f_init
+        self.f_forward = f_forward
+        self.i_epoch = i_epoch
+        self.model = model
+        self.optimizer = optimizer
+        self._interval_iters = interval_iters
+        self._interval_seconds = interval_seconds
+
+    def _get_filenames(self, i_batch) -> Dict[str, Path]:
+        base_filenames = {
+            'finished': self._fmt_finished.format(i_batch, self._total)}
+        # base_filenames['pkl'] = Path(
+        #         base_filenames['finished']).with_suffix('.pkl')
+        base_filenames['ckpt'] = Path(
+                base_filenames['finished']).with_suffix('.pth.tar')
+        filenames = {k: self._folder/v
+                for k, v in base_filenames.items()}
+        return filenames
+
+    def _restore(self):
+        intermediate_files: Dict[int, Dict[str, Path]] = \
+                self._get_intermediate_files()
+        start_i, ifiles = max(intermediate_files.items(),
+                default=(-1, None))
+        if ifiles is not None:
+            ckpt_path = ifiles['ckpt']
+            states = torch.load(ckpt_path)
+            self.model.load_state_dict(states['model_sdict'])
+            self.optimizer.load_state_dict(states['optimizer_sdict'])
+            start_i = states['i_batch']
+            i_epoch = states['i_epoch']
+            assert i_epoch == self.i_epoch
+            log.info('Restore model at [{}, {}] from {}'.format(
+                i_epoch, start_i, ckpt_path))
+        return start_i
+
+    def _save(self, i_batch):
+        ifiles = self._get_filenames(i_batch)
+        ckpt_path = ifiles['ckpt']
+
+        # Save checkpoint
+        states = {
+            'i_epoch': self.i_epoch,
+            'i_batch': i_batch,
+            'model_sdict': self.model.state_dict(),
+            'optimizer_sdict': self.optimizer.state_dict(),
+        }
+        torch.save(states, str(ckpt_path))
+
+        ifiles['finished'].touch()
+        log.info(f'Saved intermediate files at [{self.i_epoch}, {i_batch}]')
+        self._purge_intermediate_files()
+
+    def run(self):
+        i_last = self._restore()
+        countra = snippets.Counter_repeated_action(
+                seconds=self._interval_seconds,
+                iters=self._interval_iters)
+        i_start = i_last + 1
+
+        loader = self.f_init(i_last)
+        # pbar = tqdm(loader, total=len(loader))
+        pbar = tqdm(loader, total=self._total, initial=i_start)
+        for i_batch, data_input in enumerate(pbar, start=i_start):
+            self.f_forward(i_batch, self._total, data_input)
+            if countra.check(i_batch):
+                self._save(i_batch)
+                log.debug(snippets.tqdm_str(pbar))
+                countra.tic(i_batch)
 
 # EXPERIMENTS
 
@@ -1246,7 +1337,7 @@ def finetune_on_tubefeats(workfolder, cfg_dict, add_args):
     keyframes_train = [kf for kf in keyframes
             if kf['vid'] in vgroup[sset_train]]
 
-    man_lbox_improved = Manager_loader_boxcons_improved(
+    manli = Manager_loader_boxcons_improved(
         tubes_dgt_d, tubes_dwein_d,
         sset_train, dataset, cn,
         keyframes_train,
@@ -1266,37 +1357,58 @@ def finetune_on_tubefeats(workfolder, cfg_dict, add_args):
     if '--new' in add_args:
         Manager_checkpoint_name.rename_old_rundir(rundir)
         checkpoint_path = None
-    start_epoch = (man_ckpt.restore_model_magic(checkpoint_path))
+    start_epoch = man_ckpt.restore_model_magic(checkpoint_path,
+            cf['inputs.ckpt'], cf['train.start_epoch'])
 
-    train_batch_size = cf['train.batch_size.train']
+    batch_size_train = cf['train.batch_size.train']
     frame_dist = cf['train.tubes.frame_dist']
     add_keyframes = cf['train.tubes.add_keyframes']
+    NUM_WORKERS = 8
     # Training
     for i_epoch in range(start_epoch, max_epoch):
         log.info(f'New epoch {i_epoch}')
+
+        folder_epoch = small.mkdir(rundir/f'TRAIN/{i_epoch:03d}')
 
         # Reset seed to i_epoch + seed
         torch.manual_seed(initial_seed+i_epoch)
         torch.cuda.manual_seed(initial_seed+i_epoch)
         ts_rgen = np.random.default_rng(initial_seed+i_epoch)
 
-        # Train part
-        model_wf.set_train()
-        train_loader = man_lbox_improved.get_train_loader(
-                train_batch_size, ts_rgen,
-                frame_dist, add_keyframes)
-        inputs_converter = man_lbox_improved.preprocess_data
+        labeled_boxes = manli.get_labeled_boxes(
+               frame_dist, add_keyframes)
+        frame_groups = manli.get_frame_groups(
+                labeled_boxes)
+        # Permute
+        fg_list = list(frame_groups.items())
+        fg_order = ts_rgen.permutation(len(fg_list))
+        fg_list = [fg_list[i] for i in fg_order]
+        frame_groups_permuted = dict(fg_list)
 
         wavg_loss = snippets.misc.WindowAverager(10)
 
-        for i_batch, (data_input) in enumerate(train_loader):
+        inputs_converter = manli.preprocess_data
+
+        # Loader
+        def init_dataloader(i_start):
+            remaining = dict(list(frame_groups_permuted.items())[i_start:])
+            td = TDataset_over_fgroups(
+                remaining, manli.dataset,
+                manli.sampler_grid, manli.frameloader_vsf)
+            train_loader = torch.utils.data.DataLoader(td,
+                batch_size=batch_size_train,
+                num_workers=NUM_WORKERS,
+                collate_fn=sequence_batch_collate_v2)
+            return train_loader
+
+        def batch_forward(i_batch, total_batches, data_input):
+            model_wf.set_train()
             # preprocess data, transfer to GPU
             inputs, boxes, labels = inputs_converter(data_input)
 
             # Update learning rate
-            data_size = len(train_loader)
             lr = tsf_optim.get_lr_at_epoch(cn,
-                    i_epoch + float(i_batch) / data_size)
+                    i_epoch + float(i_batch) / total_batches)
             set_lr(optimizer, lr)
 
             result = model_wf.model(inputs, boxes)
@@ -1316,7 +1428,7 @@ def finetune_on_tubefeats(workfolder, cfg_dict, add_args):
             wavg_loss.update(loss.item())
 
             if check_step(i_batch, cf['period.i_batch.loss_log']):
-                log.info(f'[{i_epoch}, {i_batch}/{data_size}]'
+                log.info(f'[{i_epoch}, {i_batch}/{total_batches}]'
                     f' {lr=} loss={wavg_loss}')
             if check_step(i_batch, cf['period.i_batch.eval_krgb']):
                 log.info(f'Perf at [{i_epoch}, {i_batch}]')
@@ -1325,6 +1437,13 @@ def finetune_on_tubefeats(workfolder, cfg_dict, add_args):
                     eval_krgb_keyframes, tubes_dwein_eval, tubes_dgt_eval,
                     dataset, man_lkrgb.preprocess_data, cut_off_bg=True)
                 model_wf.set_train()
+
+        isaver = Isaver_train_epoch(
+                folder_epoch, len(frame_groups_permuted)//batch_size_train,
+                init_dataloader, batch_forward,
+                i_epoch, model_wf.model, optimizer,
+                interval_seconds=cf['train.batch_save_interval_seconds'])
+        isaver.run()
 
         # Save part
         man_ckpt.save_epoch(rundir, i_epoch)
