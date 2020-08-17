@@ -1041,7 +1041,7 @@ def _preset_defaults(cfg):
     ll_dropout: 0.5
     train:
         start_epoch: 0
-        batch_save_interval_seconds: 60
+        batch_save_interval_seconds: 120
         batch_size:
             train: 32
             eval: 64
@@ -1140,7 +1140,7 @@ class Isaver_train_epoch(snippets.isaver.Isaver_base):
                 iters=self._interval_iters)
         i_start = i_last + 1
 
-        loader = self.f_init(i_last)
+        loader = self.f_init(i_start)
         # pbar = tqdm(loader, total=len(loader))
         pbar = tqdm(loader, total=self._total, initial=i_start)
         for i_batch, data_input in enumerate(pbar, start=i_start):
