@@ -76,7 +76,7 @@ from thes.pytorch import (
     sequence_batch_collate_v2, np_to_gpu,
     to_gpu_normalize_permute, Sampler_grid,
     Frameloader_video_slowfast, NumpyRandomSampler,
-    merge_cf_into_cfgnode)
+    merge_cf_into_cfgnode, pack_pathway_output)
 from thes.training import (
     Manager_checkpoint_name)
 
@@ -673,49 +673,140 @@ class Manager_loader_krgb(object):
 
 
 class TDataset_over_fgroups(torch.utils.data.Dataset):
-    def __init__(self, frame_groups, dataset,
-            sampler_grid, frameloader_vsf):
+    def __init__(self, cn, frame_groups, dataset):
         self.frame_groups = frame_groups
         self.keys_vf = list(self.frame_groups.keys())
         self.dataset = dataset
-        self.sampler_grid = sampler_grid
-        self.frameloader_vsf = frameloader_vsf
+
+        # Temporal sampling
+        model_nframes = cn.DATA.NUM_FRAMES
+        model_sample = cn.DATA.SAMPLING_RATE
+        self.sampler_grid = Sampler_grid(model_nframes, model_sample)
+
+        self.cn = cn
+        self._is_slowfast = False
+        self._slowfast_alpha = cn.SLOWFAST.ALPHA
+        self._test_crop_size = 256
 
     def __len__(self):
         return len(self.frame_groups)
 
     def __getitem__(self, index):
         key_vf = self.keys_vf[index]
-        boxes = self.frame_groups[key_vf]
-        vid = boxes[0]['vid']
-        i0 = boxes[0]['frame_ind']
+        frame_group = self.frame_groups[key_vf]
+        vid = frame_group[0]['vid']
+        i0 = frame_group[0]['frame_ind']
         assert key_vf == (vid, i0)
 
         video_path = str(self.dataset.videos_ocv[vid]['path'])
+
+        # Sampling frames themselves
         nframes = self.dataset.videos_ocv[vid]['nframes']
         finds_to_sample = self.sampler_grid.apply(i0, nframes)
-        frame_list, resize_params, ccrop_params = \
-            self.frameloader_vsf.prepare_frame_list(
-                    video_path, finds_to_sample)
+        with vt_cv.video_capture_open(video_path) as vcap:
+            fl_u8_bgr = vt_cv.video_sample(vcap, finds_to_sample)
+        # # Flip to RGB
+        # fl_u8 = [np.flip(x, -1) for x in fl_u8_bgr]
+        # Video is in HWC, BGR format
 
-        # Boxes
-        prepared_bboxes = []
-        for box in boxes:
-            prepared_bbox_tldr = self.frameloader_vsf.prepare_box(
-                box['box'], resize_params, ccrop_params)
-            prepared_bboxes.append(prepared_bbox_tldr)
-        prepared_bboxes = np.stack(prepared_bboxes, axis=0)
+        # I am following slowfast/datasets/ava_dataset.py
+        # (_images_and_boxes_preprocessing_cv2)
 
-        # labels
-        labels = np.array([box['label'] for box in boxes])
+        boxes_tldr = np.vstack([f['box'][[1, 0, 3, 2]]
+            for f in frame_group])
+        orig_boxes = boxes_tldr.copy()
+
+        from slowfast.datasets import cv2_transform as sf_cv2_transform
+        jmin, jmax = self.cn.DATA.TRAIN_JITTER_SCALES
+        crop_size = self.cn.DATA.TRAIN_CROP_SIZE
+        random_horizontal_flip = self.cn.DATA.RANDOM_FLIP
+        use_color_augmentation = True
+        pca_eigval = self.cn.AVA.TRAIN_PCA_EIGVAL
+        pca_eigvec = self.cn.AVA.TRAIN_PCA_EIGVEC
+        data_mean = self.cn.DATA.MEAN
+        data_std = self.cn.DATA.STD
+
+        imgs, boxes = fl_u8_bgr, [boxes_tldr]
+        imgs, boxes = sf_cv2_transform.random_short_side_scale_jitter_list(
+                imgs, min_size=jmin, max_size=jmax, boxes=boxes)
+        imgs, boxes = sf_cv2_transform.random_crop_list(
+                imgs, crop_size, order="HWC", boxes=boxes)
+        if random_horizontal_flip:
+            imgs, boxes = sf_cv2_transform.horizontal_flip_list(
+                0.5, imgs, order="HWC", boxes=boxes)
+
+        # Convert image to CHW keeping BGR order.
+        imgs = [sf_cv2_transform.HWC2CHW(img) for img in imgs]
+
+        # Image [0, 255] -> [0, 1].
+        imgs = [img / 255.0 for img in imgs]
+
+        imgs = [
+            np.ascontiguousarray(
+                img.reshape((3, imgs[0].shape[1], imgs[0].shape[2]))
+            ).astype(np.float32)
+            for img in imgs
+        ]
+
+        if use_color_augmentation:
+            imgs = sf_cv2_transform.color_jitter_list(
+                imgs,
+                img_brightness=0.4,
+                img_contrast=0.4,
+                img_saturation=0.4,
+            )
+
+            imgs = sf_cv2_transform.lighting_list(
+                imgs,
+                alphastd=0.1,
+                eigval=np.array(pca_eigval).astype(np.float32),
+                eigvec=np.array(pca_eigvec).astype(np.float32),
+            )
+
+        # Normalize now
+        imgs = [
+            sf_cv2_transform.color_normalization(
+                img,
+                np.array(data_mean, dtype=np.float32),
+                np.array(data_std, dtype=np.float32),
+            )
+            for img in imgs
+        ]
+
+        # Concat list of images to single ndarray.
+        imgs = np.concatenate(
+            [np.expand_dims(img, axis=1) for img in imgs], axis=1
+        )
+
+        # To RGB
+        imgs = imgs[::-1, ...]
+
+        imgs = np.ascontiguousarray(imgs)
+        imgs = torch.from_numpy(imgs)
+        boxes = sf_cv2_transform.clip_boxes_to_image(
+            boxes[0], imgs[0].shape[1], imgs[0].shape[2]
+        )
+
+        # Y = (imgs[0].transpose([1, 2, 0])*255).clip(0, 255).astype(np.uint8)
+        # cv2.imshow("test", Y)
+        # cv2.waitKey(0)
+        # cv2.destroyAllWindows()
+
+        # Construct labels
+        labels = np.array([f['label'] for f in frame_group])
+
+        # Pack pathways
+        packed_imgs = pack_pathway_output(imgs,
+                self._is_slowfast, self._slowfast_alpha)
 
         meta = {
             'labels': labels,
             'index': index,
             'ckey': key_vf,
-            'bboxes_tldr': prepared_bboxes,
+            'bboxes_tldr': boxes,
+            'orig_boxes': orig_boxes,
             'do_not_collate': True}
-        return (frame_list, meta)
+        return (packed_imgs, meta)
 
 class Manager_loader_boxcons_improved(object):
     def __init__(self, tubes_dgt_d, tubes_dwein_d,
@@ -744,13 +835,6 @@ class Manager_loader_boxcons_improved(object):
         # Break into frames, sort by distance
         self.dist_boxes_train = group_dwein_frames_wrt_kf_distance(
             dataset, stride, tubes_dwein_train, tube_metas)
-
-        model_nframes = cn.DATA.NUM_FRAMES
-        model_sample = cn.DATA.SAMPLING_RATE
-        slowfast_alpha = cn.SLOWFAST.ALPHA
-        self.sampler_grid = Sampler_grid(model_nframes, model_sample)
-        self.frameloader_vsf = Frameloader_video_slowfast(
-                False, slowfast_alpha, 256)
 
     def get_labeled_boxes(self, max_distance, add_keyframes):
         # fg/bf boxes -> labels
@@ -1050,6 +1134,7 @@ def _preset_defaults(cfg):
             stride: 4
             frame_dist: -1
             add_keyframes: True
+        num_workers: 8
     period:
         i_batch:
             loss_log: '0::10'
@@ -1363,7 +1448,7 @@ def finetune_on_tubefeats(workfolder, cfg_dict, add_args):
     batch_size_train = cf['train.batch_size.train']
     frame_dist = cf['train.tubes.frame_dist']
     add_keyframes = cf['train.tubes.add_keyframes']
-    NUM_WORKERS = 8
+    NUM_WORKERS = cf['train.num_workers']
     # Training
     for i_epoch in range(start_epoch, max_epoch):
         log.info(f'New epoch {i_epoch}')
@@ -1387,14 +1472,10 @@ def finetune_on_tubefeats(workfolder, cfg_dict, add_args):
 
         wavg_loss = snippets.misc.WindowAverager(10)
 
-        inputs_converter = manli.preprocess_data
-
         # Loader
         def init_dataloader(i_start):
             remaining = dict(list(frame_groups_permuted.items())[i_start:])
-            td = TDataset_over_fgroups(
-                remaining, manli.dataset,
-                manli.sampler_grid, manli.frameloader_vsf)
+            td = TDataset_over_fgroups(cn, remaining, manli.dataset)
             train_loader = torch.utils.data.DataLoader(td,
                 batch_size=batch_size_train,
                 num_workers=NUM_WORKERS,
@@ -1404,7 +1485,25 @@ def finetune_on_tubefeats(workfolder, cfg_dict, add_args):
         def batch_forward(i_batch, total_batches, data_input):
             model_wf.set_train()
             # preprocess data, transfer to GPU
-            inputs, boxes, labels = inputs_converter(data_input)
+            frame_list, metas, = data_input
+
+            # bbox transformations
+            bboxes_np = [m['bboxes_tldr'] for m in metas]
+            counts = np.array([len(x) for x in bboxes_np])
+            batch_indices = np.repeat(np.arange(len(counts)), counts)
+            bboxes0 = np.c_[batch_indices, np.vstack(bboxes_np)]
+            bboxes0 = torch.from_numpy(bboxes0)
+            bboxes0_c = bboxes0.type(torch.cuda.FloatTensor)
+
+            # labels
+            labels_np = [m['labels'] for m in metas]
+            labels_np = np.hstack(labels_np)
+            labels_t = torch.from_numpy(labels_np)
+            labels_c = labels_t.cuda()
+
+            inputs = [x.type(torch.cuda.FloatTensor) for x in frame_list]
+            boxes = bboxes0_c
+            labels = labels_c
 
             # Update learning rate
             lr = tsf_optim.get_lr_at_epoch(cn,
