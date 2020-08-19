@@ -571,7 +571,7 @@ def extract_keyframe_rgb(workfolder, cfg_dict, add_args):
     slowfast_alpha = 8
     sampler_grid = Sampler_grid(model_nframes, model_sample)
     frameloader_vsf = Frameloader_video_slowfast(
-            is_slowfast, slowfast_alpha, 256)
+            is_slowfast, slowfast_alpha, 256, 'ltrd')
 
     def prepare_func(start_i):
         remaining_keyframes_dict = dict(list(

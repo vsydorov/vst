@@ -37,7 +37,7 @@ class Sampler_grid(object):
 class Frameloader_video_slowfast(object):
     def __init__(self, is_slowfast, slowfast_alpha,
             test_crop_size,
-            box_orientation,
+            box_orientation='ltrd',
             load_method='opencv'):
         self._is_slowfast = is_slowfast
         self._slowfast_alpha = slowfast_alpha
