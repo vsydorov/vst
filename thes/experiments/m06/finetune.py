@@ -1,4 +1,5 @@
 from tqdm import tqdm
+import cv2
 import copy
 import string
 import random
@@ -21,7 +22,8 @@ import torch.nn as nn
 import torch.utils.data
 from detectron2.layers import ROIAlign
 import slowfast.models
-import slowfast.utils.checkpoint as cu
+import slowfast.utils.checkpoint as sf_cu
+from slowfast.datasets import cv2_transform as sf_cv2_transform
 
 from slowfast.models.video_model_builder import SlowFast as M_slowfast
 from slowfast.models.video_model_builder import ResNet as M_resnet
@@ -468,7 +470,7 @@ class Manager_model_checkpoints(object):
 
         # Load model
         with vt_log.logging_disabled(logging.WARNING):
-            cu.load_checkpoint(
+            sf_cu.load_checkpoint(
                 CHECKPOINT_FILE_PATH, model, False, None,
                 inflation=False, convert_from_caffe2=True,)
 
@@ -673,7 +675,7 @@ class Manager_loader_krgb(object):
 
 
 class TDataset_over_fgroups(torch.utils.data.Dataset):
-    def __init__(self, cn, frame_groups, dataset):
+    def __init__(self, cf, cn, frame_groups, dataset):
         self.frame_groups = frame_groups
         self.keys_vf = list(self.frame_groups.keys())
         self.dataset = dataset
@@ -687,6 +689,11 @@ class TDataset_over_fgroups(torch.utils.data.Dataset):
         self._is_slowfast = False
         self._slowfast_alpha = cn.SLOWFAST.ALPHA
         self._test_crop_size = 256
+
+        # Enable augmentations
+        self.augment_scale = cf['train.augment.scale']
+        self.augment_hflip = cf['train.augment.hflip']
+        self.augment_color = cf['train.augment.color']
 
     def __len__(self):
         return len(self.frame_groups)
@@ -708,39 +715,50 @@ class TDataset_over_fgroups(torch.utils.data.Dataset):
         # # Flip to RGB
         # fl_u8 = [np.flip(x, -1) for x in fl_u8_bgr]
         # Video is in HWC, BGR format
+        # Boxes should be in LTRD format
 
         # I am following slowfast/datasets/ava_dataset.py
         # (_images_and_boxes_preprocessing_cv2)
 
-        boxes_tldr = np.vstack([f['box'][[1, 0, 3, 2]]
+        boxes_ltrd = np.vstack([f['box']
             for f in frame_group])
-        orig_boxes = boxes_tldr.copy()
+        orig_boxes_ltrd = boxes_ltrd.copy()
 
-        from slowfast.datasets import cv2_transform as sf_cv2_transform
         jmin, jmax = self.cn.DATA.TRAIN_JITTER_SCALES
-        crop_size = self.cn.DATA.TRAIN_CROP_SIZE
-        random_horizontal_flip = self.cn.DATA.RANDOM_FLIP
-        use_color_augmentation = True
-        pca_eigval = self.cn.AVA.TRAIN_PCA_EIGVAL
-        pca_eigvec = self.cn.AVA.TRAIN_PCA_EIGVEC
         data_mean = self.cn.DATA.MEAN
         data_std = self.cn.DATA.STD
 
-        imgs, boxes = fl_u8_bgr, [boxes_tldr]
-        imgs, boxes = sf_cv2_transform.random_short_side_scale_jitter_list(
-                imgs, min_size=jmin, max_size=jmax, boxes=boxes)
-        imgs, boxes = sf_cv2_transform.random_crop_list(
-                imgs, crop_size, order="HWC", boxes=boxes)
-        if random_horizontal_flip:
+        imgs, boxes = fl_u8_bgr, [boxes_ltrd]
+        height, width, _ = imgs[0].shape
+
+        if self.augment_scale:
+            crop_size = self.cn.DATA.TRAIN_CROP_SIZE
+            imgs, boxes = sf_cv2_transform.random_short_side_scale_jitter_list(
+                    imgs, min_size=jmin, max_size=jmax, boxes=boxes)
+            imgs, boxes = sf_cv2_transform.random_crop_list(
+                    imgs, crop_size, order="HWC", boxes=boxes)
+        else:
+            crop_size = self.cn.DATA.TEST_CROP_SIZE
+            imgs = [sf_cv2_transform.scale(
+                crop_size, img) for img in imgs]
+            boxes = [
+                sf_cv2_transform.scale_boxes(
+                    crop_size, boxes[0], height, width
+                )
+            ]
+            # Centercrop basically
+            imgs, boxes = sf_cv2_transform.spatial_shift_crop_list(
+                crop_size, imgs, 1, boxes=boxes
+            )
+
+        if self.augment_hflip:
             imgs, boxes = sf_cv2_transform.horizontal_flip_list(
                 0.5, imgs, order="HWC", boxes=boxes)
 
         # Convert image to CHW keeping BGR order.
         imgs = [sf_cv2_transform.HWC2CHW(img) for img in imgs]
-
         # Image [0, 255] -> [0, 1].
         imgs = [img / 255.0 for img in imgs]
-
         imgs = [
             np.ascontiguousarray(
                 img.reshape((3, imgs[0].shape[1], imgs[0].shape[2]))
@@ -748,7 +766,9 @@ class TDataset_over_fgroups(torch.utils.data.Dataset):
             for img in imgs
         ]
 
-        if use_color_augmentation:
+        if self.augment_color:
+            pca_eigval = self.cn.AVA.TRAIN_PCA_EIGVAL
+            pca_eigvec = self.cn.AVA.TRAIN_PCA_EIGVEC
             imgs = sf_cv2_transform.color_jitter_list(
                 imgs,
                 img_brightness=0.4,
@@ -787,24 +807,55 @@ class TDataset_over_fgroups(torch.utils.data.Dataset):
             boxes[0], imgs[0].shape[1], imgs[0].shape[2]
         )
 
+        # Construct labels
+        labels = np.array([f['label'] for f in frame_group])
+
         # Y = (imgs[0].transpose([1, 2, 0])*255).clip(0, 255).astype(np.uint8)
+
+        # Y = imgs[0].numpy().transpose([1, 2, 0])*data_std+data_mean
+
+        # Y = imgs[0].astype(np.uint8)
+
+        # Y = imgs[:, 0].numpy().transpose([1, 2, 0])*data_std+data_mean
+        # Y = (Y*255).clip(0, 255).astype(np.uint8)[..., ::-1]
+
+        # Yo = fl_u8_bgr[0]
+        # cv2.imshow("test_o", Yo)
         # cv2.imshow("test", Y)
         # cv2.waitKey(0)
         # cv2.destroyAllWindows()
 
-        # Construct labels
-        labels = np.array([f['label'] for f in frame_group])
+        # actnames = self.dataset.action_names + ['background']
+        # Y = imgs[:, 0].numpy().transpose([1, 2, 0])*data_std+data_mean
+        # Y = (Y*255).clip(0, 255).astype(np.uint8)[..., ::-1]
+        # Y = np.ascontiguousarray(Y)
+        # for i, box_ltrd in enumerate(boxes):
+        #     label = actnames[labels[i]]
+        #     snippets.misc.cv_put_box_with_text(
+        #             Y, box_ltrd, text=label)
+        # Yo = fl_u8_bgr[0].copy()
+        # for i, box_ltrd in enumerate(orig_boxes_ltrd):
+        #     label = actnames[labels[i]]
+        #     snippets.misc.cv_put_box_with_text(
+        #             Yo, box_ltrd, text=label)
+        # cv2.imshow("test", Y)
+        # cv2.imshow("test_orig", Yo)
+        # cv2.waitKey(0)
+        # cv2.destroyAllWindows()
 
         # Pack pathways
         packed_imgs = pack_pathway_output(imgs,
                 self._is_slowfast, self._slowfast_alpha)
 
+        # Convert boxes to TLRD
+        bboxes_tlrd = boxes[:, [1, 0, 3, 2]]
+
         meta = {
             'labels': labels,
             'index': index,
             'ckey': key_vf,
-            'bboxes_tldr': boxes,
-            'orig_boxes': orig_boxes,
+            'bboxes_tldr': bboxes_tlrd,
+            'orig_boxes_ltrd': orig_boxes_ltrd,
             'do_not_collate': True}
         return (packed_imgs, meta)
 
@@ -876,30 +927,6 @@ class Manager_loader_boxcons_improved(object):
             frame_ind = lbox['frame_ind']
             frame_groups.setdefault((vid, frame_ind), []).append(lbox)
         return frame_groups
-
-    def get_train_loader(
-            self, batch_size, rgen, max_distance, add_keyframes=True):
-
-        labeled_boxes = self.get_labeled_boxes(max_distance, add_keyframes)
-        frame_groups = self.get_frame_groups(labeled_boxes)
-
-        # # Permute
-        # fg_list = list(frame_groups.items())
-        # fg_order = rgen.permutation(len(fg_list))
-        # fg_list = [fg_list[i] for i in fg_order]
-        # frame_groups = dict(fg_list)
-
-        # Loader
-        NUM_WORKERS = 8
-        td = TDataset_over_fgroups(frame_groups, self.dataset,
-                self.sampler_grid, self.frameloader_vsf)
-        sampler = NumpyRandomSampler(td, rgen)
-        loader = torch.utils.data.DataLoader(td,
-            batch_size=batch_size, num_workers=NUM_WORKERS,
-            sampler=sampler, shuffle=False,
-            pin_memory=True,
-            collate_fn=sequence_batch_collate_v2)
-        return loader
 
     def preprocess_data(self, data_input):
         frame_list, metas, = data_input
@@ -1135,6 +1162,10 @@ def _preset_defaults(cfg):
             frame_dist: -1
             add_keyframes: True
         num_workers: 8
+        augment:
+            scale: False
+            hflip: False
+            color: False
     period:
         i_batch:
             loss_log: '0::10'
@@ -1475,7 +1506,7 @@ def finetune_on_tubefeats(workfolder, cfg_dict, add_args):
         # Loader
         def init_dataloader(i_start):
             remaining = dict(list(frame_groups_permuted.items())[i_start:])
-            td = TDataset_over_fgroups(cn, remaining, manli.dataset)
+            td = TDataset_over_fgroups(cf, cn, remaining, manli.dataset)
             train_loader = torch.utils.data.DataLoader(td,
                 batch_size=batch_size_train,
                 num_workers=NUM_WORKERS,
