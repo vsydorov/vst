@@ -180,7 +180,7 @@ class Ncfg_extractor:
                            'I3D_8x8_R50', 'c2d', 'c2d_1x1', 'c2d_imnet']]
             extraction_mode: ['roi', ['roi', 'fullframe']]
         extraction:
-            box_orientation: ['tldr', ['tldr', 'ltrd']]
+            box_orientation: ['ltrd', ['tldr', 'ltrd']]  # The other way is wrong
             batch_size: [8, int]
             num_workers: [12, int]
             save_interval: [300, int]

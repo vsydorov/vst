@@ -178,7 +178,7 @@ I use these guys to score tubes based on intersections with box detections
 - Helps with transfering detection information to tubes
 - Usecases:
   - Score DWEIN tubes via RCNN objdect detection overlap
-  - Cheating evalutiaon of DWEIN tubes via keyframe-only predictions
+  - Cheating evaluation of DWEIN tubes via keyframe-only predictions
 """
 
 
@@ -241,6 +241,27 @@ def score_ftubes_via_objaction_overlap_aggregation(
                     objactions_vf.get(vid, {}).get(frame_ind)
             if odets is None:
                 continue
+
+            # from vsydorov_tools import cv as vt_cv
+            # import cv2
+            # video_path = dataset.videos_ocv[vid]['path']
+            # with vt_cv.video_capture_open(video_path) as vcap:
+            #     fl_u8_bgr = vt_cv.video_sample(vcap, [frame_ind])[0]
+            # Y = np.ascontiguousarray(fl_u8_bgr)
+            # snippets.misc.cv_put_box_with_text(
+            #         Y, tube_box, text='DWT_box')
+            # # Highest scored odet
+            # argmax = odets['scores'].argmax()
+            # best_box = odets['pred_boxes'][argmax]
+            # best_score = odets['scores'][argmax]
+            # best_label = odets['pred_classes'][argmax]
+            # label = f'{best_label} = {best_score:.2f}'
+            # snippets.misc.cv_put_box_with_text(
+            #         Y, best_box, text=label)
+            # cv2.imshow("test", Y)
+            # cv2.waitKey(0)
+            # cv2.destroyAllWindows()
+
             # Check score
             score_above = odets['scores'] > score_cutoff
             sa_boxes = odets['pred_boxes'][score_above]

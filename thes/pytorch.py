@@ -44,6 +44,8 @@ class Frameloader_video_slowfast(object):
         self._test_crop_size = test_crop_size
         self._box_orientation = box_orientation
         self._load_method = load_method
+        if self._load_method == 'tldr':
+            log.warning('!!! TLDR IS A VERY BAD LOAD METHOD !!!')
 
     def prepare_frame_list(self, video_path, finds_to_sample):
         video_read_method = self._load_method
