@@ -11,7 +11,7 @@ from typing import (  # NOQA
         Iterable, List, Dict, Any)
 
 from vsydorov_tools import small
-from .misc import tqdm_str
+from .misc import (tqdm_str, check_step_sslice)
 
 log = logging.getLogger(__name__)
 

@@ -180,6 +180,7 @@ class Ncfg_extractor:
                            'I3D_8x8_R50', 'c2d', 'c2d_1x1', 'c2d_imnet']]
             extraction_mode: ['roi', ['roi', 'fullframe']]
         extraction:
+            box_orientation: ['tldr', ['tldr', 'ltrd']]
             batch_size: [8, int]
             num_workers: [12, int]
             save_interval: [300, int]
@@ -187,6 +188,8 @@ class Ncfg_extractor:
 
     def prepare(cf):
         model_id = cf['extractor.model_id']
+        assert cf['extractor.extraction_mode'] == 'roi'
+
         rel_yml_path = REL_YAML_PATHS[model_id]
         sf_cfg = basic_sf_cfg(rel_yml_path)
         if model_id == 'c2d_1x1':
@@ -220,8 +223,9 @@ class Ncfg_extractor:
         is_slowfast = isinstance(fextractor.model,
                 slowfast.models.video_model_builder.SlowFast)
         sampler_grid = Sampler_grid(model_nframes, model_sample)
+        box_orientation = cf['extraction.box_orientation']
         frameloader_vsf = Frameloader_video_slowfast(
-                is_slowfast, slowfast_alpha, 256)
+                is_slowfast, slowfast_alpha, 256, box_orientation)
         return norm_mean_t, norm_std_t, sampler_grid, frameloader_vsf, fextractor
 
 

@@ -37,10 +37,12 @@ class Sampler_grid(object):
 class Frameloader_video_slowfast(object):
     def __init__(self, is_slowfast, slowfast_alpha,
             test_crop_size,
+            box_orientation,
             load_method='opencv'):
         self._is_slowfast = is_slowfast
         self._slowfast_alpha = slowfast_alpha
         self._test_crop_size = test_crop_size
+        self._box_orientation = box_orientation
         self._load_method = load_method
 
     def prepare_frame_list(self, video_path, finds_to_sample):
@@ -58,8 +60,7 @@ class Frameloader_video_slowfast(object):
                 Xt, is_slowfast, slowfast_alpha)
         return frame_list, resize_params, ccrop_params
 
-    @staticmethod
-    def prepare_box(bbox_ltrd, resize_params, ccrop_params):
+    def prepare_box(self, bbox_ltrd, resize_params, ccrop_params):
         # X is NCHW
         # Resize bbox
         bbox_tldr = bbox_ltrd[[1, 0, 3, 2]]
@@ -73,7 +74,13 @@ class Frameloader_video_slowfast(object):
         box_maxsize = np.tile(
                 np.r_[ccrop_params['th'], ccrop_params['tw']], 2)
         bbox_tldr = np.clip(bbox_tldr, [0, 0, 0, 0], box_maxsize)
-        return bbox_tldr
+        if self._box_orientation == 'tldr':
+            bbox = bbox_tldr
+        elif self._box_orientation == 'ltrd':
+            bbox = bbox_tldr[[1, 0, 3, 2]]
+        else:
+            raise NotImplementedError()
+        return bbox
 
 
 def sequence_batch_collate_v2(batch):
@@ -379,7 +386,7 @@ class Dataloader_isaver(
             result_cache.append(result_dict)
             if countra.check(i_batch):
                 flush_purge()
-                log.debug(snippets._tqdm_str(pbar))
+                log.debug(snippets.tqdm_str(pbar))
                 countra.tic(i_batch)
         flush_purge()
         return self.result
