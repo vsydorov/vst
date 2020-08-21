@@ -1265,6 +1265,52 @@ class Isaver_train_epoch(snippets.isaver.Isaver_base):
                 log.debug(snippets.tqdm_str(pbar))
                 countra.tic(i_batch)
 
+
+def _debug_krgb_vis():
+    rgbs_, bboxes_t_, labels_, keyframes_ = data_input
+    iii = 3
+    for iii in range(len(labels_)):
+        img = inputs[0].cpu()[iii][:, 0]
+        boxes = bboxes_t_[[iii]]
+        labels = labels_[[iii]]
+        data_std = cn.DATA.STD
+        data_mean = cn.DATA.MEAN
+
+        actnames = dataset.action_names + ['background']
+        Y = img.numpy().transpose([1, 2, 0])*data_std+data_mean
+        Y = (Y*255).clip(0, 255).astype(np.uint8)[..., ::-1]
+        Y = np.ascontiguousarray(Y)
+        for i, box_ltrd in enumerate(boxes):
+            label = actnames[labels[i]]
+            snippets.misc.cv_put_box_with_text(
+                    Y, box_ltrd, text=label)
+        cv2.imshow("test", Y)
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
+
+
+def _debug_finetune_vis():
+    iii = 3
+    for iii in range(len(metas)):
+        img = frame_list[0][iii][:, 0]
+        boxes = metas[iii]['bboxes']
+        labels = metas[iii]['labels']
+        data_std = cn.DATA.STD
+        data_mean = cn.DATA.MEAN
+
+        actnames = dataset.action_names + ['background']
+        Y = img.numpy().transpose([1, 2, 0])*data_std+data_mean
+        Y = (Y*255).clip(0, 255).astype(np.uint8)[..., ::-1]
+        Y = np.ascontiguousarray(Y)
+        for i, box_ltrd in enumerate(boxes):
+            label = actnames[labels[i]]
+            snippets.misc.cv_put_box_with_text(
+                    Y, box_ltrd, text=label)
+        cv2.imshow("test", Y)
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
+
+
 # EXPERIMENTS
 
 def finetune_preextracted_krgb(workfolder, cfg_dict, add_args):
@@ -1284,6 +1330,7 @@ def finetune_preextracted_krgb(workfolder, cfg_dict, add_args):
         i_batch:
             loss_log: '0::10'
             eval_krgb: '::95'
+    n_outputs: !def [10, [10, 11]]
     """, allow_overwrite=True)
     cf = cfg.parse()
     cn = _config_preparations(cfg.without_prefix('CN.'))
@@ -1312,7 +1359,8 @@ def finetune_preextracted_krgb(workfolder, cfg_dict, add_args):
     vids_eval = vgroup[sset_eval]
 
     # Model
-    model_wf = Model_w_freezer(cf, cn, 10)
+    model_wf = Model_w_freezer(cf, cn, cf['n_outputs'])
+    CUT_OFF_BG = cf['n_outputs'] == 11
     optimizer = tsf_optim.construct_optimizer(model_wf.model, cn)
     loss_fn = torch.nn.CrossEntropyLoss(reduction='mean')
     model_wf.model.init_weights(0.01)
@@ -1386,7 +1434,7 @@ def finetune_preextracted_krgb(workfolder, cfg_dict, add_args):
                 model_wf.set_eval()
                 _evaluate_krgb_perf(model_wf, eval_krgb_loader,
                     eval_krgb_keyframes, tubes_dwein_eval, tubes_dgt_eval,
-                    dataset, man_lkrgb.preprocess_data, cut_off_bg=False)
+                    dataset, man_lkrgb.preprocess_data, cut_off_bg=CUT_OFF_BG)
                 model_wf.set_train()
 
         # Save part
@@ -1396,7 +1444,7 @@ def finetune_preextracted_krgb(workfolder, cfg_dict, add_args):
         log.info(f'Perf at [{i_epoch}]')
         _evaluate_krgb_perf(model_wf, eval_krgb_loader,
             eval_krgb_keyframes, tubes_dwein_eval, tubes_dgt_eval,
-            dataset, man_lkrgb.preprocess_data, cut_off_bg=False)
+            dataset, man_lkrgb.preprocess_data, cut_off_bg=CUT_OFF_BG)
 
 
 def finetune_on_tubefeats(workfolder, cfg_dict, add_args):
