@@ -1,4 +1,5 @@
 from tqdm import tqdm
+import shutil
 import cv2
 import copy
 import string
@@ -221,7 +222,7 @@ class TDataset_over_box_connections_w_labels(torch.utils.data.Dataset):
             'labels': labels,
             'index': index,
             'ckey': key_vf,
-            'bboxes_tldr': np.stack(prepared_bboxes, axis=0),
+            'bboxes': np.stack(prepared_bboxes, axis=0),
             'do_not_collate': True}
         return (frame_list, meta)
 
@@ -847,14 +848,11 @@ class TDataset_over_fgroups(torch.utils.data.Dataset):
         packed_imgs = pack_pathway_output(imgs,
                 self._is_slowfast, self._slowfast_alpha)
 
-        # Convert boxes to TLRD
-        bboxes_tlrd = boxes[:, [1, 0, 3, 2]]
-
         meta = {
             'labels': labels,
             'index': index,
             'ckey': key_vf,
-            'bboxes_tldr': bboxes_tlrd,
+            'bboxes': boxes,  # LTRD format
             'orig_boxes_ltrd': orig_boxes_ltrd,
             'do_not_collate': True}
         return (packed_imgs, meta)
@@ -936,7 +934,7 @@ class Manager_loader_boxcons_improved(object):
                 self.norm_std_cu) for x in frame_list]
 
         # bbox transformations
-        bboxes_np = [m['bboxes_tldr'] for m in metas]
+        bboxes_np = [m['bboxes'] for m in metas]
         counts = np.array([len(x) for x in bboxes_np])
         batch_indices = np.repeat(np.arange(len(counts)), counts)
         bboxes0 = np.c_[batch_indices, np.vstack(bboxes_np)]
@@ -1030,7 +1028,7 @@ class Manager_loader_boxcons(object):
                 self.norm_std_cu) for x in frame_list]
 
         # bbox transformations
-        bboxes_np = [m['bboxes_tldr'] for m in metas]
+        bboxes_np = [m['bboxes'] for m in metas]
         counts = np.array([len(x) for x in bboxes_np])
         batch_indices = np.repeat(np.arange(len(counts)), counts)
         bboxes0 = np.c_[batch_indices, np.vstack(bboxes_np)]
@@ -1169,7 +1167,7 @@ def _preset_defaults(cfg):
     period:
         i_batch:
             loss_log: '0::10'
-            eval_krgb: '0,50::50'
+            eval_krgb: '::'
         i_epoch:
             log: '::1'
     CN:
@@ -1203,6 +1201,7 @@ class Isaver_train_epoch(snippets.isaver.Isaver_base):
         self.optimizer = optimizer
         self._interval_iters = interval_iters
         self._interval_seconds = interval_seconds
+        self._history_size = 2
 
     def _get_filenames(self, i_batch) -> Dict[str, Path]:
         base_filenames = {
@@ -1519,7 +1518,7 @@ def finetune_on_tubefeats(workfolder, cfg_dict, add_args):
             frame_list, metas, = data_input
 
             # bbox transformations
-            bboxes_np = [m['bboxes_tldr'] for m in metas]
+            bboxes_np = [m['bboxes'] for m in metas]
             counts = np.array([len(x) for x in bboxes_np])
             batch_indices = np.repeat(np.arange(len(counts)), counts)
             bboxes0 = np.c_[batch_indices, np.vstack(bboxes_np)]
@@ -1577,6 +1576,10 @@ def finetune_on_tubefeats(workfolder, cfg_dict, add_args):
 
         # Save part
         man_ckpt.save_epoch(rundir, i_epoch)
+
+        # Remove temporary helpers
+        shutil.rmtree(folder_epoch)
+
         # Eval aprt
         log.info(f'Perf at [{i_epoch}]')
         model_wf.set_eval()
