@@ -130,6 +130,19 @@ class WindowAverager(Averager):
                 self.windowsize, self.avg, self.wavg, self.last)
 
 
+class FQTimer(object):
+    """flat QTimer"""
+    def __init__(self):
+        self.start = time.perf_counter()
+
+    @property
+    def elapsed(self):
+        return time.perf_counter() - self.start
+
+    def release(self, msg):
+        log.info(f'{msg} took {self.elapsed:.2f} sec')
+
+
 class TicToc(object):
     def __init__(self, names):
         self.names = names

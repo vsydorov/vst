@@ -1169,7 +1169,7 @@ def _preset_defaults(cfg):
             loss_log: '0::10'
             eval_krgb: '::'
         i_epoch:
-            log: '::1'
+            eval_krgb: '0::1'
     CN:
         SOLVER:
           BASE_LR: 0.0375
@@ -1530,6 +1530,7 @@ def finetune_on_tubefeats(workfolder, cfg_dict, add_args):
     # Training
     for i_epoch in range(start_epoch, max_epoch):
         log.info(f'New epoch {i_epoch}')
+        fqtimer = snippets.misc.FQTimer()
 
         folder_epoch = small.mkdir(rundir/f'TRAIN/{i_epoch:03d}')
 
@@ -1627,10 +1628,14 @@ def finetune_on_tubefeats(workfolder, cfg_dict, add_args):
 
         # Remove temporary helpers
         shutil.rmtree(folder_epoch)
+        fqtimer.release(f'Epoch {i_epoch} computations')
 
-        # Eval aprt
-        log.info(f'Perf at [{i_epoch}]')
-        model_wf.set_eval()
-        _evaluate_krgb_perf(model_wf, eval_krgb_loader,
-            eval_krgb_keyframes, tubes_dwein_eval, tubes_dgt_eval,
-            dataset, man_lkrgb.preprocess_data, cut_off_bg=True)
+        # Eval part
+        if check_step(i_epoch, cf['period.i_epoch.eval_krgb']):
+            fqtimer = snippets.misc.FQTimer()
+            log.info(f'Perf at [{i_epoch}]')
+            model_wf.set_eval()
+            _evaluate_krgb_perf(model_wf, eval_krgb_loader,
+                eval_krgb_keyframes, tubes_dwein_eval, tubes_dgt_eval,
+                dataset, man_lkrgb.preprocess_data, cut_off_bg=True)
+            fqtimer.release(f'KRGB Evaluation at epoch {i_epoch}')
