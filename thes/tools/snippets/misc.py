@@ -196,9 +196,20 @@ def get_experiment_id_string():
     return f'{str_time}_{str_rnd}_{str_node}'
 
 
-def leqn_split(arr, N):
-    """Divide 1d np array into batches of len <= N"""
-    return np.array_split(arr, (len(arr)-1)//N + 1)
+def leqn_split(arr, N, kind='nice'):
+    """Divide 1d np array into batches of len <= N
+    kind:
+        nice: divide like numpy does
+        sharp: divide sharply
+    """
+    if kind == 'nice':
+        r = np.array_split(arr, (len(arr)-1)//N + 1)
+    elif kind == 'sharp':
+        ii = np.arange(N, len(arr), N)
+        r = np.array_split(arr, ii)
+    else:
+        raise RuntimeError()
+    return r
 
 
 def weighted_array_split(X, weights, N):

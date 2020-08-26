@@ -38,15 +38,20 @@ def df_to_table_v1(df, pad=0):
             ['', ]+df.columns.tolist(), pad=pad)
 
 
-def df_to_table_v2(df: pd.DataFrame, indexname=None) -> str:
+def df_to_table_v2(df: pd.DataFrame, indexcols=None) -> str:
     # Header
-    if indexname is None:
-        indexname = df.index.name
-    if indexname is None:
-        indexname = 'index'
-    header = [indexname, ] + [str(x) for x in df.columns]
+    if indexcols is None:
+        if isinstance(df.index, pd.MultiIndex):
+            indexnames = df.index.names
+        else:
+            indexnames = [df.index.name, ]
+        indexcols = []
+        for i, n in enumerate(indexnames):
+            iname = n if n else f'ix{i}'
+            indexcols.append(iname)
+    header = indexcols + [str(x) for x in df.columns]
     # Col formats
-    col_formats = ['{}']
+    col_formats = ['{}']*len(indexcols)
     for dt in df.dtypes:
         form = '{}'
         if dt in ['float32', 'float64']:
@@ -54,8 +59,8 @@ def df_to_table_v2(df: pd.DataFrame, indexname=None) -> str:
         col_formats.append(form)
 
     table = string_table(
-            np.array(df.reset_index()),
-            header=header,
-            col_formats=col_formats,
-            pad=2)
+                    np.array(df.reset_index()),
+                    header=header,
+                    col_formats=col_formats,
+                    pad=2)
     return table

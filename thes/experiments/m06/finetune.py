@@ -1224,11 +1224,10 @@ class Isaver_train_epoch(snippets.isaver.Isaver_base):
             states = torch.load(ckpt_path)
             self.model.load_state_dict(states['model_sdict'])
             self.optimizer.load_state_dict(states['optimizer_sdict'])
-            start_i = states['i_batch']
-            i_epoch = states['i_epoch']
-            assert i_epoch == self.i_epoch
+            assert start_i == states['i_batch']
+            assert self.i_epoch == states['i_epoch']
             log.info('Restore model at [{}, {}] from {}'.format(
-                i_epoch, start_i, ckpt_path))
+                self.i_epoch, start_i, ckpt_path))
         return start_i
 
     def _save(self, i_batch):
@@ -1310,6 +1309,16 @@ def _debug_finetune_vis():
         cv2.waitKey(0)
         cv2.destroyAllWindows()
 
+class BSampler_prepared(torch.utils.data.Sampler):
+    def __init__(self, samples):
+        self.samples = samples
+
+    def __iter__(self):
+        for sample in self.samples:
+            yield sample
+
+    def __len__(self):
+        return len(self.samples)
 
 # EXPERIMENTS
 
@@ -1548,15 +1557,20 @@ def finetune_on_tubefeats(workfolder, cfg_dict, add_args):
         fg_order = ts_rgen.permutation(len(fg_list))
         fg_list = [fg_list[i] for i in fg_order]
         frame_groups_permuted = dict(fg_list)
+        # Dataset over permuted frame groups
+        td = TDataset_over_fgroups(cf, cn, frame_groups_permuted, manli.dataset)
+        # Perform batching ourselves
+        idx_batches = snippets.misc.leqn_split(np.arange(
+            len(frame_groups_permuted)), batch_size_train, 'sharp')
 
         wavg_loss = snippets.misc.WindowAverager(10)
 
         # Loader
         def init_dataloader(i_start):
-            remaining = dict(list(frame_groups_permuted.items())[i_start:])
-            td = TDataset_over_fgroups(cf, cn, remaining, manli.dataset)
+            remaining_idx_batches = idx_batches[i_start:]
+            bsampler = BSampler_prepared(remaining_idx_batches)
             train_loader = torch.utils.data.DataLoader(td,
-                batch_size=batch_size_train,
+                batch_sampler=bsampler,
                 num_workers=NUM_WORKERS,
                 collate_fn=sequence_batch_collate_v2)
             return train_loader
@@ -1617,7 +1631,7 @@ def finetune_on_tubefeats(workfolder, cfg_dict, add_args):
                 model_wf.set_train()
 
         isaver = Isaver_train_epoch(
-                folder_epoch, len(frame_groups_permuted)//batch_size_train,
+                folder_epoch, len(idx_batches),
                 init_dataloader, batch_forward,
                 i_epoch, model_wf.model, optimizer,
                 interval_seconds=cf['train.batch_save_interval_seconds'])
