@@ -161,7 +161,9 @@ def to_keyframedict(keyframes):
 
 
 def group_dwein_frames_wrt_kf_distance(
-        dataset, stride, tubes_dwein, tube_metas: Dict[I_dwein, Dict]):
+        dataset, stride, tubes_dwein,
+        tube_metas: Dict[I_dwein, Dict]
+        ) -> Dict[int, List[Dict]]:
     """
     Will only work with tubes in tube_metas
     """
@@ -191,7 +193,7 @@ def group_dwein_frames_wrt_kf_distance(
         dwtis_good_nums[dwt_index] = vid_good_nums
 
     # Compute distance, disperse
-    dist_boxes: Dict[I_dwein, List[Dict]] = {}
+    dist_boxes: Dict[int, List[Dict]] = {}
     for dwti, dwt in tubes_dwein_proper.items():
         kf_nums = dwtis_kf_nums[dwti]
         good_nums = dwtis_good_nums[dwti]

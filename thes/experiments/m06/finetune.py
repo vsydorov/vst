@@ -1739,7 +1739,7 @@ def full_tube_eval(workfolder, cfg_dict, add_args):
     # Here we'll run our connection split
     if cf['compute_split.enabled']:
         cc, ct = (cf['compute_split.chunk'], cf['compute_split.total'])
-        connections_f = perform_connections_split(connections_f, cc, ct)
+        connections_f = perform_connections_split(connections_f, cc, ct, False)
 
     BATCH_SIZE = 32
     NUM_WORKERS = 4
@@ -1804,3 +1804,121 @@ def full_tube_eval(workfolder, cfg_dict, add_args):
 
     small.save_pkl(out/'dict_outputs.pkl', dict_outputs)
     small.save_pkl(out/'connections_f.pkl', connections_f)
+
+
+def combine_split_full_tube_eval(workfolder, cfg_dict, add_args):
+    out, = snippets.get_subfolders(workfolder, ['out'])
+    cfg = snippets.YConfig_v2(cfg_dict,
+            allowed_wo_defaults=[''])
+    Ncfg_daly.set_defcfg_v2(cfg)
+    cfg.set_defaults_yaml("""
+    seed: 42
+    inputs:
+        tubes_dwein: ~
+        rpath_splits: ~
+    split_assignment: !def ['train/val',
+        ['train/val', 'trainval/test']]
+    tubes:
+        stride: 4
+    """)
+    cf = cfg.parse()
+
+    # Seeds
+    initial_seed = cf['seed']
+
+    # Data
+    # General DALY level preparation
+    dataset: Dataset_daly_ocv = Ncfg_daly.get_dataset(cf)
+    vgroup: Dict[str, List[Vid_daly]] = \
+            Ncfg_daly.get_vids(cf, dataset)
+    sset_train, sset_eval = cf['split_assignment'].split('/')
+    # wein tubes
+    tubes_dwein_d, tubes_dgt_d = load_gt_and_wein_tubes(
+            cf['inputs.tubes_dwein'], dataset, vgroup)
+
+    # Sset
+    tubes_dwein_eval = tubes_dwein_d[sset_eval]
+    tubes_dgt_eval = tubes_dgt_d[sset_eval]
+
+    # Prepare
+    frames_to_cover: Dict[Vid_daly, np.ndarray] = \
+        sample_daly_frames_from_instances(dataset, cf['tubes.stride'])
+    connections_f: Dict[Tuple[Vid_daly, int], Box_connections_dwti]
+    connections_f = group_tubes_on_frame_level(
+            tubes_dwein_eval, frames_to_cover)
+
+    _, dwti_to_label_eval = qload_synthetic_tube_labels(
+        tubes_dgt_eval, tubes_dwein_eval, dataset)
+
+    # search relativefolder
+    import dervo.experiment
+    from glob import glob
+    import os.path
+    fold_rpath = cf['inputs.rpath_splits']
+    fold = (dervo.experiment.EXPERIMENT_PATH/fold_rpath).resolve()
+    runs = list(glob(f'{fold}/**/dict_outputs.pkl', recursive=True))
+    level = 1
+    dfdict = {}
+    for f in runs:
+        rpath = os.path.relpath(f, fold)
+        name = '.'.join(rpath.split('/')[:level])
+        dfdict[name] = Path(f).parent
+    log.info('{} chunks found:\n{}'.format(
+        len(dfdict), pprint.pformat(list(dfdict.keys()))))
+
+    # Loading all piecemeal connections
+    i_cons = {}
+    for name, path in dfdict.items():
+        path = Path(path)
+        local_connections_f = small.load_pkl(path/'connections_f.pkl')
+        i_cons[name] = local_connections_f
+    # Check consistency
+    grouped_cons = {}
+    for c in i_cons.values():
+        grouped_cons.update(c)
+    if grouped_cons.keys() != connections_f.keys():
+        log.error('Loaded connections inconsistent with expected ones')
+
+    # Aggregation of per-frame scores
+    dwti_preds: Dict[I_dwein, Dict[int, Dict]] = {}
+    for name, path in dfdict.items():
+        local_outputs = small.load_pkl(path/'dict_outputs.pkl')['x_final']
+        local_connections_f = i_cons[name]
+        assert len(local_outputs) == len(local_connections_f)
+        for cons, outputs in zip(local_connections_f.values(), local_outputs):
+            frame_ind = cons['frame_ind']
+            for (box, source, output) in zip(
+                    cons['boxes'], cons['dwti_sources'], outputs):
+                pred = {
+                    'box': box,
+                    'output': output}
+                dwti_preds.setdefault(source, {})[frame_ind] = pred
+
+    # Assignment of final score to each DWTI
+    tube_softmaxes_eval: Dict[I_dwein, np.ndarray] = {}
+    for dwti, preds in dwti_preds.items():
+        preds_agg_ = []
+        for frame_ind, pred in preds.items():
+            preds_agg_.append(pred['output'])
+        pred_agg = np.vstack(preds_agg_)
+        tube_softmaxes_eval[dwti] = pred_agg
+    from thes.experiments.m06.mlp import (
+        _compute_flattube_syntlabel_acc, _quick_assign_scores_to_dwein_tubes)
+
+    # We assume input_dims == 11
+    tube_softmaxes_eval_bg = tube_softmaxes_eval
+    tube_softmaxes_eval_nobg = {k: v[:, :-1]
+            for k, v in tube_softmaxes_eval.items()}
+
+    acc_flattube_synt = _compute_flattube_syntlabel_acc(
+            tube_softmaxes_eval_bg, dwti_to_label_eval)
+    av_stubes_eval: AV_dict[T_dwein_scored] = \
+        _quick_assign_scores_to_dwein_tubes(
+            tubes_dwein_eval, tube_softmaxes_eval_nobg, dataset)
+    df_ap_full, df_recall_full = quick_tube_eval(av_stubes_eval, tubes_dgt_eval)
+
+    _df_ap_full = (df_ap_full*100).round(2)
+    _apline = '/'.join(_df_ap_full.loc['all'].values.astype(str))
+    log.info('AP (full tubes):\n{}'.format(_df_ap_full))
+    log.info('Flattube synthetic acc: {:.2f}'.format(acc_flattube_synt*100))
+    log.info('Full tube AP357: {}'.format(_apline))

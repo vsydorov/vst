@@ -346,11 +346,14 @@ def group_tubes_on_frame_level(
     return connections
 
 
-def perform_connections_split(connections_f, cc, ct):
+def perform_connections_split(connections_f, cc, ct, fancy=True):
     ckeys = list(connections_f.keys())
-    weights_dict = {k: len(v['boxes'])
-            for k, v in connections_f.items()}
-    weights = np.array(list(weights_dict.values()))
+    if fancy:
+        weights_dict = {k: len(v['boxes'])
+                for k, v in connections_f.items()}
+        weights = np.array(list(weights_dict.values()))
+    else:
+        weights = np.ones(len(connections_f))
     ii_ckeys_split = snippets.weighted_array_split(
             np.arange(len(ckeys)), weights, ct)
     ckeys_split = [[ckeys[i] for i in ii] for ii in ii_ckeys_split]
