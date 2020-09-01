@@ -54,6 +54,7 @@ from thes.data.tubes.routines import (
     spatial_tube_iou_v3,
     get_dwein_overlaps_per_dgt,
     select_fg_bg_tubes,
+    perform_connections_split
     )
 
 from thes.data.dataset.daly import (
@@ -79,7 +80,9 @@ from thes.pytorch import (
     sequence_batch_collate_v2, np_to_gpu,
     to_gpu_normalize_permute, Sampler_grid,
     Frameloader_video_slowfast, NumpyRandomSampler,
-    merge_cf_into_cfgnode, pack_pathway_output)
+    merge_cf_into_cfgnode, pack_pathway_output,
+    Dataloader_isaver,
+    TDataset_over_connections)
 from thes.training import (
     Manager_checkpoint_name)
 
@@ -1309,6 +1312,21 @@ def _debug_finetune_vis():
         cv2.waitKey(0)
         cv2.destroyAllWindows()
 
+
+def _debug_full_tube_eval_vis():
+    for iii in range(10):
+        Y = Xts[0][iii, 0].numpy()[..., ::-1]
+        Y = np.ascontiguousarray(Y)
+        boxes = metas[iii]['bboxes_tldr']
+        for i, box_ltrd in enumerate(boxes):
+            snippets.misc.cv_put_box_with_text(
+                    Y, box_ltrd, text=f'{i}',
+                    rec_thickness=1,
+                    text_position='right_up')
+        cv2.imshow("test", Y)
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
+
 class BSampler_prepared(torch.utils.data.Sampler):
     def __init__(self, samples):
         self.samples = samples
@@ -1653,3 +1671,136 @@ def finetune_on_tubefeats(workfolder, cfg_dict, add_args):
                 eval_krgb_keyframes, tubes_dwein_eval, tubes_dgt_eval,
                 dataset, man_lkrgb.preprocess_data, cut_off_bg=True)
             fqtimer.release(f'KRGB Evaluation at epoch {i_epoch}')
+
+
+def full_tube_eval(workfolder, cfg_dict, add_args):
+    out, = snippets.get_subfolders(workfolder, ['out'])
+    cfg = snippets.YConfig_v2(cfg_dict,
+            allowed_wo_defaults=['CN.'])
+    Ncfg_daly.set_defcfg_v2(cfg)
+    cfg.set_defaults_yaml("""
+    seed: 42
+    inputs:
+        tubes_dwein: ~
+        keyframes_rgb: ~
+        ckpt: ~
+    split_assignment: !def ['train/val',
+        ['train/val', 'trainval/test']]
+    freeze:
+        level: -1
+        freeze_bn: False
+    debug_outputs: False
+    ll_dropout: 0.5
+    tubes:
+        stride: 4
+    batch_save_interval_seconds: 120
+    compute_split:
+        enabled: [False, bool]
+        chunk: [0, "VALUE >= 0"]
+        total: [1, int]
+    """)
+    cf = cfg.parse()
+    cn = _config_preparations(cfg.without_prefix('CN.'))
+
+    # Seeds
+    initial_seed = cf['seed']
+    torch.manual_seed(initial_seed)
+    torch.cuda.manual_seed(initial_seed)
+
+    # Data
+    # General DALY level preparation
+    dataset: Dataset_daly_ocv = Ncfg_daly.get_dataset(cf)
+    vgroup: Dict[str, List[Vid_daly]] = \
+            Ncfg_daly.get_vids(cf, dataset)
+    sset_train, sset_eval = cf['split_assignment'].split('/')
+    # wein tubes
+    tubes_dwein_d, tubes_dgt_d = load_gt_and_wein_tubes(
+            cf['inputs.tubes_dwein'], dataset, vgroup)
+    # Means
+    norm_mean_cu = np_to_gpu(cn.DATA.MEAN)
+    norm_std_cu = np_to_gpu(cn.DATA.STD)
+    # Sset
+    tubes_dwein_eval = tubes_dwein_d[sset_eval]
+    # tubes_dgt_eval = tubes_dgt_d[sset_eval]
+
+    # Model
+    model_wf = Model_w_freezer(cf, cn, 11)
+    model_wf.model_to_gpu()
+    # Restore checkpoint
+    states = torch.load(cf['inputs.ckpt'])
+    model_wf.model.load_state_dict(states['model_sdict'])
+
+    # Prepare
+    frames_to_cover: Dict[Vid_daly, np.ndarray] = \
+        sample_daly_frames_from_instances(dataset, cf['tubes.stride'])
+    connections_f: Dict[Tuple[Vid_daly, int], Box_connections_dwti]
+    connections_f = group_tubes_on_frame_level(
+            tubes_dwein_eval, frames_to_cover)
+    # Here we'll run our connection split
+    if cf['compute_split.enabled']:
+        cc, ct = (cf['compute_split.chunk'], cf['compute_split.total'])
+        connections_f = perform_connections_split(connections_f, cc, ct)
+
+    BATCH_SIZE = 32
+    NUM_WORKERS = 4
+    sampler_grid = Sampler_grid(cn.DATA.NUM_FRAMES, cn.DATA.SAMPLING_RATE)
+    frameloader_vsf = Frameloader_video_slowfast(
+            False, cn.SLOWFAST.ALPHA, 256, 'ltrd')
+
+    def prepare_func(start_i):
+        # start_i defined wrt keys in connections_f
+        remaining_dict = dict(list(
+            connections_f.items())[start_i+1:])
+        tdataset_kf = TDataset_over_connections(
+            remaining_dict, dataset, sampler_grid, frameloader_vsf)
+        loader = torch.utils.data.DataLoader(tdataset_kf,
+            batch_size=BATCH_SIZE, shuffle=False,
+            num_workers=NUM_WORKERS, pin_memory=True,
+            collate_fn=sequence_batch_collate_v2)
+        return loader
+
+    def func(data_input):
+        Xts, metas = data_input
+        Xts_f32c = [to_gpu_normalize_permute(
+            x, norm_mean_cu, norm_std_cu) for x in Xts]
+        # bbox transformations
+        bboxes_np = [m['bboxes_tldr'] for m in metas]
+        counts = np.array([len(x) for x in bboxes_np])
+        batch_indices = np.repeat(np.arange(len(counts)), counts)
+        bboxes0 = np.c_[batch_indices, np.vstack(bboxes_np)]
+        bboxes0 = torch.from_numpy(bboxes0)
+        bboxes0_c = bboxes0.type(torch.cuda.FloatTensor)
+
+        with torch.no_grad():
+            result = model_wf.model.forward(Xts_f32c, bboxes0_c)
+        result_dict = {}
+        for k, v in result.items():
+            out_np = v.cpu().numpy()
+            out_split = np.split(out_np,
+                np.cumsum(counts), axis=0)[:-1]
+            result_dict[k] = out_split
+
+        # Find last index over global structure
+        # back to tuple, since dataloader casts to list
+        ckey = tuple(metas[-1]['ckey'])
+        ckeys = list(connections_f.keys())
+        last_i = ckeys.index(ckey)
+        return result_dict, last_i
+
+    disaver_fold = small.mkdir(out/'disaver')
+    total = len(connections_f)
+    disaver = Dataloader_isaver(disaver_fold, total, func, prepare_func,
+        save_interval_seconds=cf['batch_save_interval_seconds'],
+        log_interval=30)
+
+    model_wf.set_eval()
+    outputs = disaver.run()
+
+    keys = next(iter(outputs)).keys()
+    dict_outputs = {}
+    for k in keys:
+        key_outputs = [oo for o in outputs for oo in o[k]]
+        dict_outputs[k] = key_outputs
+
+    small.save_pkl(out/'dict_outputs.pkl', dict_outputs)
+    small.save_pkl(out/'connections_f.pkl', connections_f)
