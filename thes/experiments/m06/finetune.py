@@ -1,37 +1,30 @@
 from tqdm import tqdm
 import shutil
 import cv2
-import copy
-import string
-import random
-import shutil
+from glob import glob
+import os.path
 import pprint
-import yacs
-import re
 import numpy as np
 import logging
 from pathlib import Path
-from datetime import datetime
-from types import MethodType
 from typing import (  # NOQA
     Dict, Any, List, Optional, Tuple, TypedDict, Set)
 from sklearn.metrics import (
-    accuracy_score, roc_auc_score)
+    accuracy_score)
 
 import torch
 import torch.nn as nn
 import torch.utils.data
-from detectron2.layers import ROIAlign
-import slowfast.models
-import slowfast.utils.checkpoint as sf_cu
-from slowfast.datasets import cv2_transform as sf_cv2_transform
 
+from detectron2.layers import ROIAlign
+
+import slowfast.utils.checkpoint as sf_cu
+import slowfast.utils.weight_init_helper as init_helper
+import slowfast.utils.misc as sf_misc
+from slowfast.datasets import cv2_transform as sf_cv2_transform
 from slowfast.models.video_model_builder import SlowFast as M_slowfast
 from slowfast.models.video_model_builder import ResNet as M_resnet
 from slowfast.models.batchnorm_helper import get_norm
-import slowfast.utils.weight_init_helper as init_helper
-from slowfast.models.video_model_builder import _POOL1 as SF_POOL1
-import slowfast.utils.misc as sf_misc
 
 from vsydorov_tools import small
 from vsydorov_tools import cv as vt_cv
@@ -39,38 +32,27 @@ from vsydorov_tools import log as vt_log
 
 from thes.data.dataset.external import (
     Dataset_daly_ocv, Vid_daly)
-from thes.data.tubes.types import (
-    Box_connections_dwti,
-    I_dwein, T_dwein, T_dwein_scored, I_dgt, T_dgt,
-    get_daly_gt_tubes, push_into_avdict,
-    AV_dict, loadconvert_tubes_dwein,
-    av_stubes_above_score)
-from thes.data.tubes.routines import (
-    group_tubes_on_frame_level,
-    score_ftubes_via_objaction_overlap_aggregation,
-    create_kinda_objaction_struct,
-    qload_synthetic_tube_labels,
-    temporal_ious_where_positive,
-    spatial_tube_iou_v3,
-    get_dwein_overlaps_per_dgt,
-    select_fg_bg_tubes,
-    perform_connections_split
-    )
-
 from thes.data.dataset.daly import (
     Ncfg_daly, sample_daly_frames_from_instances,
     load_gt_and_wein_tubes, create_keyframelist,
     to_keyframedict, group_dwein_frames_wrt_kf_distance)
 
-from thes.evaluation.recall import (
-    compute_recall_for_avtubes_as_dfs,)
-from thes.evaluation.ap.convert import (
-    compute_ap_for_avtubes_as_df)
+from thes.data.tubes.types import (  # NOQA
+    Box_connections_dwti, I_dwein, T_dwein,
+    T_dwein_scored, I_dgt, T_dgt, AV_dict,
+)
+from thes.data.tubes.routines import (
+    group_tubes_on_frame_level,
+    qload_synthetic_tube_labels,
+    get_dwein_overlaps_per_dgt,
+    select_fg_bg_tubes,
+    perform_connections_split,
+    compute_flattube_syntlabel_acc,
+    quick_assign_scores_to_dwein_tubes
+    )
 from thes.evaluation.meta import (
-    keyframe_cls_scores, cheating_tube_scoring, quick_tube_eval)
+    cheating_tube_scoring, quick_tube_eval)
 
-from thes.data.tubes.nms import (
-    compute_nms_for_av_stubes,)
 from thes.slowfast.cfg import (basic_sf_cfg)
 from thes.tools import snippets
 from thes.tools.snippets import check_step_sslice as check_step
@@ -1338,6 +1320,49 @@ class BSampler_prepared(torch.utils.data.Sampler):
     def __len__(self):
         return len(self.samples)
 
+
+def full_tube_perf_eval(outputs, connections_f,
+        dataset, dwti_to_label_eval,
+        tubes_dgt_eval, tubes_dwein_eval):
+    assert len(outputs) == len(connections_f)
+    # Aggregation of per-frame scores
+    dwti_preds: Dict[I_dwein, Dict[int, Dict]] = {}
+    for cons, outputs_ in zip(connections_f.values(), outputs):
+        frame_ind = cons['frame_ind']
+        for (box, source, output) in zip(
+                cons['boxes'], cons['dwti_sources'], outputs_):
+            pred = {
+                'box': box,
+                'output': output}
+            dwti_preds.setdefault(source, {})[frame_ind] = pred
+
+    # Assignment of final score to each DWTI
+    tube_softmaxes_eval: Dict[I_dwein, np.ndarray] = {}
+    for dwti, preds in dwti_preds.items():
+        preds_agg_ = []
+        for frame_ind, pred in preds.items():
+            preds_agg_.append(pred['output'])
+        pred_agg = np.vstack(preds_agg_)
+        tube_softmaxes_eval[dwti] = pred_agg
+
+    # We assume input_dims == 11
+    tube_softmaxes_eval_bg = tube_softmaxes_eval
+    tube_softmaxes_eval_nobg = {k: v[:, :-1]
+            for k, v in tube_softmaxes_eval.items()}
+
+    acc_flattube_synt = compute_flattube_syntlabel_acc(
+            tube_softmaxes_eval_bg, dwti_to_label_eval)
+    av_stubes_eval: AV_dict[T_dwein_scored] = \
+        quick_assign_scores_to_dwein_tubes(
+            tubes_dwein_eval, tube_softmaxes_eval_nobg, dataset)
+    df_ap_full, df_recall_full = quick_tube_eval(av_stubes_eval, tubes_dgt_eval)
+
+    _df_ap_full = (df_ap_full*100).round(2)
+    _apline = '/'.join(_df_ap_full.loc['all'].values.astype(str))
+    log.info('AP (full tubes):\n{}'.format(_df_ap_full))
+    log.info('Flattube synthetic acc: {:.2f}'.format(acc_flattube_synt*100))
+    log.info('Full tube AP357: {}'.format(_apline))
+
 # EXPERIMENTS
 
 def finetune_preextracted_krgb(workfolder, cfg_dict, add_args):
@@ -1676,7 +1701,7 @@ def finetune_on_tubefeats(workfolder, cfg_dict, add_args):
 def full_tube_eval(workfolder, cfg_dict, add_args):
     out, = snippets.get_subfolders(workfolder, ['out'])
     cfg = snippets.YConfig_v2(cfg_dict,
-            allowed_wo_defaults=['CN.'])
+            allowed_wo_defaults=['CN.', 'train.', 'period.'])
     Ncfg_daly.set_defcfg_v2(cfg)
     cfg.set_defaults_yaml("""
     seed: 42
@@ -1721,7 +1746,7 @@ def full_tube_eval(workfolder, cfg_dict, add_args):
     norm_std_cu = np_to_gpu(cn.DATA.STD)
     # Sset
     tubes_dwein_eval = tubes_dwein_d[sset_eval]
-    # tubes_dgt_eval = tubes_dgt_d[sset_eval]
+    tubes_dgt_eval = tubes_dgt_d[sset_eval]
 
     # Model
     model_wf = Model_w_freezer(cf, cn, 11)
@@ -1805,6 +1830,14 @@ def full_tube_eval(workfolder, cfg_dict, add_args):
     small.save_pkl(out/'dict_outputs.pkl', dict_outputs)
     small.save_pkl(out/'connections_f.pkl', connections_f)
 
+    if not cf['compute_split.enabled']:
+        log.info('We can eval right away')
+        _, dwti_to_label_eval = qload_synthetic_tube_labels(
+            tubes_dgt_eval, tubes_dwein_eval, dataset)
+        full_tube_perf_eval(dict_outputs['x_final'], connections_f,
+                dataset, dwti_to_label_eval,
+                tubes_dgt_eval, tubes_dwein_eval)
+
 
 def combine_split_full_tube_eval(workfolder, cfg_dict, add_args):
     out, = snippets.get_subfolders(workfolder, ['out'])
@@ -1823,9 +1856,6 @@ def combine_split_full_tube_eval(workfolder, cfg_dict, add_args):
     """)
     cf = cfg.parse()
 
-    # Seeds
-    initial_seed = cf['seed']
-
     # Data
     # General DALY level preparation
     dataset: Dataset_daly_ocv = Ncfg_daly.get_dataset(cf)
@@ -1843,8 +1873,8 @@ def combine_split_full_tube_eval(workfolder, cfg_dict, add_args):
     # Prepare
     frames_to_cover: Dict[Vid_daly, np.ndarray] = \
         sample_daly_frames_from_instances(dataset, cf['tubes.stride'])
-    connections_f: Dict[Tuple[Vid_daly, int], Box_connections_dwti]
-    connections_f = group_tubes_on_frame_level(
+    connections_f_: Dict[Tuple[Vid_daly, int], Box_connections_dwti]
+    connections_f_ = group_tubes_on_frame_level(
             tubes_dwein_eval, frames_to_cover)
 
     _, dwti_to_label_eval = qload_synthetic_tube_labels(
@@ -1852,8 +1882,6 @@ def combine_split_full_tube_eval(workfolder, cfg_dict, add_args):
 
     # search relativefolder
     import dervo.experiment
-    from glob import glob
-    import os.path
     fold_rpath = cf['inputs.rpath_splits']
     fold = (dervo.experiment.EXPERIMENT_PATH/fold_rpath).resolve()
     runs = list(glob(f'{fold}/**/dict_outputs.pkl', recursive=True))
@@ -1866,59 +1894,20 @@ def combine_split_full_tube_eval(workfolder, cfg_dict, add_args):
     log.info('{} chunks found:\n{}'.format(
         len(dfdict), pprint.pformat(list(dfdict.keys()))))
 
-    # Loading all piecemeal connections
-    i_cons = {}
+    # Chunk merge
+    dict_outputs = {}
+    connections_f = {}
     for name, path in dfdict.items():
         path = Path(path)
-        local_connections_f = small.load_pkl(path/'connections_f.pkl')
-        i_cons[name] = local_connections_f
+        local_outputs = small.load_pkl(path/'dict_outputs.pkl')
+        for k, v in local_outputs.items():
+            dict_outputs.setdefault(k, []).extend(v)
+        connections_f.update(small.load_pkl(path/'connections_f.pkl'))
+
     # Check consistency
-    grouped_cons = {}
-    for c in i_cons.values():
-        grouped_cons.update(c)
-    if grouped_cons.keys() != connections_f.keys():
+    if connections_f.keys() != connections_f_.keys():
         log.error('Loaded connections inconsistent with expected ones')
 
-    # Aggregation of per-frame scores
-    dwti_preds: Dict[I_dwein, Dict[int, Dict]] = {}
-    for name, path in dfdict.items():
-        local_outputs = small.load_pkl(path/'dict_outputs.pkl')['x_final']
-        local_connections_f = i_cons[name]
-        assert len(local_outputs) == len(local_connections_f)
-        for cons, outputs in zip(local_connections_f.values(), local_outputs):
-            frame_ind = cons['frame_ind']
-            for (box, source, output) in zip(
-                    cons['boxes'], cons['dwti_sources'], outputs):
-                pred = {
-                    'box': box,
-                    'output': output}
-                dwti_preds.setdefault(source, {})[frame_ind] = pred
-
-    # Assignment of final score to each DWTI
-    tube_softmaxes_eval: Dict[I_dwein, np.ndarray] = {}
-    for dwti, preds in dwti_preds.items():
-        preds_agg_ = []
-        for frame_ind, pred in preds.items():
-            preds_agg_.append(pred['output'])
-        pred_agg = np.vstack(preds_agg_)
-        tube_softmaxes_eval[dwti] = pred_agg
-    from thes.experiments.m06.mlp import (
-        _compute_flattube_syntlabel_acc, _quick_assign_scores_to_dwein_tubes)
-
-    # We assume input_dims == 11
-    tube_softmaxes_eval_bg = tube_softmaxes_eval
-    tube_softmaxes_eval_nobg = {k: v[:, :-1]
-            for k, v in tube_softmaxes_eval.items()}
-
-    acc_flattube_synt = _compute_flattube_syntlabel_acc(
-            tube_softmaxes_eval_bg, dwti_to_label_eval)
-    av_stubes_eval: AV_dict[T_dwein_scored] = \
-        _quick_assign_scores_to_dwein_tubes(
-            tubes_dwein_eval, tube_softmaxes_eval_nobg, dataset)
-    df_ap_full, df_recall_full = quick_tube_eval(av_stubes_eval, tubes_dgt_eval)
-
-    _df_ap_full = (df_ap_full*100).round(2)
-    _apline = '/'.join(_df_ap_full.loc['all'].values.astype(str))
-    log.info('AP (full tubes):\n{}'.format(_df_ap_full))
-    log.info('Flattube synthetic acc: {:.2f}'.format(acc_flattube_synt*100))
-    log.info('Full tube AP357: {}'.format(_apline))
+    full_tube_perf_eval(dict_outputs['x_final'], connections_f,
+            dataset, dwti_to_label_eval,
+            tubes_dgt_eval, tubes_dwein_eval)

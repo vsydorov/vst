@@ -12,9 +12,6 @@ import torch.nn as nn
 import torch.utils.data
 import torch.nn.functional as F
 
-from sklearn.metrics import (
-    accuracy_score,)
-
 from vsydorov_tools import small
 
 from thes.data.dataset.daly import (
@@ -24,13 +21,18 @@ from thes.data.dataset.external import (
     Dataset_daly_ocv, Vid_daly)
 from thes.data.tubes.types import (
     I_dwein, T_dwein, T_dwein_scored, I_dgt, T_dgt,
-    AV_dict, Box_connections_dwti)
+    AV_dict, Box_connections_dwti
+)
 from thes.data.tubes.routines import (
-    temporal_ious_where_positive, spatial_tube_iou_v3,
-    get_dwein_overlaps_per_dgt, select_fg_bg_tubes,
-    qload_synthetic_tube_labels)
+    get_dwein_overlaps_per_dgt,
+    select_fg_bg_tubes,
+    qload_synthetic_tube_labels,
+    compute_flattube_syntlabel_acc,
+    quick_assign_scores_to_dwein_tubes
+)
 from thes.evaluation.meta import (
-    keyframe_cls_scores, cheating_tube_scoring, quick_tube_eval)
+    cheating_tube_scoring,
+    quick_tube_eval)
 from thes.tools import snippets
 from thes.tools.snippets import check_step_sslice as check_step
 from thes.pytorch import (
@@ -572,54 +574,6 @@ def _quick_accuracy_over_kfeat(
     return acc
 
 
-def _compute_flattube_syntlabel_acc(
-        tube_softmaxes: Dict[I_dwein, np.ndarray],
-        dwti_to_label: Dict[I_dwein, int]) -> float:
-    """
-    Compute synthetic per-frame accuracy over dwein tubes
-    """
-    # Assert presence of background cls
-    x = next(iter(tube_softmaxes.values()))
-    assert x.shape[-1] == 11
-
-    flat_sm_ = []
-    flat_label_ = []
-    for dwti, label in dwti_to_label.items():
-        softmaxes = tube_softmaxes[dwti]
-        flat_sm_.append(softmaxes)
-        flat_label_.append(np.repeat(label, len(softmaxes)))
-    flat_sm = np.vstack(flat_sm_)
-    flat_label = np.hstack(flat_label_)
-    return accuracy_score(flat_label, flat_sm.argmax(axis=1))
-
-
-def _quick_assign_scores_to_dwein_tubes(
-        tubes_dwein: Dict[I_dwein, T_dwein],
-        tube_softmaxes: Dict[I_dwein, np.ndarray],
-        dataset: Dataset_daly_ocv
-        ) -> AV_dict[T_dwein_scored]:
-    """
-    Softmaxes should correspond to dataset.action_names
-    """
-    # Assert absence of background cls
-    x = next(iter(tube_softmaxes.values()))
-    assert x.shape[-1] == 10
-
-    av_stubes: AV_dict[T_dwein_scored] = {}
-    for dwt_index, tube in tubes_dwein.items():
-        softmaxes = tube_softmaxes[dwt_index]
-        scores = softmaxes.mean(axis=0)
-        (vid, bunch_id, tube_id) = dwt_index
-        for action_name, score in zip(dataset.action_names, scores):
-            stube = cast(T_dwein_scored, tube.copy())
-            stube['score'] = score
-            stube = cast(T_dwein_scored, stube)
-            (av_stubes
-                    .setdefault(action_name, {})
-                    .setdefault(vid, []).append(stube))
-    return av_stubes
-
-
 def _tubefeats_trainset_perf(
         model,
         da_big: Data_access_big,
@@ -628,7 +582,7 @@ def _tubefeats_trainset_perf(
         tube_sofmaxes_train: Dict[I_dwein, np.ndarray] = \
             _predict_softmaxes_for_dwein_tubes_in_da_big(
                 model, da_big, dwti_to_label_train.keys())
-        acc_full_train = _compute_flattube_syntlabel_acc(
+        acc_full_train = compute_flattube_syntlabel_acc(
                 tube_sofmaxes_train, dwti_to_label_train)
     tsec = t.time
     return acc_full_train, tsec
@@ -700,12 +654,12 @@ def mlp_perf_evaluate(
                 for k, v in tube_softmaxes_eval.items()}
         tube_softmaxes_eval_bg = tube_softmaxes_eval
     # Flat accuracy (over synthetic labels, needs background)
-    acc_flattube_synt = _compute_flattube_syntlabel_acc(
+    acc_flattube_synt = compute_flattube_syntlabel_acc(
             tube_softmaxes_eval_bg, dwti_to_label_eval)
     result['acc_flattube_synt'] = acc_flattube_synt
     # MAP (over all tubes in tubes_dwein_eval, does not need background)
     av_stubes_eval: AV_dict[T_dwein_scored] = \
-        _quick_assign_scores_to_dwein_tubes(
+        quick_assign_scores_to_dwein_tubes(
             tubes_dwein_eval, tube_softmaxes_eval_nobg, dataset)
     df_ap_full, df_recall_full = quick_tube_eval(av_stubes_eval, tubes_dgt_eval)
     result.update({

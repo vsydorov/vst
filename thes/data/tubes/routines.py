@@ -7,6 +7,7 @@ from tqdm import tqdm
 from typing import (  # NOQA
     Dict, List, Tuple, TypeVar, Set, Optional, Callable,
     TypedDict, NewType, NamedTuple, Sequence, Literal, cast, Any)
+from sklearn.metrics import (accuracy_score)
 
 from thes.tools import snippets
 from thes.data.dataset.external import (
@@ -559,3 +560,51 @@ def qload_synthetic_tube_labels(
             raise RuntimeError()
         dwti_to_label[dwti] = ilabel
     return cls_labels, dwti_to_label
+
+
+def quick_assign_scores_to_dwein_tubes(
+        tubes_dwein: Dict[I_dwein, T_dwein],
+        tube_softmaxes: Dict[I_dwein, np.ndarray],
+        dataset: Dataset_daly_ocv
+        ) -> AV_dict[T_dwein_scored]:
+    """
+    Softmaxes should correspond to dataset.action_names
+    """
+    # Assert absence of background cls
+    x = next(iter(tube_softmaxes.values()))
+    assert x.shape[-1] == 10
+
+    av_stubes: AV_dict[T_dwein_scored] = {}
+    for dwt_index, tube in tubes_dwein.items():
+        softmaxes = tube_softmaxes[dwt_index]
+        scores = softmaxes.mean(axis=0)
+        (vid, bunch_id, tube_id) = dwt_index
+        for action_name, score in zip(dataset.action_names, scores):
+            stube = cast(T_dwein_scored, tube.copy())
+            stube['score'] = score
+            stube = cast(T_dwein_scored, stube)
+            (av_stubes
+                    .setdefault(action_name, {})
+                    .setdefault(vid, []).append(stube))
+    return av_stubes
+
+
+def compute_flattube_syntlabel_acc(
+        tube_softmaxes: Dict[I_dwein, np.ndarray],
+        dwti_to_label: Dict[I_dwein, int]) -> float:
+    """
+    Compute synthetic per-frame accuracy over dwein tubes
+    """
+    # Assert presence of background cls
+    x = next(iter(tube_softmaxes.values()))
+    assert x.shape[-1] == 11
+
+    flat_sm_ = []
+    flat_label_ = []
+    for dwti, label in dwti_to_label.items():
+        softmaxes = tube_softmaxes[dwti]
+        flat_sm_.append(softmaxes)
+        flat_label_.append(np.repeat(label, len(softmaxes)))
+    flat_sm = np.vstack(flat_sm_)
+    flat_label = np.hstack(flat_label_)
+    return accuracy_score(flat_label, flat_sm.argmax(axis=1))
