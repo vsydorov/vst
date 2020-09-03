@@ -1720,9 +1720,9 @@ def full_tube_eval(workfolder, cfg_dict, add_args):
         stride: 4
     batch_save_interval_seconds: 120
     compute_split:
-        enabled: [False, bool]
-        chunk: [0, "VALUE >= 0"]
-        total: [1, int]
+        enabled: False
+        chunk: !def {default: 0, evalcheck: "VALUE >= 0"}
+        total: 1
     """)
     cf = cfg.parse()
     cn = _config_preparations(cfg.without_prefix('CN.'))
