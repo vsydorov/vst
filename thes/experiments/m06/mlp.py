@@ -491,7 +491,8 @@ class Partial_Train_sampler(Train_sampler):
             keyframe['do_not_collate'] = True
             return feat, label, keyframe
 
-    def __init__(self, tkfeats_train, initial_seed, TRAIN_BATCH_SIZE):
+    def __init__(self, tkfeats_train, initial_seed,
+            TRAIN_BATCH_SIZE, period_ibatch_loss_log):
         td_sstrain = Partial_Train_sampler.TD_over_feats(
                 tkfeats_train['X'],
                 tkfeats_train['Y'],
@@ -504,7 +505,7 @@ class Partial_Train_sampler(Train_sampler):
                 num_workers=0, pin_memory=True,
                 sampler=sampler, shuffle=False,
                 collate_fn=sequence_batch_collate_v2)
-        self.period_ibatch_loss_log = '0::10'
+        self.period_ibatch_loss_log = period_ibatch_loss_log
 
     def train_step(self, model, optimizer, loss_fn, i_epoch):
         l_avg = snippets.misc.Averager()
@@ -735,8 +736,10 @@ def _kffeats_train_mlp_single_run(
         trsampler = Full_train_sampler(tkfeats_train)
     elif cf['train.mode'] == 'partial':
         train_batch_size = cf['train.partial.train_batch_size']
+        period_ibatch_loss_log = cf['train.period.ibatch_loss']
         trsampler = Partial_Train_sampler(
-                tkfeats_train, initial_seed, train_batch_size)
+                tkfeats_train, initial_seed,
+                train_batch_size, period_ibatch_loss_log)
     else:
         raise NotImplementedError()
 
@@ -851,6 +854,7 @@ def kffeats_train_mlp(workfolder, cfg_dict, add_args):
         period:
             log: '0::500'
             eval: '0::500'
+            ibatch_loss: '::'  # only relevant for partial
         partial:
             train_batch_size: 32
         mode: !def ['full', ['full', 'partial']]
