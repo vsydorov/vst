@@ -100,7 +100,6 @@ class Head_featextract_roi(nn.Module):
             assert out.shape[2] == 1
             out = torch.squeeze(out, 2)
 
-            # Roi, assuming 1 box per 1 batch_ind
             roi_align = getattr(self, f's{pi}_roi')
             out = roi_align(out, bboxes0)
 
@@ -114,12 +113,52 @@ class Head_featextract_roi(nn.Module):
         result = {'roipooled': x}
         return result
 
+class Head_featextract_fullframe(nn.Module):
+    def __init__(self, dim_in, temp_pool_size, spat_pool_size):
+        super(Head_featextract_fullframe, self).__init__()
+        self.dim_in = dim_in
+        self.num_pathways = len(temp_pool_size)
+
+        for pi in range(self.num_pathways):
+            # Pooling goes: T) avg, S) max
+            pi_temp_pool_size = temp_pool_size[pi]
+            pi_spat_pool_size = spat_pool_size[pi]
+            if pi_temp_pool_size is not None:
+                tpool = nn.AvgPool3d(
+                        [pi_temp_pool_size, 1, 1], stride=1)
+                self.add_module(f's{pi}_tpool', tpool)
+            spool = nn.MaxPool2d(
+                    (pi_spat_pool_size, pi_spat_pool_size), stride=1)
+            self.add_module(f's{pi}_spool', spool)
+
+    def forward(self, x):
+        # / Roi_Pooling
+        pool_out = []
+        for pi in range(self.num_pathways):
+            t_pool = getattr(self, f's{pi}_tpool', None)
+            if t_pool is not None:
+                out = t_pool(x[pi])
+            else:
+                out = x[pi]
+            assert out.shape[2] == 1
+            out = torch.squeeze(out, 2)
+
+            s_pool = getattr(self, f's{pi}_spool')
+            out = s_pool(out)
+            pool_out.append(out)
+        # B C H W.
+        x = torch.cat(pool_out, 1)
+        x = x.view(x.shape[0], -1)
+        assert x.shape[-1] == sum(self.dim_in)
+        result = {'fullframe': x}
+        return result
+
 class FExtractor(object):
     def __init__(self, sf_cfg, model_id):
-        self.headless_define(sf_cfg, model_id)
-        self.head_define(self.model, sf_cfg, model_id)
+        self._headless_define(sf_cfg, model_id)
+        self._head_define(self.model, sf_cfg, model_id)
 
-    def headless_define(self, sf_cfg, model_id):
+    def _headless_define(self, sf_cfg, model_id):
         model = slowfast.models.build_model(sf_cfg)
         if isinstance(model, slowfast.models.video_model_builder.ResNet):
             if model_id == 'c2d_1x1':
@@ -134,7 +173,14 @@ class FExtractor(object):
         self.model.forward = MethodType(hforward, self.model)
         self.model.eval()  # IMPORTANT
 
-    def head_define(self, model, sf_cfg, model_id):
+    def _head_define(self, model, sf_cfg, model_id):
+        raise NotImplementedError()
+
+    def forward(self, Xt_f32c, bboxes0_c):
+        raise NotImplementedError()
+
+class FExtractor_roi(FExtractor):
+    def _head_define(self, model, sf_cfg, model_id):
         model_nframes = sf_cfg.DATA.NUM_FRAMES
         POOL1 = SF_POOL1[sf_cfg.MODEL.ARCH]
         width_per_group = sf_cfg.RESNET.WIDTH_PER_GROUP
@@ -172,6 +218,42 @@ class FExtractor(object):
         return result
 
 
+class FExtractor_fullframe(FExtractor):
+    def _head_define(self, model, sf_cfg, model_id):
+        model_nframes = sf_cfg.DATA.NUM_FRAMES
+        POOL1 = SF_POOL1[sf_cfg.MODEL.ARCH]
+        width_per_group = sf_cfg.RESNET.WIDTH_PER_GROUP
+
+        if isinstance(model, slowfast.models.video_model_builder.ResNet):
+            dim_in = [width_per_group * 32]
+            pool_size = [
+                    [model_nframes//POOL1[0][0], 1, 1]]
+            spat_pool_size = [256//32]
+        elif isinstance(model, slowfast.models.video_model_builder.SlowFast):
+            # As per SlowFast._construct_network
+            dim_in = [
+                width_per_group * 32,
+                width_per_group * 32 // sf_cfg.SLOWFAST.BETA_INV]
+            pool_size = [
+                [model_nframes//sf_cfg.SLOWFAST.ALPHA//POOL1[0][0], 1, 1],
+                [model_nframes//POOL1[1][0], 1, 1]]
+            spat_pool_size = [256//32, 256//32]
+        else:
+            raise RuntimeError()
+
+        if model_id == 'c2d_1x1':
+            temp_pool_size = [None]
+        else:
+            temp_pool_size = [s[0] for s in pool_size]
+        self.head = Head_featextract_fullframe(
+                dim_in, temp_pool_size, spat_pool_size)
+
+    def forward(self, Xt_f32c, bboxes0_c):
+        x = self.model(Xt_f32c)
+        result = self.head(x)
+        return result
+
+
 class Ncfg_extractor:
     def set_defcfg(cfg):
         cfg.set_deftype("""
@@ -188,7 +270,6 @@ class Ncfg_extractor:
 
     def prepare(cf):
         model_id = cf['extractor.model_id']
-        assert cf['extractor.extraction_mode'] == 'roi'
 
         rel_yml_path = REL_YAML_PATHS[model_id]
         sf_cfg = basic_sf_cfg(rel_yml_path)
@@ -199,7 +280,12 @@ class Ncfg_extractor:
         norm_mean = sf_cfg.DATA.MEAN
         norm_std = sf_cfg.DATA.STD
 
-        fextractor = FExtractor(sf_cfg, model_id)
+        if cf['extractor.extraction_mode'] == 'roi':
+            fextractor = FExtractor_roi(sf_cfg, model_id)
+        elif cf['extractor.extraction_mode'] == 'fullframe':
+            fextractor = FExtractor_fullframe(sf_cfg, model_id)
+        else:
+            raise RuntimeError()
 
         # Load model
         CHECKPOINT_FILE_PATH = CHECKPOINTS_PREFIX/CHECKPOINTS[model_id]
