@@ -114,37 +114,53 @@ class Head_featextract_roi(nn.Module):
         return result
 
 class Head_featextract_fullframe(nn.Module):
-    def __init__(self, dim_in, temp_pool_size, spat_pool_size):
+    def __init__(self, dim_in, temp_pool_size, spat_pool_size, ffmode):
         super(Head_featextract_fullframe, self).__init__()
         self.dim_in = dim_in
         self.num_pathways = len(temp_pool_size)
+        self.ffmode = ffmode
 
         for pi in range(self.num_pathways):
             # Pooling goes: T) avg, S) max
             pi_temp_pool_size = temp_pool_size[pi]
             pi_spat_pool_size = spat_pool_size[pi]
-            if pi_temp_pool_size is not None:
-                tpool = nn.AvgPool3d(
-                        [pi_temp_pool_size, 1, 1], stride=1)
-                self.add_module(f's{pi}_tpool', tpool)
-            spool = nn.MaxPool2d(
-                    (pi_spat_pool_size, pi_spat_pool_size), stride=1)
-            self.add_module(f's{pi}_spool', spool)
+            if self.ffmode == 'tavg_smax':
+                if pi_temp_pool_size is not None:
+                    tpool = nn.AvgPool3d(
+                            [pi_temp_pool_size, 1, 1], stride=1)
+                    self.add_module(f's{pi}_tpool', tpool)
+                spool = nn.MaxPool2d(
+                        (pi_spat_pool_size, pi_spat_pool_size), stride=1)
+                self.add_module(f's{pi}_spool', spool)
+            elif self.ffmode == 'ts_avg':
+                pool_size = [
+                    pi_temp_pool_size, pi_spat_pool_size, pi_spat_pool_size]
+                if pi_temp_pool_size is None:
+                    pool_size[0] = 1
+                ts_pool = nn.AvgPool3d(pool_size)
+                self.add_module(f's{pi}_ts_pool', ts_pool)
+            else:
+                raise RuntimeError()
 
     def forward(self, x):
         # / Roi_Pooling
         pool_out = []
         for pi in range(self.num_pathways):
-            t_pool = getattr(self, f's{pi}_tpool', None)
-            if t_pool is not None:
-                out = t_pool(x[pi])
+            if self.ffmode == 'tavg_smax':
+                t_pool = getattr(self, f's{pi}_tpool', None)
+                if t_pool is not None:
+                    out = t_pool(x[pi])
+                else:
+                    out = x[pi]
+                assert out.shape[2] == 1
+                out = torch.squeeze(out, 2)
+                s_pool = getattr(self, f's{pi}_spool')
+                out = s_pool(out)
+            elif self.ffmode == 'ts_avg':
+                ts_pool = getattr(self, f's{pi}_ts_pool')
+                out = ts_pool(x[pi])
             else:
-                out = x[pi]
-            assert out.shape[2] == 1
-            out = torch.squeeze(out, 2)
-
-            s_pool = getattr(self, f's{pi}_spool')
-            out = s_pool(out)
+                raise RuntimeError()
             pool_out.append(out)
         # B C H W.
         x = torch.cat(pool_out, 1)
@@ -154,10 +170,6 @@ class Head_featextract_fullframe(nn.Module):
         return result
 
 class FExtractor(object):
-    def __init__(self, sf_cfg, model_id):
-        self._headless_define(sf_cfg, model_id)
-        self._head_define(self.model, sf_cfg, model_id)
-
     def _headless_define(self, sf_cfg, model_id):
         model = slowfast.models.build_model(sf_cfg)
         if isinstance(model, slowfast.models.video_model_builder.ResNet):
@@ -180,6 +192,10 @@ class FExtractor(object):
         raise NotImplementedError()
 
 class FExtractor_roi(FExtractor):
+    def __init__(self, sf_cfg, model_id):
+        self._headless_define(sf_cfg, model_id)
+        self._head_define(self.model, sf_cfg, model_id)
+
     def _head_define(self, model, sf_cfg, model_id):
         model_nframes = sf_cfg.DATA.NUM_FRAMES
         POOL1 = SF_POOL1[sf_cfg.MODEL.ARCH]
@@ -217,9 +233,12 @@ class FExtractor_roi(FExtractor):
         result = self.head(x, bboxes0_c)
         return result
 
-
 class FExtractor_fullframe(FExtractor):
-    def _head_define(self, model, sf_cfg, model_id):
+    def __init__(self, sf_cfg, model_id, IMAGE_SIZE, ffmode):
+        self._headless_define(sf_cfg, model_id)
+        self._head_define(self.model, sf_cfg, model_id, IMAGE_SIZE, ffmode)
+
+    def _head_define(self, model, sf_cfg, model_id, IMAGE_SIZE, ffmode):
         model_nframes = sf_cfg.DATA.NUM_FRAMES
         POOL1 = SF_POOL1[sf_cfg.MODEL.ARCH]
         width_per_group = sf_cfg.RESNET.WIDTH_PER_GROUP
@@ -228,7 +247,7 @@ class FExtractor_fullframe(FExtractor):
             dim_in = [width_per_group * 32]
             pool_size = [
                     [model_nframes//POOL1[0][0], 1, 1]]
-            spat_pool_size = [256//32]
+            spat_pool_size = [IMAGE_SIZE//32]
         elif isinstance(model, slowfast.models.video_model_builder.SlowFast):
             # As per SlowFast._construct_network
             dim_in = [
@@ -237,7 +256,7 @@ class FExtractor_fullframe(FExtractor):
             pool_size = [
                 [model_nframes//sf_cfg.SLOWFAST.ALPHA//POOL1[0][0], 1, 1],
                 [model_nframes//POOL1[1][0], 1, 1]]
-            spat_pool_size = [256//32, 256//32]
+            spat_pool_size = [IMAGE_SIZE//32, IMAGE_SIZE//32]
         else:
             raise RuntimeError()
 
@@ -246,7 +265,7 @@ class FExtractor_fullframe(FExtractor):
         else:
             temp_pool_size = [s[0] for s in pool_size]
         self.head = Head_featextract_fullframe(
-                dim_in, temp_pool_size, spat_pool_size)
+                dim_in, temp_pool_size, spat_pool_size, ffmode)
 
     def forward(self, Xt_f32c, bboxes0_c):
         x = self.model(Xt_f32c)
@@ -261,6 +280,8 @@ class Ncfg_extractor:
             model_id: [~, ['SLOWFAST_8x8_R50', 'SLOWFAST_4x16_R50',
                            'I3D_8x8_R50', 'c2d', 'c2d_1x1', 'c2d_imnet']]
             extraction_mode: ['roi', ['roi', 'fullframe']]
+            fullframe_mode: ['tavg_smax', ['tavg_smax', 'ts_avg']]
+            image_size: [256, int]
         extraction:
             box_orientation: ['ltrd', ['tldr', 'ltrd']]  # The other way is wrong
             batch_size: [8, int]
@@ -280,10 +301,13 @@ class Ncfg_extractor:
         norm_mean = sf_cfg.DATA.MEAN
         norm_std = sf_cfg.DATA.STD
 
+        IMAGE_SIZE = cf['extractor.image_size']
+        ffmode = cf['extractor.fullframe_mode']
+
         if cf['extractor.extraction_mode'] == 'roi':
             fextractor = FExtractor_roi(sf_cfg, model_id)
         elif cf['extractor.extraction_mode'] == 'fullframe':
-            fextractor = FExtractor_fullframe(sf_cfg, model_id)
+            fextractor = FExtractor_fullframe(sf_cfg, model_id, IMAGE_SIZE, ffmode)
         else:
             raise RuntimeError()
 
@@ -311,7 +335,7 @@ class Ncfg_extractor:
         sampler_grid = Sampler_grid(model_nframes, model_sample)
         box_orientation = cf['extraction.box_orientation']
         frameloader_vsf = Frameloader_video_slowfast(
-                is_slowfast, slowfast_alpha, 256, box_orientation)
+                is_slowfast, slowfast_alpha, IMAGE_SIZE, box_orientation)
         return norm_mean_t, norm_std_t, sampler_grid, frameloader_vsf, fextractor
 
 
