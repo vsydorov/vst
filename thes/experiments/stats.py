@@ -534,7 +534,7 @@ class Daly_stats:
         for i, (a, X) in enumerate(aX.items()):
             imgpath = str(fold0/f'{i}_{a}_h.jpg')
             cv2.imwrite(str(imgpath), ocv_hmap(X.T))
-        imgpath = str(fold0/f'all.jpg')
+        imgpath = str(fold0/'all.jpg')
         cv2.imwrite(str(imgpath), ocv_hmap(allX.T))
 
         fold = mkd(out/'box_heatmap_100')
@@ -618,20 +618,21 @@ class Daly_stats:
         for i, (a, X) in enumerate(aX.items()):
             imgpath = str(fold0/f'{i}_{a}_h.jpg')
             cv2.imwrite(str(imgpath), ocv_hmap(X.T))
-        imgpath = str(fold0/f'all.jpg')
+        imgpath = str(fold0/'all.jpg')
         cv2.imwrite(str(imgpath), ocv_hmap(allX.T))
 
 
-def daly_stats(workfolder, cfg_dict, add_args):
+def daly_oldstats(workfolder, cfg_dict, add_args):
     out, = snippets.get_subfolders(workfolder, ['out'])
-    cfg = snippets.YConfig(cfg_dict)
-    cfg.set_deftype("""
+    cfg = snippets.yconfig.YConfig_v2(cfg_dict, allowed_wo_defaults=[''])
+    cfg.set_defaults_yaml("""
     dataset:
-        cache_folder: [~, str]
+        cache_folder: ~
+        mirror: 'uname'
     """)
     cf = cfg.parse()
 
-    dataset = Dataset_daly_ocv()
+    dataset = Dataset_daly_ocv(cf['dataset.mirror'])
     dataset.populate_from_folder(cf['dataset.cache_folder'])
 
     pd_kf, pd_obj = Daly_stats.pd_stats(dataset)
