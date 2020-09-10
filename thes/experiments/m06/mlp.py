@@ -552,7 +552,7 @@ def _predict_softmaxes_for_dwein_tubes_in_da_big(
     model.eval()
     with torch.no_grad():
         for dwti in dwtis:
-            preds_softmax = model(da_big.get(model, dwti))['x_final']
+            preds_softmax = model(da_big.get(None, dwti))['x_final']
             tube_sofmaxes[dwti] = preds_softmax.numpy()
     return tube_sofmaxes
 
