@@ -2145,7 +2145,6 @@ def combine_split_full_tube_eval(workfolder, cfg_dict, add_args):
         for k, v in local_outputs.items():
             dict_outputs.setdefault(k, []).extend(v)
         connections_f.update(small.load_pkl(path/'connections_f.pkl'))
-
     # Check consistency
     if connections_f.keys() != connections_f_.keys():
         log.error('Loaded connections inconsistent with expected ones')

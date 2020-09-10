@@ -662,6 +662,59 @@ def combine_split_philtube_features(workfolder, cfg_dict, add_args):
     del dset
 
 
+def combine_split_philtube_fullframe_features(workfolder, cfg_dict, add_args):
+    out, = snippets.get_subfolders(workfolder, ['out'])
+    cfg = snippets.YConfig(cfg_dict)
+    cfg.set_defaults_handling(['inputs.cfolders'])
+    Ncfg_daly.set_defcfg(cfg)
+    cfg.set_deftype("""
+    inputs:
+        cfolders: [~, ~]
+        dims: [~, int]
+        key: ['roipooled', str]
+    tubes_dwein: [~, str]
+    frame_coverage:
+        keyframes: [True, bool]
+        subsample: [16, int]
+    """)
+    cf = cfg.parse()
+
+    # / prepare data
+    dataset: Dataset_daly_ocv = Ncfg_daly.get_dataset(cf)
+    tubes_dwein: Dict[I_dwein, T_dwein] = \
+            loadconvert_tubes_dwein(cf['tubes_dwein'])
+    # // Frames to cover: keyframes and every 16th frame
+    frames_to_cover: Dict[Vid_daly, np.ndarray] = \
+        sample_daly_frames_from_instances(dataset, cf['frame_coverage.subsample'])
+    connections_f_: Dict[Tuple[Vid_daly, int], Box_connections_dwti]
+    connections_f_ = group_tubes_on_frame_level(
+            tubes_dwein, frames_to_cover)
+
+    # Load inputs now
+    input_cfolders = cf['inputs.cfolders']
+    if not snippets.gather_check_all_present(input_cfolders, [
+            'dict_outputs.pkl', 'connections_f.pkl']):
+        return
+
+    # Chunk merge
+    connections_f = {}
+    dict_outputs = {}
+    for i, path in enumerate(input_cfolders):
+        path = Path(path)
+        local_outputs = small.load_pkl(path/'dict_outputs.pkl')
+        for k, v in local_outputs.items():
+            dict_outputs.setdefault(k, []).extend(v)
+        connections_f.update(small.load_pkl(path/'connections_f.pkl'))
+    # Check consistency
+    if connections_f_.keys() != connections_f.keys():
+        log.error('Loaded connections inconsistent with expected ones')
+
+    # fix mistake
+    fullframe = np.vstack(dict_outputs['fullframe'])
+    small.save_pkl(out/'connections_f.pkl', connections_f)
+    small.save_pkl(out/'fullframe.pkl', fullframe)
+
+
 def extract_keyframe_rgb(workfolder, cfg_dict, add_args):
     out, = snippets.get_subfolders(workfolder, ['out'])
     cfg = snippets.YConfig(cfg_dict)
