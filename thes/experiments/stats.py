@@ -28,10 +28,11 @@ from thes.data.tubes.routines import (
     numpy_inner_overlap_NN, _bareas,
     quick_assign_scores_to_dwein_tubes
 )
-from thes.evaluation.ap.convert import (
-    compute_ap_for_avtubes_as_df)
 from thes.data.tubes.nms import (
     compute_nms_for_av_stubes,)
+
+from thes.evaluation.ap.convert import (
+    compute_ap_for_avtubes_as_df)
 
 from thes.data.dataset.external import (
     Dataset_daly_ocv, Dataset_charades_ocv)
@@ -802,7 +803,7 @@ def daly_map_explore(workfolder, cfg_dict, add_args):
     av_gt_tubes: AV_dict[T_dgt] = push_into_avdict(tubes_dgt_eval)
 
     # Universal detector experiments
-    av_stubes_eval_augm: AV_dict[T_dwein_scored] = {}
+    av_stubes_eval_augm: AV_dict[Dict] = {}
     for dwt_index, tube in tubes_dwein_eval.items():
         softmaxes = tube_softmaxes_eval_nobg[dwt_index]
         scores = softmaxes.mean(axis=0)
@@ -810,12 +811,11 @@ def daly_map_explore(workfolder, cfg_dict, add_args):
         iscores = tubes_dwein_prov[dwt_index]['iscores']
         (vid, bunch_id, tube_id) = dwt_index
         for action_name, score in zip(dataset.action_names, scores):
-            stube = cast(T_dwein_scored, tube.copy())
+            stube = tube.copy()
             stube['cls_score'] = score
             stube['univ_score'] = scores.sum()
             stube['hscore'] = hscores.mean()
             stube['iscore'] = np.nanmean(iscores)
-            stube = cast(T_dwein_scored, stube)
             (av_stubes_eval_augm
                     .setdefault(action_name, {})
                     .setdefault(vid, []).append(stube))

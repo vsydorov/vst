@@ -1,4 +1,5 @@
 from tqdm import tqdm
+import copy
 import shutil
 import cv2
 from glob import glob
@@ -8,7 +9,7 @@ import numpy as np
 import logging
 from pathlib import Path
 from typing import (  # NOQA
-    Dict, Any, List, Optional, Tuple, TypedDict, Set)
+    Dict, Any, List, Optional, Tuple, TypedDict, Set, cast)
 from sklearn.metrics import (
     accuracy_score)
 
@@ -41,7 +42,11 @@ from thes.data.dataset.daly import (
 from thes.data.tubes.types import (  # NOQA
     Box_connections_dwti, I_dwein, T_dwein,
     T_dwein_scored, I_dgt, T_dgt, AV_dict,
+    Tube_daly_wein_as_provided,
+    av_stubes_above_score, push_into_avdict
 )
+from thes.data.tubes.nms import (
+    compute_nms_for_av_stubes,)
 from thes.data.tubes.routines import (
     group_tubes_on_frame_level,
     qload_synthetic_tube_labels,
@@ -51,6 +56,9 @@ from thes.data.tubes.routines import (
     compute_flattube_syntlabel_acc,
     quick_assign_scores_to_dwein_tubes
     )
+
+from thes.evaluation.ap.convert import (
+    compute_ap_for_avtubes_as_df)
 from thes.evaluation.meta import (
     cheating_tube_scoring, quick_tube_eval)
 
@@ -1521,6 +1529,64 @@ def full_tube_perf_eval(outputs, connections_f,
     log.info('Flattube synthetic acc: {:.2f}'.format(acc_flattube_synt*100))
     log.info('Full tube AP357: {}'.format(_apline))
 
+def full_tube_full_frame_perf_eval(
+        x_final_broken, connections_f,
+        tubes_dwein_prov, dataset, tubes_dwein_eval, tubes_dgt_eval):
+    # // fullframe evaluation
+    # We have wrongly attempted to be smart and unbatch out connections
+    x_final = np.vstack(x_final_broken)
+    # Aggregate frame scores
+    frame_scores: Dict[Tuple[Vid_daly, int], np.ndarray] = {}
+    for cons, outputs_ in zip(connections_f.values(), x_final):
+        vid = cons['vid']
+        frame_ind = cons['frame_ind']
+        frame_scores[(vid, frame_ind)] = outputs_
+    assert len(frame_scores) == len(connections_f)
+
+    av_stubes_eval_augm: AV_dict[Dict] = {}
+    for dwt_index, tube in tubes_dwein_eval.items():
+        (vid, bunch_id, tube_id) = dwt_index
+        # Human score from dwein tubes
+        hscores = tubes_dwein_prov[dwt_index]['hscores']
+        # Aggregated frame score
+        fscores_for_tube = []
+        for frame_ind in tube['frame_inds']:
+            fscore = frame_scores.get((vid, frame_ind))
+            if fscore is not None:
+                fscores_for_tube.append(fscore)
+        fscores_for_tube = np.vstack(fscores_for_tube)
+        for ia, action_name in enumerate(dataset.action_names):
+            stube = cast(T_dwein_scored, tube.copy())
+            stube['hscore'] = hscores.mean()
+            stube['fscore'] = fscores_for_tube.mean(0)[ia]
+            stube['hfscore'] = stube['hscore'] * stube['fscore']
+            (av_stubes_eval_augm
+                    .setdefault(action_name, {})
+                    .setdefault(vid, []).append(stube))
+
+    def assign_scorefield(av_stubes, score_field):
+        for a, v_stubes in av_stubes.items():
+            for v, stubes in v_stubes.items():
+                for stube in stubes:
+                    stube['score'] = stube[score_field]
+
+    iou_thresholds = [.3, .5, .7]
+    av_gt_tubes: AV_dict[T_dgt] = push_into_avdict(tubes_dgt_eval)
+    # Full evaluation
+    av_stubes = copy.deepcopy(av_stubes_eval_augm)
+    assign_scorefield(av_stubes, 'hscore')
+    av_stubes = av_stubes_above_score(av_stubes, 0.0)
+    av_stubes = compute_nms_for_av_stubes(av_stubes, 0.3)
+
+    assign_scorefield(av_stubes, 'hfscore')
+    df_ap_hfscore = compute_ap_for_avtubes_as_df(
+        av_gt_tubes, av_stubes, iou_thresholds, False, False)
+
+    _df_ap_full = (df_ap_hfscore*100).round(2)
+    _apline = '/'.join(_df_ap_full.loc['all'].values.astype(str))
+    log.info('AP (full tubes):\n{}'.format(_df_ap_full))
+    log.info('Full tube AP357: {}'.format(_apline))
+
 # EXPERIMENTS
 
 def finetune_preextracted_krgb(workfolder, cfg_dict, add_args):
@@ -1881,6 +1947,7 @@ def full_tube_eval(workfolder, cfg_dict, add_args):
         enabled: False
         chunk: !def {default: 0, evalcheck: "VALUE >= 0"}
         total: 1
+    mode: !def ['roi', ['roi', 'fullframe']]
     """)
     cf = cfg.parse()
     cn = _config_preparations(cfg.without_prefix('CN.'))
@@ -1899,6 +1966,8 @@ def full_tube_eval(workfolder, cfg_dict, add_args):
     # wein tubes
     tubes_dwein_d, tubes_dgt_d = load_gt_and_wein_tubes(
             cf['inputs.tubes_dwein'], dataset, vgroup)
+    tubes_dwein_prov: Dict[I_dwein, Tube_daly_wein_as_provided] = \
+            small.load_pkl(cf['inputs.tubes_dwein'])
     # Means
     norm_mean_cu = np_to_gpu(cn.DATA.MEAN)
     norm_std_cu = np_to_gpu(cn.DATA.STD)
@@ -1907,7 +1976,15 @@ def full_tube_eval(workfolder, cfg_dict, add_args):
     tubes_dgt_eval = tubes_dgt_d[sset_eval]
 
     # Model
-    model_wf = Model_w_freezer(cf, cn, 11)
+    if cf['mode'] == 'roi':
+        n_outputs = 11
+        model_wf = Model_w_freezer(cf, cn, n_outputs)
+    elif cf['mode'] == 'fullframe':
+        n_outputs = 10
+        model_wf = Model_w_freezer_fullframe(cf, cn, n_outputs)
+    else:
+        raise RuntimeError()
+
     model_wf.model_to_gpu()
     # Restore checkpoint
     states = torch.load(cf['inputs.ckpt'])
@@ -1928,7 +2005,7 @@ def full_tube_eval(workfolder, cfg_dict, add_args):
     NUM_WORKERS = 4
     sampler_grid = Sampler_grid(cn.DATA.NUM_FRAMES, cn.DATA.SAMPLING_RATE)
     frameloader_vsf = Frameloader_video_slowfast(
-            False, cn.SLOWFAST.ALPHA, 256, 'ltrd')
+            False, cn.SLOWFAST.ALPHA, cn.DATA.CROP_SIZE, 'ltrd')
 
     def prepare_func(start_i):
         # start_i defined wrt keys in connections_f
@@ -1990,11 +2067,18 @@ def full_tube_eval(workfolder, cfg_dict, add_args):
 
     if not cf['compute_split.enabled']:
         log.info('We can eval right away')
-        _, dwti_to_label_eval = qload_synthetic_tube_labels(
-            tubes_dgt_eval, tubes_dwein_eval, dataset)
-        full_tube_perf_eval(dict_outputs['x_final'], connections_f,
+        if cf['mode'] == 'roi':
+            _, dwti_to_label_eval = qload_synthetic_tube_labels(
+                tubes_dgt_eval, tubes_dwein_eval, dataset)
+            full_tube_perf_eval(dict_outputs['x_final'], connections_f,
                 dataset, dwti_to_label_eval,
                 tubes_dgt_eval, tubes_dwein_eval)
+        elif cf['mode'] == 'fullframe':
+            full_tube_full_frame_perf_eval(
+                dict_outputs['x_final'], connections_f, tubes_dwein_prov,
+                dataset, tubes_dwein_eval, tubes_dgt_eval)
+        else:
+            raise RuntimeError()
 
 
 def combine_split_full_tube_eval(workfolder, cfg_dict, add_args):
