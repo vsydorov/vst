@@ -43,7 +43,9 @@ def nms_over_custom_elements(
 
 
 def spatiotemp_tube_iou_1N(
-        x: Frametube_scored, ys: Sequence[Frametube_scored]) -> np.ndarray:
+        x: Frametube_scored,
+        ys: Sequence[Frametube_scored]
+        ) -> np.ndarray:
     """
     Spatiotemporal IOUs: x tube with every y tube
     """

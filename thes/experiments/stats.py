@@ -42,8 +42,7 @@ from thes.data.dataset.daly import (
 from thes.tools import snippets
 from thes.experiments.m06.mlp import (
     Ncfg_kfeats, define_mlp_model,
-    _quick_accuracy_over_kfeat,
-    _predict_softmaxes_for_dwein_tubes_in_da_big)
+    _quick_accuracy_over_kfeat)
 
 
 log = logging.getLogger(__name__)
@@ -820,7 +819,7 @@ def daly_map_explore(workfolder, cfg_dict, add_args):
                     .setdefault(action_name, {})
                     .setdefault(vid, []).append(stube))
 
-    def assign_scorefield(av_stubes, score_field):
+    def assign_scorefield(av_stubes: Any, score_field):
         for a, v_stubes in av_stubes.items():
             for v, stubes in v_stubes.items():
                 for stube in stubes:

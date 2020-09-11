@@ -2095,6 +2095,7 @@ def combine_split_full_tube_eval(workfolder, cfg_dict, add_args):
         ['train/val', 'trainval/test']]
     tubes:
         stride: 4
+    mode: !def ['roi', ['roi', 'fullframe']]
     """)
     cf = cfg.parse()
 
@@ -2107,6 +2108,8 @@ def combine_split_full_tube_eval(workfolder, cfg_dict, add_args):
     # wein tubes
     tubes_dwein_d, tubes_dgt_d = load_gt_and_wein_tubes(
             cf['inputs.tubes_dwein'], dataset, vgroup)
+    tubes_dwein_prov: Dict[I_dwein, Tube_daly_wein_as_provided] = \
+            small.load_pkl(cf['inputs.tubes_dwein'])
 
     # Sset
     tubes_dwein_eval = tubes_dwein_d[sset_eval]
@@ -2118,9 +2121,6 @@ def combine_split_full_tube_eval(workfolder, cfg_dict, add_args):
     connections_f_: Dict[Tuple[Vid_daly, int], Box_connections_dwti]
     connections_f_ = group_tubes_on_frame_level(
             tubes_dwein_eval, frames_to_cover)
-
-    _, dwti_to_label_eval = qload_synthetic_tube_labels(
-        tubes_dgt_eval, tubes_dwein_eval, dataset)
 
     # search relativefolder
     import dervo.experiment
@@ -2149,9 +2149,19 @@ def combine_split_full_tube_eval(workfolder, cfg_dict, add_args):
     if connections_f.keys() != connections_f_.keys():
         log.error('Loaded connections inconsistent with expected ones')
 
-    full_tube_perf_eval(dict_outputs['x_final'], connections_f,
+    # Now we can eval
+    if cf['mode'] == 'roi':
+        _, dwti_to_label_eval = qload_synthetic_tube_labels(
+            tubes_dgt_eval, tubes_dwein_eval, dataset)
+        full_tube_perf_eval(dict_outputs['x_final'], connections_f,
             dataset, dwti_to_label_eval,
             tubes_dgt_eval, tubes_dwein_eval)
+    elif cf['mode'] == 'fullframe':
+        full_tube_full_frame_perf_eval(
+            dict_outputs['x_final'], connections_f, tubes_dwein_prov,
+            dataset, tubes_dwein_eval, tubes_dgt_eval)
+    else:
+        raise RuntimeError()
 
 
 def finetune_on_fullframes(workfolder, cfg_dict, add_args):
