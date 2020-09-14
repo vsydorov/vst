@@ -54,10 +54,11 @@ def load_wein_tubes(workfolder, cfg_dict, add_args):
     wein_tubes: [~, str]
     dataset:
         cache_folder: [~, str]
+        mirror: ['uname', ~]
     """)
     cf = cfg.parse()
     # Dataset
-    dataset = Dataset_daly_ocv()
+    dataset = Dataset_daly_ocv(cf['dataset.mirror'])
     dataset.populate_from_folder(cf['dataset.cache_folder'])
     # Tubes
     # 0 has 510 elements, 1 has 200 elements
