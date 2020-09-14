@@ -643,13 +643,16 @@ def combine_split_philtube_features(workfolder, cfg_dict, add_args):
     dset = np.lib.format.open_memmap(np_filename, 'w+',
         dtype=np.float16, shape=(partbox_numbering[-1], cf['inputs.dims']))
 
+    inputs_key = cf['inputs.key']
+    if inputs_key != 'roipooled':
+        log.warn(f"{inputs_key=} != 'roipooled'. You sure?")
     # Piecemeal conversion
     for i, path in enumerate(input_cfolders):
         log.info(f'Merging chunk {i=} at {path=}')
         path = Path(path)
         with small.QTimer('Unpickling'):
             local_dict_outputs = small.load_pkl(path/'dict_outputs.pkl')
-        roipooled_feats = local_dict_outputs[cf['inputs.key']]
+        roipooled_feats = local_dict_outputs[inputs_key]
         with small.QTimer('Vstack'):
             cat_roipooled_feats = np.vstack(roipooled_feats)
         with small.QTimer('to float16'):
@@ -671,7 +674,7 @@ def combine_split_philtube_fullframe_features(workfolder, cfg_dict, add_args):
     inputs:
         cfolders: [~, ~]
         dims: [~, int]
-        key: ['roipooled', str]
+        key: ['fullframe', str]
     tubes_dwein: [~, str]
     frame_coverage:
         keyframes: [True, bool]
@@ -696,6 +699,9 @@ def combine_split_philtube_fullframe_features(workfolder, cfg_dict, add_args):
             'dict_outputs.pkl', 'connections_f.pkl']):
         return
 
+    inputs_key = cf['inputs.key']
+    if inputs_key != 'fullframe':
+        log.warn(f"{inputs_key=} != 'fullframe'. You sure?")
     # Chunk merge
     connections_f = {}
     dict_outputs = {}
@@ -710,7 +716,7 @@ def combine_split_philtube_fullframe_features(workfolder, cfg_dict, add_args):
         log.error('Loaded connections inconsistent with expected ones')
 
     # fix mistake
-    fullframe = np.vstack(dict_outputs['fullframe'])
+    fullframe = np.vstack(dict_outputs[inputs_key])
     small.save_pkl(out/'connections_f.pkl', connections_f)
     small.save_pkl(out/'fullframe.pkl', fullframe)
 
