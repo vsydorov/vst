@@ -17,7 +17,8 @@ from vsydorov_tools import small
 
 from thes.data.dataset.daly import (
     Ncfg_daly, load_gt_and_wein_tubes,
-    group_dwein_frames_wrt_kf_distance)
+    group_dwein_frames_wrt_kf_distance,
+    sample_daly_frames_from_instances)
 from thes.data.dataset.external import (
     Dataset_daly_ocv, Vid_daly)
 
@@ -213,194 +214,16 @@ class Net_mlp_onelayer(nn.Module):
         result['x_final'] = x
         return result
 
-class Manager_feats_tubes_dwein(object):
-    pass
 
-
-class Manager_feats_tubes_dwein_roipooled(Manager_feats_tubes_dwein):
-    def __init__(self, tubes_dwein_feats_fold, scaler):
-        self.scaler = scaler
-        fold = Path(tubes_dwein_feats_fold)
-        connections_f: Dict[Tuple[Vid_daly, int], Box_connections_dwti] = \
-                small.load_pkl(fold/'connections_f.pkl')
-        box_inds2 = small.load_pkl(fold/'box_inds2.pkl')
-        # DWTI -> Frame -> bi (big index)
-        dwti_f_bi: Dict[I_dwein, Dict[int, int]]
-        with small.QTimer('Creating dwti -> big index structure'):
-            dwti_f_bi = {}
-            for con, bi2 in zip(connections_f.values(), box_inds2):
-                bi_range = np.arange(bi2[0], bi2[1])
-                for dwti, bi in zip(con['dwti_sources'], bi_range):
-                    dwti_f_bi.setdefault(dwti, {})[con['frame_ind']] = bi
-        # Features
-        with small.QTimer('big numpy load'):
-            BIG = np.load(str(fold/"feats.npy"))
-        self.dwti_f_bi = dwti_f_bi
-        self.BIG = BIG
-
-    def get_all_tube_feats(self, dwti: I_dwein):
-        """ Get all feats and optionall scale """
-        inds_big = np.array(list(self.dwti_f_bi[dwti].values()))
-        feats = self.BIG[inds_big]
-        feats = feats.astype(np.float32)
-        if self.scaler is not None:
-            feats = self.scaler.transform(feats)
-        feats = torch.from_numpy(feats)
-        return feats
-
-
-class Manager_feats_tubes_dwein_full(Manager_feats_tubes_dwein):
-    def __init__(self, tubes_featfold, scaler):
-        self.scaler = scaler
-        tubes_featfold = Path(tubes_featfold)
-        connections_f: Dict[
-            Tuple[Vid_daly, int], Box_connections_dwti] = \
-                small.load_pkl(tubes_featfold/'connections_f.pkl')
-        fullframe = small.load_pkl(tubes_featfold/'fullframe.pkl')
-        self.connections_f = connections_f
-        self.fullframe_feats = fullframe
-
-
-class TDataset_over_bilinked_boxes(torch.utils.data.Dataset):
-    def __init__(self, frame_groups, BIG, scaler, KFX):
-        self.frame_groups = frame_groups
-        self.keys_vf = list(frame_groups.keys())
-        self.BIG = BIG
-        self.scaler = scaler
-        self.KFX = KFX
-
-    def __getitem__(self, index):
-        key_vf = self.keys_vf[index]
-        boxes = self.frame_groups[key_vf]
-
-        # Features
-        bi_presence = np.array(['bi' in b for b in boxes])
-        if bi_presence.all():
-            bis = np.array([b['bi'] for b in boxes])
-            feats = self.BIG[bis]
-            feats = feats.astype(np.float32)
-        else:
-            feats = np.zeros((len(boxes),
-                self.BIG.shape[-1]), dtype=np.float32)
-            for i, box in enumerate(boxes):
-                if 'bi' in box:
-                    feats[i] = self.BIG[box['bi']]
-                elif 'kfi' in box:
-                    feats[i] = self.KFX[box['kfi']]
-                else:
-                    raise RuntimeError()
-
-        if self.scaler is not None:
-            feats = self.scaler.transform(feats)
-
-        # Labels
-        labels = np.array([b['label'] for b in boxes])
-
-        meta = {'feats': feats, 'labels': labels, 'do_not_collate': True}
-        return (meta,)
-
-    def __len__(self):
-        return len(self.frame_groups)
-
-
-class Manager_loader_big_v2(object):
-    def __init__(self, tubes_featfold, scaler,
-            stride, top_n_matches,
-            dataset, tubes_dwein_train, tubes_dgt_train, tkfeats_train):
-        self.dataset = dataset
-        self.scaler = scaler
-        self.tkfeats_train = tkfeats_train
-
-        tubes_featfold = Path(tubes_featfold)
-        connections_f: Dict[Tuple[Vid_daly, int], Box_connections_dwti] = \
-                small.load_pkl(tubes_featfold/'connections_f.pkl')
-        box_inds2 = small.load_pkl(tubes_featfold/'box_inds2.pkl')
-        # DWTI -> Frame -> bi (big index)
-        with small.QTimer('Creating dwti -> big index structure'):
-            dwti_f_bi = {}
-            for con, bi2 in zip(connections_f.values(), box_inds2):
-                bi_range = np.arange(bi2[0], bi2[1])
-                for dwti, bi in zip(con['dwti_sources'], bi_range):
-                    dwti_f_bi.setdefault(dwti, {})[con['frame_ind']] = bi
-        # Features
-        with small.QTimer('big numpy load'):
-            BIG = np.load(str(tubes_featfold/"feats.npy"))
-        self.dwti_f_bi = dwti_f_bi
-        self.BIG = BIG
-
-        # // Associate tubes
-        matched_dwts: Dict[I_dgt, Dict[I_dwein, float]] = \
-            get_dwein_overlaps_per_dgt(tubes_dgt_train, tubes_dwein_train)
-        fg_meta, bg_meta = select_fg_bg_tubes(matched_dwts, top_n_matches)
-        log.info('Selected {} FG and {} BG tubes from a total of {}'.format(
-            len(fg_meta), len(bg_meta), len(tubes_dwein_train)))
-        # Merge fg/bg
-        tube_metas = {}
-        tube_metas.update(fg_meta)
-        tube_metas.update(bg_meta)
-        # Break into frames, sort by distance
-        self.dist_boxes_train = group_dwein_frames_wrt_kf_distance(
-            dataset, stride, tubes_dwein_train, tube_metas)
-
-    def get(self, model, dwti):
-        inds_big = np.array(list(self.dwti_f_bi[dwti].values()))
-        feats = self.BIG[inds_big]
-        feats = feats.astype(np.float32)
-        if self.scaler is not None:
-            feats = self.scaler.transform(feats)
-        feats = torch.from_numpy(feats)
-        return feats
-
-    def get_train_loader(
-            self, batch_size, rgen, max_distance, add_keyframes=True):
-        labeled_boxes = []
-        for i, boxes in self.dist_boxes_train.items():
-            if i > max_distance:
-                break
-            for box in boxes:
-                (vid, bunch_id, tube_id) = box['dwti']
-                bi = self.dwti_f_bi[box['dwti']][box['frame_ind']]
-                if box['kind'] == 'fg':
-                    (vid, action_name, ins_id) = box['dgti']
-                    label = self.dataset.action_names.index(action_name)
-                else:
-                    label = len(self.dataset.action_names)
-                lbox = {
-                    'vid': vid,
-                    'frame_ind': box['frame_ind'],
-                    'bi': bi,
-                    'box': box['box'],
-                    'label': label}
-                labeled_boxes.append(lbox)
-        if add_keyframes:
-            for kfi, kf in enumerate(self.tkfeats_train['kf']):
-                lbox = {
-                    'vid': kf['vid'],
-                    'frame_ind': kf['frame0'],
-                    'kfi': kfi,
-                    'box': kf['bbox'],
-                    'label': kf['action_id']}
-                labeled_boxes.append(lbox)
-
-        # Group into frame_groups
-        frame_groups: Dict[Tuple[Vid_daly, int], Dict] = {}
-        for lbox in labeled_boxes:
-            vid = lbox['vid']
-            frame_ind = lbox['frame_ind']
-            frame_groups.setdefault((vid, frame_ind), []).append(lbox)
-
-        # Loader
-        NUM_WORKERS = 0
-        td = TDataset_over_bilinked_boxes(
-                frame_groups, self.BIG, self.scaler,
-                self.tkfeats_train['X'].numpy())
-        sampler = NumpyRandomSampler(td, rgen)
-        loader = torch.utils.data.DataLoader(td,
-            batch_size=batch_size, num_workers=NUM_WORKERS,
-            sampler=sampler, shuffle=False,
-            pin_memory=True,
-            collate_fn=sequence_batch_collate_v2)
-        return loader
+def define_mlp_model(cf, D_in, D_out):
+    dropout_rate = cf['net.ll_dropout']
+    if cf['net.kind'] == 'layer0':
+        model = Net_mlp_zerolayer(
+            D_in, D_out, dropout_rate)
+    elif cf['net.kind'] == 'layer1':
+        model = Net_mlp_onelayer(
+            D_in, D_out, cf['net.layer1.H'], dropout_rate)
+    return model
 
 
 class Train_sampler(object):
@@ -475,15 +298,301 @@ class Partial_Train_sampler(Train_sampler):
         return l_avg.avg
 
 
-def define_mlp_model(cf, D_in, D_out):
-    dropout_rate = cf['net.ll_dropout']
-    if cf['net.kind'] == 'layer0':
-        model = Net_mlp_zerolayer(
-            D_in, D_out, dropout_rate)
-    elif cf['net.kind'] == 'layer1':
-        model = Net_mlp_onelayer(
-            D_in, D_out, cf['net.layer1.H'], dropout_rate)
-    return model
+class Frame_labeled(TypedDict):
+    vid: Vid_daly
+    frame_ind: int
+    label: int
+
+
+def prepare_label_fullframes_for_training(
+        tubes_dgt_train, dataset,
+        stride: int, max_distance: int
+        ) -> List[Frame_labeled]:
+    # Frames which we consider for this experiment
+    # (universal, present in every experiment)
+    vids_good_nums: Dict[Vid_daly, np.ndarray] = \
+            sample_daly_frames_from_instances(dataset, stride=stride)
+    # Retrieve frames from GT tubes
+    dist_frames: Dict[int, List[Dict]] = {}
+    for dgti, tube_dgt in tubes_dgt_train.items():
+        vid, action_name, _ = dgti
+        label = dataset.action_names.index(action_name)
+        good_nums = vids_good_nums[vid]
+        kf_nums = tube_dgt['frame_inds']
+        # Distance matrix
+        M = np.zeros((len(kf_nums), len(good_nums)), dtype=np.int)
+        for i, kf in enumerate(kf_nums):
+            M[i] = np.abs(good_nums-kf)
+        best_dist = M.min(axis=0)
+        # Disperse boxes per dist
+        for f0, dist in zip(good_nums, best_dist):
+            metaframe = {
+                'frame_ind': f0, 'dwti': dgti, 'label': label}
+            dist_frames.setdefault(dist, []).append(metaframe)
+    dist_frames = dict(sorted(list(dist_frames.items())))
+    # Take only proper distance, rearrange into (vid,frame_ind)
+    labeled_frames: List[Frame_labeled] = []
+    for i, frames_ in dist_frames.items():
+        if i > max_distance:
+            break
+        for frame_ in frames_:
+            lframe: Frame_labeled = {
+                    'vid': frame_['dwti'][0],
+                    'frame_ind': frame_['frame_ind'],
+                    'label': frame_['label']}
+            labeled_frames.append(lframe)
+    # Group into frame_groups
+    frame_groups: Dict[Tuple[Vid_daly, int], List[Frame_labeled]] = {}
+    for lframe in labeled_frames:
+        vid = lframe['vid']
+        frame_ind = lframe['frame_ind']
+        frame_groups.setdefault((vid, frame_ind), []).append(lframe)
+    # Exclude frames with >1 box from training
+    singular_labeled_frames: List[Frame_labeled] = []
+    for vf, lframes in frame_groups.items():
+        if len(lframes) == 1:
+            singular_labeled_frames.append(lframes[0])
+    return singular_labeled_frames
+
+
+class Box_labeled(TypedDict):
+    vid: Vid_daly
+    frame_ind: int
+    box: np.ndarray  # LTRD, absolute scale
+    label: int
+    dwti: Optional[I_dwein]
+    kfi: Optional[int]
+
+
+def prepare_label_roiboxes_for_training(
+        tubes_dgt_train, dataset,
+        stride: int, max_distance: int,
+        tubes_dwein_train, keyframes_train, top_n_matches: int,
+        add_keyframes=True
+        ) -> List[Box_labeled]:
+    # ROI box extract
+    matched_dwts: Dict[I_dgt, Dict[I_dwein, float]] = \
+        get_dwein_overlaps_per_dgt(tubes_dgt_train, tubes_dwein_train)
+    fg_meta, bg_meta = select_fg_bg_tubes(matched_dwts, top_n_matches)
+    log.info('Selected {} FG and {} BG tubes from a total of {}'.format(
+        len(fg_meta), len(bg_meta), len(tubes_dwein_train)))
+    # Merge fg/bg
+    tube_metas = {}
+    tube_metas.update(fg_meta)
+    tube_metas.update(bg_meta)
+    # Break into frames, sort by distance
+    dist_boxes_train: Dict[int, List[Dict]] = \
+        group_dwein_frames_wrt_kf_distance(
+            dataset, stride, tubes_dwein_train, tube_metas)
+    # Special
+    lbox: Box_labeled
+    labeled_boxes: List[Box_labeled] = []
+    for i, boxes in dist_boxes_train.items():
+        if i > max_distance:
+            break
+        for box in boxes:
+            (vid, bunch_id, tube_id) = box['dwti']
+            if box['kind'] == 'fg':
+                (vid, action_name, ins_id) = box['dgti']
+                label = dataset.action_names.index(action_name)
+            else:
+                label = len(dataset.action_names)
+            lbox = {
+                'vid': vid,
+                'frame_ind': box['frame_ind'],
+                'box': box['box'],
+                'label': label,
+                'dwti': box['dwti'],
+                'kfi': None
+            }
+            labeled_boxes.append(lbox)
+    if add_keyframes:
+        # Merge keyframes too
+        for kfi, kf in enumerate(keyframes_train):
+            action_name = kf['action_name']
+            label = dataset.action_names.index(action_name)
+            lbox = {
+                'vid': kf['vid'],
+                'frame_ind': kf['frame0'],
+                'box': kf['bbox'],
+                'label': label,
+                'dwti': None,
+                'kfi': kfi,
+            }
+            labeled_boxes.append(lbox)
+    return labeled_boxes
+
+
+class Manager_feats_tubes_dwein(object):
+    pass
+
+# Management of dwein roipooled features
+
+class Box_labeled_linked(Box_labeled):
+    bi: Optional[int]
+
+class Manager_feats_tubes_dwein_roipooled(Manager_feats_tubes_dwein):
+    def __init__(self, tubes_dwein_feats_fold, scaler):
+        self.scaler = scaler
+        fold = Path(tubes_dwein_feats_fold)
+        connections_f: Dict[Tuple[Vid_daly, int], Box_connections_dwti] = \
+                small.load_pkl(fold/'connections_f.pkl')
+        box_inds2 = small.load_pkl(fold/'box_inds2.pkl')
+        # DWTI -> Frame -> bi (big index)
+        dwti_f_bi: Dict[I_dwein, Dict[int, int]]
+        with small.QTimer('Creating dwti -> big index structure'):
+            dwti_f_bi = {}
+            for con, bi2 in zip(connections_f.values(), box_inds2):
+                bi_range = np.arange(bi2[0], bi2[1])
+                for dwti, bi in zip(con['dwti_sources'], bi_range):
+                    dwti_f_bi.setdefault(dwti, {})[con['frame_ind']] = bi
+        # Features
+        with small.QTimer('big numpy load'):
+            BIG = np.load(str(fold/"feats.npy"))
+        self.connections_f = connections_f
+        self.dwti_f_bi = dwti_f_bi
+        self.BIG = BIG
+
+    def get_all_tube_feats(self, dwti: I_dwein):
+        """ Get all feats and optionall scale """
+        inds_big = np.array(list(self.dwti_f_bi[dwti].values()))
+        feats = self.BIG[inds_big]
+        feats = feats.astype(np.float32)
+        if self.scaler is not None:
+            feats = self.scaler.transform(feats)
+        feats = torch.from_numpy(feats)
+        return feats
+
+
+def _link_lboxes_to_exfeats(
+        labeled_boxes: List[Box_labeled],
+        man_feats_dwt: Manager_feats_tubes_dwein_roipooled
+        ) -> List[Box_labeled_linked]:
+    labeled_linked_boxes = []
+    for lbox in labeled_boxes:
+        lbox = cast(Box_labeled_linked, copy.deepcopy(lbox))
+        if lbox['dwti'] is not None:
+            bi = man_feats_dwt.dwti_f_bi[lbox['dwti']][lbox['frame_ind']]
+        else:
+            bi = None
+        lbox['bi'] = bi
+        labeled_linked_boxes.append(lbox)
+    return labeled_linked_boxes
+
+
+class TDataset_over_labeled_linked_boxes(torch.utils.data.Dataset):
+    def __init__(self,
+            labeled_linked_boxes: List[Box_labeled_linked],
+            man_feats_dwt: Manager_feats_tubes_dwein_roipooled,
+            KFX: np.ndarray):
+        # Group into frame_groups
+        frame_groups: Dict[Tuple[Vid_daly, int], List[Box_labeled_linked]] = {}
+        for lbox in labeled_linked_boxes:
+            vid = lbox['vid']
+            frame_ind = lbox['frame_ind']
+            frame_groups.setdefault((vid, frame_ind), []).append(lbox)
+        self.frame_groups = frame_groups
+        self.keys_vf = list(frame_groups.keys())
+        self.BIG = man_feats_dwt.BIG
+        self.scaler = man_feats_dwt.scaler
+        self.KFX = KFX
+
+    def __getitem__(self, index):
+        key_vf = self.keys_vf[index]
+        boxes: List[Box_labeled_linked] = self.frame_groups[key_vf]
+
+        # Features
+        bi_presence = np.array([b.get('bi') is not None for b in boxes])
+        if bi_presence.all():
+            bis = np.array([b['bi'] for b in boxes])
+            feats = self.BIG[bis]
+            feats = feats.astype(np.float32)
+        else:
+            feats = np.zeros((len(boxes),
+                self.BIG.shape[-1]), dtype=np.float32)
+            for i, box in enumerate(boxes):
+                if bi := box.get('bi') is not None:
+                    feats[i] = self.BIG[bi]
+                elif kfi := box.get('kfi') is not None:
+                    feats[i] = self.KFX[kfi]
+                else:
+                    raise RuntimeError()
+
+        if self.scaler is not None:
+            feats = self.scaler.transform(feats)
+
+        # Labels
+        labels = np.array([b['label'] for b in boxes])
+
+        meta = {'feats': feats, 'labels': labels, 'do_not_collate': True}
+        return (meta,)
+
+    def __len__(self):
+        return len(self.frame_groups)
+
+
+# Management of dwein fullframe features
+
+class Frame_labeled_linked(Frame_labeled):
+    exfeat_ind: int
+
+
+class Manager_feats_tubes_dwein_full(Manager_feats_tubes_dwein):
+    def __init__(self, tubes_featfold, scaler):
+        self.scaler = scaler
+        tubes_featfold = Path(tubes_featfold)
+        connections_f: Dict[
+            Tuple[Vid_daly, int], Box_connections_dwti] = \
+                small.load_pkl(tubes_featfold/'connections_f.pkl')
+        fullframe = small.load_pkl(tubes_featfold/'fullframe.pkl')
+        self.connections_f = connections_f
+        self.fullframe_feats = fullframe
+
+
+def _link_lframes_to_exfeats(
+        labeled_frames: List[Frame_labeled],
+        man_feats_dwt: Manager_feats_tubes_dwein_full
+        ) -> List[Frame_labeled_linked]:
+    # Assign link to extracted feature
+    vf_to_exfeat_ind = {}
+    for i, vf in enumerate(list(man_feats_dwt.connections_f.keys())):
+        vf_to_exfeat_ind[vf] = i
+    errors = 0
+    ll_frames: List[Frame_labeled_linked] = []
+    for lframe in labeled_frames:
+        vf = (lframe['vid'], lframe['frame_ind'])
+        lframe = cast(Frame_labeled_linked, copy.deepcopy(lframe))
+        exfeat_ind = vf_to_exfeat_ind.get(vf)
+        if exfeat_ind is None:
+            errors += 1
+            continue
+        lframe['exfeat_ind'] = exfeat_ind
+        ll_frames.append(lframe)
+    log.info(f'Got {errors=} when linking frames to exfeats')
+    return ll_frames
+
+
+class TDataset_over_labeled_linked_frames(torch.utils.data.Dataset):
+    def __init__(self,
+            labeled_linked_frames: List[Frame_labeled_linked],
+            man_feats_dwt: Manager_feats_tubes_dwein_full):
+        self.labeled_linked_frames = labeled_linked_frames
+        self.fullframe_feats = man_feats_dwt.fullframe_feats
+        self.scaler = man_feats_dwt.scaler
+
+    def __getitem__(self, index):
+        llframe = self.labeled_linked_frames[index]
+
+        feat = self.fullframe_feats[llframe['exfeat_ind']]
+        label = np.array(llframe['label'])
+
+        meta = {'feats': feat[None],
+                'labels': label[None],
+                'do_not_collate': True}
+        return (meta,)
+
+    def __len__(self):
+        return len(self.labeled_linked_frames)
 
 
 # Evaluation
@@ -584,7 +693,7 @@ def mlp_perf_kf_evaluate(
         tubes_dwein_eval: Dict[I_dwein, T_dwein],
         tubes_dgt_eval: Dict[I_dgt, T_dgt],
         dataset: Dataset_daly_ocv,
-        input_dims: int,
+        output_dims: int,
             ) -> Dict:
     """
     This function should MLP KF evaluations
@@ -592,8 +701,8 @@ def mlp_perf_kf_evaluate(
      + df_recall_cheat, df_ap_cheat - perf for cheating evaluation
     """
     assert not model.training, 'Wrong results in train mode'
-    assert input_dims in (10, 11)
-    kf_cut_last = input_dims == 11
+    assert output_dims in (10, 11)
+    kf_cut_last = output_dims == 11
     result = {}
     # // Quick acc
     result['kacc_train'] = _quick_accuracy_over_kfeat(
@@ -628,13 +737,13 @@ def mlp_perf_fulltube_evaluate(
         tubes_dgt_eval: Dict[I_dgt, T_dgt],
         dwti_to_label_eval: Dict[I_dwein, int],
         dataset: Dataset_daly_ocv,
-        input_dims: int,
+        output_dims: int,
         # stats for fulltube eval
         f_detect_mode: Literal['roipooled', 'fullframe'],
         f_nms: float,
         f_field_nms: str,
         f_field_det: str,
-        ):
+        ) -> Dict:
     """
     This function should perform MLP fulltube evaluations
      + acc_flattube_synt - synthetic per-frame accuracy of dwein tubes
@@ -656,7 +765,7 @@ def mlp_perf_fulltube_evaluate(
                 preds_softmax = model(dwti_feats)['x_final']
                 tube_softmaxes_eval[dwti] = preds_softmax.numpy()
         # We need 2 kinds of tubes: with background and without
-        if input_dims == 10:
+        if output_dims == 10:
             tube_softmaxes_eval_nobg = tube_softmaxes_eval
             tube_softmaxes_eval_bg = {k: np.pad(v, ((0, 0), (0, 1)))
                     for k, v in tube_softmaxes_eval.items()}
@@ -672,7 +781,7 @@ def mlp_perf_fulltube_evaluate(
                 tubes_dwein_eval, tubes_dwein_prov,
                 tube_softmaxes_eval_nobg, dataset)
     elif f_detect_mode =='fullframe':
-        assert input_dims == 10
+        assert output_dims == 10
         # Aggregate frame scores
         assert isinstance(man_feats_dwt, Manager_feats_tubes_dwein_full)
         connections_f = man_feats_dwt.connections_f
@@ -754,98 +863,6 @@ def mlp_perf_display(result, sset_eval):
         [fields], header=header, pad=2)))
 
 
-# kffeats_train_mlp
-
-
-def _kffeats_train_mlp_single_run(
-        cf, fold_trmodels, i,
-        initial_seed, man_feats_dwt,
-        tkfeats_train: E_tkfeats,
-        tkfeats_eval: E_tkfeats,
-        tubes_dwein_eval, tubes_dgt_eval,
-        tubes_dwein_prov, dataset, sset_eval):
-
-    torch.manual_seed(initial_seed)
-    period_log = cf['train.period.log']
-    period_eval_evalset = cf['train.period.eval']
-
-    input_dims = cf['net.n_outputs']
-
-    n_epochs = cf['train.n_epochs']
-    D_in = tkfeats_train['X'].shape[-1]
-    model = define_mlp_model(cf, D_in, input_dims)
-    model.init_weights(0.01, initial_seed)
-
-    loss_fn = torch.nn.CrossEntropyLoss(reduction='mean')
-    optimizer = torch.optim.AdamW(model.parameters(),
-            lr=cf['train.lr'], weight_decay=cf['train.weight_decay'])
-
-    trsampler: Train_sampler
-    if cf['train.batch_mode'] == 'full':
-        trsampler = Full_train_sampler(tkfeats_train)
-    elif cf['train.batch_mode'] == 'partial':
-        train_batch_size = cf['train.batch_mode_partial.train_batch_size']
-        period_ibatch_loss_log = cf['train.period.ibatch_loss']
-        trsampler = Partial_Train_sampler(
-                tkfeats_train, initial_seed,
-                train_batch_size, period_ibatch_loss_log)
-    else:
-        raise NotImplementedError()
-
-    _, dwti_to_label_eval = qload_synthetic_tube_labels(
-        tubes_dgt_eval, tubes_dwein_eval, dataset)
-    kf_cut_last = input_dims == 11
-    # fullframe eval stats
-
-    def evaluate(i_epoch):
-        model.eval()
-        result = mlp_perf_kf_evaluate(
-                model, tkfeats_train, tkfeats_eval,
-                tubes_dwein_eval, tubes_dgt_eval,
-                dataset, input_dims)
-        if cf['eval.full_tubes.enabled']:
-            result_fulltube = mlp_perf_fulltube_evaluate(
-                    model, man_feats_dwt,
-                    tubes_dwein_eval, tubes_dwein_prov,
-                    tubes_dgt_eval, dwti_to_label_eval,
-                    dataset, input_dims,
-                    cf['eval.full_tubes.detect_mode'],
-                    cf['eval.full_tubes.nms'],
-                    cf['eval.full_tubes.field_nms'],
-                    cf['eval.full_tubes.field_det'])
-            result.update(result_fulltube)
-        model.train()
-        log.info(f'Perf at {i_epoch=}')
-        mlp_perf_display(result, sset_eval)
-        return result
-
-    for i_epoch in range(n_epochs):
-        avg_loss = trsampler.train_step(model, optimizer, loss_fn, i_epoch)
-        if snippets.check_step_sslice(i_epoch, period_log):
-            log.info(f'Loss at {i_epoch=}: {avg_loss}')
-            model.eval()
-            kacc_train = _quick_accuracy_over_kfeat(
-                    tkfeats_train, model, kf_cut_last)*100
-            kacc_eval = _quick_accuracy_over_kfeat(
-                    tkfeats_eval, model, kf_cut_last)*100
-            model.train()
-            log.info(f'Qperf at {i_epoch=}: '
-                    f'{kacc_train=:.2f} {kacc_eval=:.2f}')
-        if snippets.check_step_sslice(i_epoch, period_eval_evalset):
-            result = evaluate(i_epoch)
-
-    # Save the final model
-    save_filepath = str(fold_trmodels/f'finished_{i}.ckpt')
-    states = {
-            'i_epoch': i_epoch,
-            'model_sdict': model.state_dict(),
-    }
-    torch.save(states, str(save_filepath))
-    # Eval
-    result = evaluate(i_epoch)
-    return result
-
-
 class Checkpointer(object):
     def __init__(self, model, optimizer):
         self.model = model
@@ -891,10 +908,129 @@ class Checkpointer(object):
                     'empty model, at epoch {}').format(start_epoch))
         return start_epoch
 
+
+def _create_preextracted_feats_manager(cf, scaler, detect_mode):
+    kind = cf['inputs.tubes_dwein_feats.kind']
+    fold = cf['inputs.tubes_dwein_feats.fold']
+    if kind == 'roipooled':
+        man_feats_dwt = \
+            Manager_feats_tubes_dwein_roipooled(fold, scaler)
+    elif kind == 'fullframe':
+        man_feats_dwt = \
+            Manager_feats_tubes_dwein_full(fold, scaler)
+    else:
+        raise RuntimeError()
+    assert kind == detect_mode
+    return man_feats_dwt
+
+
+def _get_trainloader_rnd_sampler(tdataset, batch_size, rgen):
+    NUM_WORKERS = 0
+    sampler = NumpyRandomSampler(tdataset, rgen)
+    loader = torch.utils.data.DataLoader(tdataset,
+        batch_size=batch_size, num_workers=NUM_WORKERS,
+        sampler=sampler, shuffle=False,
+        pin_memory=True,
+        collate_fn=sequence_batch_collate_v2)
+    return loader
+
+
+def _kffeats_train_mlp_single_run(
+        cf, fold_trmodels, i,
+        initial_seed, man_feats_dwt,
+        tkfeats_train: E_tkfeats,
+        tkfeats_eval: E_tkfeats,
+        tubes_dwein_eval, tubes_dgt_eval,
+        tubes_dwein_prov, dataset, sset_eval):
+
+    torch.manual_seed(initial_seed)
+    period_log = cf['train.period.log']
+    period_eval_evalset = cf['train.period.eval']
+
+    output_dims = cf['net.n_outputs']
+
+    n_epochs = cf['train.n_epochs']
+    D_in = tkfeats_train['X'].shape[-1]
+    model = define_mlp_model(cf, D_in, output_dims)
+    model.init_weights(0.01, initial_seed)
+
+    loss_fn = torch.nn.CrossEntropyLoss(reduction='mean')
+    optimizer = torch.optim.AdamW(model.parameters(),
+            lr=cf['train.lr'], weight_decay=cf['train.weight_decay'])
+
+    trsampler: Train_sampler
+    if cf['train.batch_mode'] == 'full':
+        trsampler = Full_train_sampler(tkfeats_train)
+    elif cf['train.batch_mode'] == 'partial':
+        train_batch_size = cf['train.batch_mode_partial.train_batch_size']
+        period_ibatch_loss_log = cf['train.period.ibatch_loss']
+        trsampler = Partial_Train_sampler(
+                tkfeats_train, initial_seed,
+                train_batch_size, period_ibatch_loss_log)
+    else:
+        raise NotImplementedError()
+
+    _, dwti_to_label_eval = qload_synthetic_tube_labels(
+        tubes_dgt_eval, tubes_dwein_eval, dataset)
+    kf_cut_last = output_dims == 11
+    # fullframe eval stats
+
+    def evaluate(i_epoch):
+        model.eval()
+        result = mlp_perf_kf_evaluate(
+                model, tkfeats_train, tkfeats_eval,
+                tubes_dwein_eval, tubes_dgt_eval,
+                dataset, output_dims)
+        if cf['eval.full_tubes.enabled']:
+            result_fulltube = mlp_perf_fulltube_evaluate(
+                    model, man_feats_dwt,
+                    tubes_dwein_eval, tubes_dwein_prov,
+                    tubes_dgt_eval, dwti_to_label_eval,
+                    dataset, output_dims,
+                    cf['eval.full_tubes.detect_mode'],
+                    cf['eval.full_tubes.nms'],
+                    cf['eval.full_tubes.field_nms'],
+                    cf['eval.full_tubes.field_det'])
+            result.update(result_fulltube)
+        model.train()
+        log.info(f'Perf at {i_epoch=}')
+        mlp_perf_display(result, sset_eval)
+        return result
+
+    for i_epoch in range(n_epochs):
+        avg_loss = trsampler.train_step(model, optimizer, loss_fn, i_epoch)
+        if snippets.check_step_sslice(i_epoch, period_log):
+            log.info(f'Loss at {i_epoch=}: {avg_loss}')
+            model.eval()
+            kacc_train = _quick_accuracy_over_kfeat(
+                    tkfeats_train, model, kf_cut_last)*100
+            kacc_eval = _quick_accuracy_over_kfeat(
+                    tkfeats_eval, model, kf_cut_last)*100
+            model.train()
+            log.info(f'Qperf at {i_epoch=}: '
+                    f'{kacc_train=:.2f} {kacc_eval=:.2f}')
+        if snippets.check_step_sslice(i_epoch, period_eval_evalset):
+            result = evaluate(i_epoch)
+
+    # Save the final model
+    save_filepath = str(fold_trmodels/f'finished_{i}.ckpt')
+    states = {
+            'i_epoch': i_epoch,
+            'model_sdict': model.state_dict(),
+    }
+    torch.save(states, str(save_filepath))
+    # Eval
+    result = evaluate(i_epoch)
+    return result
+
+
 # Experiments
 
 
 def kffeats_train_mlp(workfolder, cfg_dict, add_args):
+    """
+    Train a classification MLP on keyframes only. Simple to do.
+    """
     out, = snippets.get_subfolders(workfolder, ['out'])
     cfg = snippets.YConfig_v2(cfg_dict)
     Ncfg_daly.set_defcfg_v2(cfg)
@@ -909,8 +1045,7 @@ def kffeats_train_mlp(workfolder, cfg_dict, add_args):
     split_assignment: !def ['train/val', ['train/val', 'trainval/test']]
     data_scaler: !def ['keyframes', ['keyframes', 'no']]
     net:
-        kind: !def ['layer1',
-            ['layer0', 'layer1']]
+        kind: !def ['layer1', ['layer0', 'layer1']]
         layer1:
             H: 32
         ll_dropout: 0.5
@@ -948,18 +1083,10 @@ def kffeats_train_mlp(workfolder, cfg_dict, add_args):
             cf['inputs.tubes_dwein'], dataset, vgroup)
     tubes_dwein_prov: Dict[I_dwein, Tube_daly_wein_as_provided] = \
             small.load_pkl(cf['inputs.tubes_dwein'])
+    detect_mode = cf['eval.full_tubes.detect_mode']
     if cf['eval.full_tubes.enabled']:
-        kind = cf['inputs.tubes_dwein_feats.kind']
-        fold = cf['inputs.tubes_dwein_feats.fold']
-        assert kind == cf['eval.full_tubes.detect_mode']
-        if kind == 'roipooled':
-            man_feats_dwt = \
-                Manager_feats_tubes_dwein_roipooled(fold, scaler)
-        elif kind == 'fullframe':
-            man_feats_dwt = \
-                Manager_feats_tubes_dwein_full(fold, scaler)
-        else:
-            raise RuntimeError()
+        man_feats_dwt = _create_preextracted_feats_manager(
+                cf, scaler, detect_mode)
     else:
         man_feats_dwt = None
 
@@ -1023,22 +1150,22 @@ def tubefeats_dist_train_mlp(workfolder, cfg_dict, add_args):
     cfg.set_defaults_yaml("""
     inputs:
         tubes_dwein: ~
-        big:
+        tubes_dwein_feats:
             fold: ~
+            kind: !def ['roipooled', ['fullframe', 'roipooled']]
         ckpt: ~
     seed: 42
     split_assignment: !def ['train/val',
         ['train/val', 'trainval/test']]
-    data_scaler: !def ['no',
-        ['keyframes', 'no']]
+    data_scaler: !def ['no', ['keyframes', 'no']]
     net:
-        kind: !def ['layer1',
-            ['layer0', 'layer1']]
+        kind: !def ['layer1', ['layer0', 'layer1']]
         layer1:
             H: 32
         ll_dropout: 0.5
+        n_outputs: !def [~, [10, 11]]
     train:
-        lr: 1.0e-4
+        lr: 1.0e-05
         weight_decay: 5.0e-2
         start_epoch: 0
         n_epochs: 120
@@ -1054,15 +1181,19 @@ def tubefeats_dist_train_mlp(workfolder, cfg_dict, add_args):
         i_epoch:
             loss_log: '0::1'
             q_eval: '::'
-            full_eval: '0::1'
+            full_eval: '0,1,2,3,4::5'
+    eval:
+        full_tubes:
+            enabled: True
+            detect_mode: !def ['roipooled', ['fullframe', 'roipooled']]
+            nms: 0.3
+            field_nms: 'box_det_score'  # hscore
+            field_det: 'box_det_score'  # hscore*frame_cls_score
     """)
     cf = cfg.parse()
-
     # Seeds
     initial_seed = cf['seed']
     torch.manual_seed(initial_seed)
-    rgen = np.random.default_rng(initial_seed)
-
     # Data
     # General DALY level preparation
     dataset = Ncfg_daly.get_dataset(cf)
@@ -1073,6 +1204,8 @@ def tubefeats_dist_train_mlp(workfolder, cfg_dict, add_args):
     # wein tubes
     tubes_dwein_d, tubes_dgt_d = load_gt_and_wein_tubes(
             cf['inputs.tubes_dwein'], dataset, vgroup)
+    tubes_dwein_prov: Dict[I_dwein, Tube_daly_wein_as_provided] = \
+            small.load_pkl(cf['inputs.tubes_dwein'])
 
     # synthetic tube labels
     _, dwti_to_label_eval = qload_synthetic_tube_labels(
@@ -1087,14 +1220,49 @@ def tubefeats_dist_train_mlp(workfolder, cfg_dict, add_args):
     tubes_dgt_eval = tubes_dgt_d[sset_eval]
 
     # Interacting with big
-    man_bigv2 = Manager_loader_big_v2(cf['inputs.big.fold'], scaler,
-            cf['train.tubes.stride'],
-            cf['train.tubes.top_n_matches'],
-            dataset, tubes_dwein_train, tubes_dgt_train, tkfeats_train)
+    assert cf['eval.full_tubes.enabled'], 'We train on them anyway'
+    top_n_matches = cf['train.tubes.top_n_matches']
+    stride = cf['train.tubes.stride']
+    detect_mode = cf['inputs.tubes_dwein_feats.kind']
+    man_feats_dwt = _create_preextracted_feats_manager(
+            cf, scaler, detect_mode)
+
+    max_distance = cf['train.tubes.frame_dist']
+    output_dims = cf['net.n_outputs']
+
+    if detect_mode == 'fullframe':
+        # fullframes
+        labeled_frames: List[Frame_labeled] = \
+            prepare_label_fullframes_for_training(
+                tubes_dgt_train, dataset, stride, max_distance)
+        # associate to extracted feats
+        labeled_linked_frames: List[Frame_labeled] = \
+            _link_lframes_to_exfeats(labeled_frames, man_feats_dwt)
+        tdataset = TDataset_over_labeled_linked_frames(
+                labeled_linked_frames, man_feats_dwt)
+        assert output_dims == 10
+        D_in = man_feats_dwt.fullframe_feats.shape[-1]
+    elif detect_mode == 'roipooled':
+        # roitubes
+        keyframes_train = tkfeats_train['kf']
+        keyframe_feats_train = tkfeats_train['X'].numpy()
+        labeled_boxes: List[Box_labeled] = \
+          prepare_label_roiboxes_for_training(
+            tubes_dgt_train, dataset, stride, max_distance,
+            tubes_dwein_train, keyframes_train, top_n_matches,
+            cf['train.tubes.add_keyframes'])
+        # associate roiboxes to extracted feats
+        labeled_linked_boxes: List[Box_labeled_linked] = \
+                _link_lboxes_to_exfeats(labeled_boxes, man_feats_dwt)
+        tdataset = TDataset_over_labeled_linked_boxes(
+            labeled_linked_boxes, man_feats_dwt, keyframe_feats_train)
+        assert output_dims == 11
+        D_in = man_feats_dwt.BIG.shape[-1]
+    else:
+        raise RuntimeError()
 
     # Model
-    D_in = man_bigv2.BIG.shape[-1]
-    model = define_mlp_model(cf, D_in, 11)
+    model = define_mlp_model(cf, D_in, output_dims)
     loss_fn = torch.nn.CrossEntropyLoss(reduction='mean')
     optimizer = torch.optim.AdamW(model.parameters(),
             lr=cf['train.lr'], weight_decay=cf['train.weight_decay'])
@@ -1114,13 +1282,13 @@ def tubefeats_dist_train_mlp(workfolder, cfg_dict, add_args):
     n_epochs = cf['train.n_epochs']
     for i_epoch in range(start_epoch, n_epochs):
         log.info(f'Started epoch {i_epoch=}')
-        loader = man_bigv2.get_train_loader(
-            cf['train.batch_size'], rgen,
-            cf['train.tubes.frame_dist'],
-            cf['train.tubes.add_keyframes'])
         model.train()
         l_avg = snippets.misc.Averager()
         avg_bs = snippets.misc.Averager()
+        # Loader reproducible even if we restore
+        rgen = np.random.default_rng(initial_seed+i_epoch)
+        loader = _get_trainloader_rnd_sampler(tdataset,
+                cf['train.batch_size'], rgen)
         for i_batch, (data_input) in enumerate(loader):
             # inputs converter
             (meta,) = data_input
@@ -1160,10 +1328,20 @@ def tubefeats_dist_train_mlp(workfolder, cfg_dict, add_args):
                     f'{kacc_train=:.2f} {kacc_eval=:.2f}')
         if check_step(i_epoch, cf['period.i_epoch.full_eval']):
             model.eval()
-            evalset_result = mlp_perf_evaluate(
-                    model, man_bigv2, tkfeats_train, tkfeats_eval,
-                    tubes_dwein_eval, tubes_dgt_eval, dataset,
-                    dwti_to_label_eval, 11, True)
+            result = mlp_perf_kf_evaluate(
+                    model, tkfeats_train, tkfeats_eval,
+                    tubes_dwein_eval, tubes_dgt_eval,
+                    dataset, output_dims)
+            result_fulltube = mlp_perf_fulltube_evaluate(
+                    model, man_feats_dwt,
+                    tubes_dwein_eval, tubes_dwein_prov,
+                    tubes_dgt_eval, dwti_to_label_eval,
+                    dataset, output_dims,
+                    cf['eval.full_tubes.detect_mode'],
+                    cf['eval.full_tubes.nms'],
+                    cf['eval.full_tubes.field_nms'],
+                    cf['eval.full_tubes.field_det'])
+            result.update(result_fulltube)
             model.train()
             log.info(f'Evalset perf at {i_epoch=}')
-            mlp_perf_display(evalset_result, sset_eval)
+            mlp_perf_display(result, sset_eval)
