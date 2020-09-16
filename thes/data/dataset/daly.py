@@ -1,4 +1,5 @@
 import numpy as np
+import logging
 from typing import (  # NOQA
     Dict, Any, List, Optional, Tuple, TypedDict, Set)
 
@@ -10,6 +11,27 @@ from thes.data.tubes.types import (
     I_dwein, T_dwein, T_dwein_scored, I_dgt, T_dgt,
     get_daly_gt_tubes, remove_hard_dgt_tubes,
     loadconvert_tubes_dwein, dtindex_filter_split)
+from thes.data.tubes.routines import (
+    get_dwein_overlaps_per_dgt,
+    select_fg_bg_tubes,
+)
+
+log = logging.getLogger(__name__)
+
+
+class Frame_labeled(TypedDict):
+    vid: Vid_daly
+    frame_ind: int
+    label: int
+
+
+class Box_labeled(TypedDict):
+    vid: Vid_daly
+    frame_ind: int
+    box: np.ndarray  # LTRD, absolute scale
+    label: int
+    dwti: Optional[I_dwein]
+    kfi: Optional[int]
 
 
 class Ncfg_daly:
@@ -218,3 +240,113 @@ def group_dwein_frames_wrt_kf_distance(
             dist_boxes.setdefault(dist, []).append(metabox)
     dist_boxes = dict(sorted(list(dist_boxes.items())))
     return dist_boxes
+
+
+def prepare_label_fullframes_for_training(
+        tubes_dgt_train, dataset,
+        stride: int, max_distance: int
+        ) -> List[Frame_labeled]:
+    # Frames which we consider for this experiment
+    # (universal, present in every experiment)
+    vids_good_nums: Dict[Vid_daly, np.ndarray] = \
+            sample_daly_frames_from_instances(dataset, stride=stride)
+    # Retrieve frames from GT tubes
+    dist_frames: Dict[int, List[Dict]] = {}
+    for dgti, tube_dgt in tubes_dgt_train.items():
+        vid, action_name, _ = dgti
+        label = dataset.action_names.index(action_name)
+        good_nums = vids_good_nums[vid]
+        kf_nums = tube_dgt['frame_inds']
+        # Distance matrix
+        M = np.zeros((len(kf_nums), len(good_nums)), dtype=np.int)
+        for i, kf in enumerate(kf_nums):
+            M[i] = np.abs(good_nums-kf)
+        best_dist = M.min(axis=0)
+        # Disperse boxes per dist
+        for f0, dist in zip(good_nums, best_dist):
+            metaframe = {
+                'frame_ind': f0, 'dwti': dgti, 'label': label}
+            dist_frames.setdefault(dist, []).append(metaframe)
+    dist_frames = dict(sorted(list(dist_frames.items())))
+    # Take only proper distance, rearrange into (vid,frame_ind)
+    labeled_frames: List[Frame_labeled] = []
+    for i, frames_ in dist_frames.items():
+        if i > max_distance:
+            break
+        for frame_ in frames_:
+            lframe: Frame_labeled = {
+                    'vid': frame_['dwti'][0],
+                    'frame_ind': frame_['frame_ind'],
+                    'label': frame_['label']}
+            labeled_frames.append(lframe)
+    # Group into frame_groups
+    frame_groups: Dict[Tuple[Vid_daly, int], List[Frame_labeled]] = {}
+    for lframe in labeled_frames:
+        vid = lframe['vid']
+        frame_ind = lframe['frame_ind']
+        frame_groups.setdefault((vid, frame_ind), []).append(lframe)
+    # Exclude frames with >1 box from training
+    singular_labeled_frames: List[Frame_labeled] = []
+    for vf, lframes in frame_groups.items():
+        if len(lframes) == 1:
+            singular_labeled_frames.append(lframes[0])
+    return singular_labeled_frames
+
+
+def prepare_label_roiboxes_for_training(
+        tubes_dgt_train, dataset,
+        stride: int, max_distance: int,
+        tubes_dwein_train, keyframes_train, top_n_matches: int,
+        add_keyframes=True
+        ) -> List[Box_labeled]:
+    # ROI box extract
+    matched_dwts: Dict[I_dgt, Dict[I_dwein, float]] = \
+        get_dwein_overlaps_per_dgt(tubes_dgt_train, tubes_dwein_train)
+    fg_meta, bg_meta = select_fg_bg_tubes(matched_dwts, top_n_matches)
+    log.info('Selected {} FG and {} BG tubes from a total of {}'.format(
+        len(fg_meta), len(bg_meta), len(tubes_dwein_train)))
+    # Merge fg/bg
+    tube_metas = {}
+    tube_metas.update(fg_meta)
+    tube_metas.update(bg_meta)
+    # Break into frames, sort by distance
+    dist_boxes_train: Dict[int, List[Dict]] = \
+        group_dwein_frames_wrt_kf_distance(
+            dataset, stride, tubes_dwein_train, tube_metas)
+    # Special
+    lbox: Box_labeled
+    labeled_boxes: List[Box_labeled] = []
+    for i, boxes in dist_boxes_train.items():
+        if i > max_distance:
+            break
+        for box in boxes:
+            (vid, bunch_id, tube_id) = box['dwti']
+            if box['kind'] == 'fg':
+                (vid, action_name, ins_id) = box['dgti']
+                label = dataset.action_names.index(action_name)
+            else:
+                label = len(dataset.action_names)
+            lbox = {
+                'vid': vid,
+                'frame_ind': box['frame_ind'],
+                'box': box['box'],
+                'label': label,
+                'dwti': box['dwti'],
+                'kfi': None
+            }
+            labeled_boxes.append(lbox)
+    if add_keyframes:
+        # Merge keyframes too
+        for kfi, kf in enumerate(keyframes_train):
+            action_name = kf['action_name']
+            label = dataset.action_names.index(action_name)
+            lbox = {
+                'vid': kf['vid'],
+                'frame_ind': kf['frame0'],
+                'box': kf['bbox'],
+                'label': label,
+                'dwti': None,
+                'kfi': kfi,
+            }
+            labeled_boxes.append(lbox)
+    return labeled_boxes
