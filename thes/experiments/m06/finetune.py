@@ -37,7 +37,11 @@ from thes.data.dataset.external import (
 from thes.data.dataset.daly import (
     Ncfg_daly, sample_daly_frames_from_instances,
     load_gt_and_wein_tubes, create_keyframelist,
-    to_keyframedict, group_dwein_frames_wrt_kf_distance)
+    to_keyframedict, group_dwein_frames_wrt_kf_distance,
+    Frame_labeled, Box_labeled,
+    prepare_label_fullframes_for_training,
+    prepare_label_roiboxes_for_training
+)
 
 from thes.data.tubes.types import (  # NOQA
     Box_connections_dwti, I_dwein, T_dwein,
@@ -777,6 +781,92 @@ class Manager_loader_krgb(object):
         return frame_list_f32c, bboxes0_c, labels_c
 
 
+def vis_frameload():
+    pass
+    # Y = (imgs[0].transpose([1, 2, 0])*255).clip(0, 255).astype(np.uint8)
+
+    # Y = imgs[0].numpy().transpose([1, 2, 0])*data_std+data_mean
+
+    # Y = imgs[0].astype(np.uint8)
+
+    # Y = imgs[:, 0].numpy().transpose([1, 2, 0])*data_std+data_mean
+    # Y = (Y*255).clip(0, 255).astype(np.uint8)[..., ::-1]
+
+    # Yo = fl_u8_bgr[0]
+    # cv2.imshow("test_o", Yo)
+    # cv2.imshow("test", Y)
+    # cv2.waitKey(0)
+    # cv2.destroyAllWindows()
+
+    # actnames = self.dataset.action_names + ['background']
+    # Y = imgs[:, 0].numpy().transpose([1, 2, 0])*data_std+data_mean
+    # Y = (Y*255).clip(0, 255).astype(np.uint8)[..., ::-1]
+    # Y = np.ascontiguousarray(Y)
+    # for i, box_ltrd in enumerate(boxes):
+    #     label = actnames[labels[i]]
+    #     snippets.misc.cv_put_box_with_text(
+    #             Y, box_ltrd, text=label)
+    # Yo = fl_u8_bgr[0].copy()
+    # for i, box_ltrd in enumerate(orig_boxes_ltrd):
+    #     label = actnames[labels[i]]
+    #     snippets.misc.cv_put_box_with_text(
+    #             Yo, box_ltrd, text=label)
+    # cv2.imshow("test", Y)
+    # cv2.imshow("test_orig", Yo)
+    # cv2.waitKey(0)
+    # cv2.destroyAllWindows()
+
+
+class TDataset_over_lframes(torch.utils.data.Dataset):
+    def __init__(self, cf, cn,
+            labeled_frames: List[Frame_labeled], dataset):
+        self.labeled_frames = labeled_frames
+        self.dataset = dataset
+
+        # Temporal sampling
+        model_nframes = cn.DATA.NUM_FRAMES
+        model_sample = cn.DATA.SAMPLING_RATE
+        self.sampler_grid = Sampler_grid(model_nframes, model_sample)
+
+        self.cn = cn
+        self._is_slowfast = False
+
+        # Enable augmentations
+        self.augment_scale = cf['train.augment.scale']
+        self.augment_hflip = cf['train.augment.hflip']
+
+    def __len__(self):
+        return len(self.labeled_frames)
+
+    def __getitem__(self, index):
+        labeled_frame: Frame_labeled = self.labeled_frames[index]
+        vid = labeled_frame['vid']
+        i0 = labeled_frame['frame_ind']
+        label = labeled_frame['label']
+
+        video_path = str(self.dataset.videos_ocv[vid]['path'])
+
+        # Construct labels
+        # Sampling frames themselves
+        nframes = self.dataset.videos_ocv[vid]['nframes']
+        finds_to_sample = self.sampler_grid.apply(i0, nframes)
+        with vt_cv.video_capture_open(video_path) as vcap:
+            fl_u8_bgr = vt_cv.video_sample(vcap, finds_to_sample)
+
+        imgs = _data_augment_nobox(
+                self.cn, self.augment_scale, self.augment_hflip, fl_u8_bgr)
+
+        # Pack pathways
+        packed_imgs = pack_pathway_output(imgs,
+                self._is_slowfast, self.cn.SLOWFAST.ALPHA)
+
+        meta = {
+            'index': index,
+            'label': label,
+            'do_not_collate': True}
+        return (packed_imgs, meta)
+
+
 class TDataset_over_fgroups(torch.utils.data.Dataset):
     def __init__(self, cf, cn, frame_groups, dataset):
         self.frame_groups = frame_groups
@@ -790,13 +880,10 @@ class TDataset_over_fgroups(torch.utils.data.Dataset):
 
         self.cn = cn
         self._is_slowfast = False
-        self._slowfast_alpha = cn.SLOWFAST.ALPHA
-        self._test_crop_size = 256
 
         # Enable augmentations
         self.augment_scale = cf['train.augment.scale']
         self.augment_hflip = cf['train.augment.hflip']
-        self.augment_color = cf['train.augment.color']
 
     def __len__(self):
         return len(self.frame_groups)
@@ -810,145 +897,26 @@ class TDataset_over_fgroups(torch.utils.data.Dataset):
 
         video_path = str(self.dataset.videos_ocv[vid]['path'])
 
+        # Construct labels
+        labels = np.array([f['label'] for f in frame_group])
         # Sampling frames themselves
         nframes = self.dataset.videos_ocv[vid]['nframes']
         finds_to_sample = self.sampler_grid.apply(i0, nframes)
         with vt_cv.video_capture_open(video_path) as vcap:
             fl_u8_bgr = vt_cv.video_sample(vcap, finds_to_sample)
-        # # Flip to RGB
-        # fl_u8 = [np.flip(x, -1) for x in fl_u8_bgr]
-        # Video is in HWC, BGR format
-        # Boxes should be in LTRD format
-
-        # I am following slowfast/datasets/ava_dataset.py
-        # (_images_and_boxes_preprocessing_cv2)
-
-        boxes_ltrd = np.vstack([f['box']
-            for f in frame_group])
+        # Sampling boxes
+        boxes_ltrd = np.vstack([f['box'] for f in frame_group])
         orig_boxes_ltrd = boxes_ltrd.copy()
 
-        jmin, jmax = self.cn.DATA.TRAIN_JITTER_SCALES
-        data_mean = self.cn.DATA.MEAN
-        data_std = self.cn.DATA.STD
-
-        imgs, boxes = fl_u8_bgr, [boxes_ltrd]
-        height, width, _ = imgs[0].shape
-
-        if self.augment_scale:
-            crop_size = self.cn.DATA.TRAIN_CROP_SIZE
-            imgs, boxes = sf_cv2_transform.random_short_side_scale_jitter_list(
-                    imgs, min_size=jmin, max_size=jmax, boxes=boxes)
-            imgs, boxes = sf_cv2_transform.random_crop_list(
-                    imgs, crop_size, order="HWC", boxes=boxes)
-        else:
-            crop_size = self.cn.DATA.TEST_CROP_SIZE
-            imgs = [sf_cv2_transform.scale(
-                crop_size, img) for img in imgs]
-            boxes = [
-                sf_cv2_transform.scale_boxes(
-                    crop_size, boxes[0], height, width
-                )
-            ]
-            # Centercrop basically
-            imgs, boxes = sf_cv2_transform.spatial_shift_crop_list(
-                crop_size, imgs, 1, boxes=boxes
-            )
-
-        if self.augment_hflip:
-            imgs, boxes = sf_cv2_transform.horizontal_flip_list(
-                0.5, imgs, order="HWC", boxes=boxes)
-
-        # Convert image to CHW keeping BGR order.
-        imgs = [sf_cv2_transform.HWC2CHW(img) for img in imgs]
-        # Image [0, 255] -> [0, 1].
-        imgs = [img / 255.0 for img in imgs]
-        imgs = [
-            np.ascontiguousarray(
-                img.reshape((3, imgs[0].shape[1], imgs[0].shape[2]))
-            ).astype(np.float32)
-            for img in imgs
-        ]
-
-        if self.augment_color:
-            pca_eigval = self.cn.AVA.TRAIN_PCA_EIGVAL
-            pca_eigvec = self.cn.AVA.TRAIN_PCA_EIGVEC
-            imgs = sf_cv2_transform.color_jitter_list(
-                imgs,
-                img_brightness=0.4,
-                img_contrast=0.4,
-                img_saturation=0.4,
-            )
-
-            imgs = sf_cv2_transform.lighting_list(
-                imgs,
-                alphastd=0.1,
-                eigval=np.array(pca_eigval).astype(np.float32),
-                eigvec=np.array(pca_eigvec).astype(np.float32),
-            )
-
-        # Normalize now
-        imgs = [
-            sf_cv2_transform.color_normalization(
-                img,
-                np.array(data_mean, dtype=np.float32),
-                np.array(data_std, dtype=np.float32),
-            )
-            for img in imgs
-        ]
-
-        # Concat list of images to single ndarray.
-        imgs = np.concatenate(
-            [np.expand_dims(img, axis=1) for img in imgs], axis=1
+        imgs, boxes = _data_augment_with_box(
+            self.cn, self.augment_scale,
+            self.augment_hflip,
+            fl_u8_bgr, boxes_ltrd,
         )
-
-        # To RGB
-        imgs = imgs[::-1, ...]
-
-        imgs = np.ascontiguousarray(imgs)
-        imgs = torch.from_numpy(imgs)
-        boxes = sf_cv2_transform.clip_boxes_to_image(
-            boxes[0], imgs[0].shape[1], imgs[0].shape[2]
-        )
-
-        # Construct labels
-        labels = np.array([f['label'] for f in frame_group])
-
-        # Y = (imgs[0].transpose([1, 2, 0])*255).clip(0, 255).astype(np.uint8)
-
-        # Y = imgs[0].numpy().transpose([1, 2, 0])*data_std+data_mean
-
-        # Y = imgs[0].astype(np.uint8)
-
-        # Y = imgs[:, 0].numpy().transpose([1, 2, 0])*data_std+data_mean
-        # Y = (Y*255).clip(0, 255).astype(np.uint8)[..., ::-1]
-
-        # Yo = fl_u8_bgr[0]
-        # cv2.imshow("test_o", Yo)
-        # cv2.imshow("test", Y)
-        # cv2.waitKey(0)
-        # cv2.destroyAllWindows()
-
-        # actnames = self.dataset.action_names + ['background']
-        # Y = imgs[:, 0].numpy().transpose([1, 2, 0])*data_std+data_mean
-        # Y = (Y*255).clip(0, 255).astype(np.uint8)[..., ::-1]
-        # Y = np.ascontiguousarray(Y)
-        # for i, box_ltrd in enumerate(boxes):
-        #     label = actnames[labels[i]]
-        #     snippets.misc.cv_put_box_with_text(
-        #             Y, box_ltrd, text=label)
-        # Yo = fl_u8_bgr[0].copy()
-        # for i, box_ltrd in enumerate(orig_boxes_ltrd):
-        #     label = actnames[labels[i]]
-        #     snippets.misc.cv_put_box_with_text(
-        #             Yo, box_ltrd, text=label)
-        # cv2.imshow("test", Y)
-        # cv2.imshow("test_orig", Yo)
-        # cv2.waitKey(0)
-        # cv2.destroyAllWindows()
 
         # Pack pathways
         packed_imgs = pack_pathway_output(imgs,
-                self._is_slowfast, self._slowfast_alpha)
+                self._is_slowfast, self.cn.SLOWFAST.ALPHA)
 
         meta = {
             'labels': labels,
@@ -1292,8 +1260,7 @@ def _preset_defaults(cfg):
         tubes_dwein: ~
         keyframes_rgb: ~
         ckpt: ~
-    split_assignment: !def ['train/val',
-        ['train/val', 'trainval/test']]
+    split_assignment: !def ['train/val', ['train/val', 'trainval/test']]
     freeze:
         level: -1
         freeze_bn: False
@@ -1587,6 +1554,197 @@ def full_tube_full_frame_perf_eval(
     log.info('AP (full tubes):\n{}'.format(_df_ap_full))
     log.info('Full tube AP357: {}'.format(_apline))
 
+# interacting with data
+def _data_imgs_postprocess(imgs, cn):
+    # Convert image to CHW keeping BGR order.
+    imgs = [sf_cv2_transform.HWC2CHW(img) for img in imgs]
+    # Image [0, 255] -> [0, 1].
+    imgs = [img / 255.0 for img in imgs]
+    imgs = [
+        np.ascontiguousarray(
+            img.reshape((3, imgs[0].shape[1], imgs[0].shape[2]))
+        ).astype(np.float32)
+        for img in imgs
+    ]
+
+    # Normalize now
+    data_mean = cn.DATA.MEAN
+    data_std = cn.DATA.STD
+    imgs = [
+        sf_cv2_transform.color_normalization(
+            img,
+            np.array(data_mean, dtype=np.float32),
+            np.array(data_std, dtype=np.float32),
+        )
+        for img in imgs
+    ]
+
+    # Concat list of images to single ndarray.
+    imgs = np.concatenate(
+        [np.expand_dims(img, axis=1) for img in imgs], axis=1
+    )
+
+    # To RGB
+    imgs = imgs[::-1, ...]
+
+    imgs = np.ascontiguousarray(imgs)
+    imgs = torch.from_numpy(imgs)
+    return imgs
+
+
+def _data_augment_with_box(
+        cn, augment_scale, augment_hflip,
+        fl_u8_bgr, boxes_ltrd):
+
+    # # Flip to RGB
+    # fl_u8 = [np.flip(x, -1) for x in fl_u8_bgr]
+    # Video is in HWC, BGR format
+    # Boxes should be in LTRD format
+
+    # I am following slowfast/datasets/ava_dataset.py
+    # (_images_and_boxes_preprocessing_cv2)
+
+    imgs, boxes = fl_u8_bgr, [boxes_ltrd]
+    height, width, _ = imgs[0].shape
+
+    jmin, jmax = cn.DATA.TRAIN_JITTER_SCALES
+    crop_size = cn.DATA.TRAIN_CROP_SIZE
+    if augment_scale:
+        imgs, boxes = sf_cv2_transform.random_short_side_scale_jitter_list(
+                imgs, min_size=jmin, max_size=jmax, boxes=boxes)
+        imgs, boxes = sf_cv2_transform.random_crop_list(
+                imgs, crop_size, order="HWC", boxes=boxes)
+    else:
+        # Centercrop
+        imgs = [sf_cv2_transform.scale(crop_size, img) for img in imgs]
+        boxes = [sf_cv2_transform.scale_boxes(
+                crop_size, boxes[0], height, width)]
+        imgs, boxes = sf_cv2_transform.spatial_shift_crop_list(
+            crop_size, imgs, 1, boxes=boxes)
+
+    if augment_hflip:
+        imgs, boxes = sf_cv2_transform.horizontal_flip_list(
+            0.5, imgs, order="HWC", boxes=boxes)
+
+    imgs = _data_imgs_postprocess(imgs, cn)
+    boxes = sf_cv2_transform.clip_boxes_to_image(
+        boxes[0], imgs[0].shape[1], imgs[0].shape[2]
+    )
+    return imgs, boxes
+
+
+def _data_augment_nobox(
+        cn, augment_scale, augment_hflip,
+        fl_u8_bgr):
+
+    imgs = fl_u8_bgr
+    height, width, _ = imgs[0].shape
+
+    jmin, jmax = cn.DATA.TRAIN_JITTER_SCALES
+    crop_size = cn.DATA.TRAIN_CROP_SIZE
+
+    if augment_scale:
+        imgs, _ = sf_cv2_transform.random_short_side_scale_jitter_list(
+                imgs, min_size=jmin, max_size=jmax)
+        imgs, _ = sf_cv2_transform.random_crop_list(
+                imgs, crop_size, order="HWC")
+    else:
+        imgs = [sf_cv2_transform.scale(crop_size, img) for img in imgs]
+        imgs, _ = sf_cv2_transform.spatial_shift_crop_list(
+            crop_size, imgs, 1)
+
+    if augment_hflip:
+        imgs, _ = sf_cv2_transform.horizontal_flip_list(
+            0.5, imgs, order="HWC")
+    imgs = _data_imgs_postprocess(imgs, cn)
+    return imgs
+
+
+# Labeled frames
+
+
+def _prepare_permute_lframes(
+        cf, cn, dataset, batch_size_train,
+        labeled_frames: List[Frame_labeled],
+        ts_rgen,
+        ):
+    # Permute
+    order = ts_rgen.permutation(len(labeled_frames))
+    labeled_frames_permuted = [labeled_frames[i] for i in order]
+    # Dataset over permuted frame groups
+    tdataset = TDataset_over_lframes(cf, cn, labeled_frames_permuted, dataset)
+    # Perform batching ourselves
+    idx_batches = snippets.misc.leqn_split(np.arange(
+        len(labeled_frames_permuted)), batch_size_train, 'sharp')
+    return tdataset, idx_batches
+
+
+def _lframes_forward(data_input, model_wf):
+    frame_list, metas, = data_input
+
+    labels_np = np.array([m['label'] for m in metas])
+    labels_t = torch.from_numpy(labels_np)
+    labels_c = labels_t.cuda()
+
+    inputs = [x.type(torch.cuda.FloatTensor) for x in frame_list]
+
+    result = model_wf.model(inputs, None)
+    preds = result['x_final']
+    return labels_c, preds
+
+
+# Labeled boxes
+
+
+def _prepare_permute_lboxes(
+        cf, cn, dataset, batch_size_train,
+        labeled_boxes: List[Box_labeled],
+        ts_rgen,
+        ):
+    # Group into frame_groups
+    frame_groups: Dict[Tuple[Vid_daly, int], List[Box_labeled]] = {}
+    for lbox in labeled_boxes:
+        vid = lbox['vid']
+        frame_ind = lbox['frame_ind']
+        frame_groups.setdefault((vid, frame_ind), []).append(lbox)
+    # Permute
+    fg_list = list(frame_groups.items())
+    fg_order = ts_rgen.permutation(len(fg_list))
+    fg_list = [fg_list[i] for i in fg_order]
+    frame_groups_permuted = dict(fg_list)
+    # Dataset over permuted frame groups
+    tdataset = TDataset_over_fgroups(cf, cn, frame_groups_permuted, dataset)
+    # Perform batching ourselves
+    idx_batches = snippets.misc.leqn_split(np.arange(
+        len(frame_groups_permuted)), batch_size_train, 'sharp')
+    return tdataset, idx_batches
+
+def _lboxes_forward(data_input, model_wf):
+    # preprocess data, transfer to GPU
+    frame_list, metas, = data_input
+
+    # bbox transformations
+    bboxes_np = [m['bboxes'] for m in metas]
+    counts = np.array([len(x) for x in bboxes_np])
+    batch_indices = np.repeat(np.arange(len(counts)), counts)
+    bboxes0 = np.c_[batch_indices, np.vstack(bboxes_np)]
+    bboxes0 = torch.from_numpy(bboxes0)
+    bboxes0_c = bboxes0.type(torch.cuda.FloatTensor)
+
+    # labels
+    labels_np = [m['labels'] for m in metas]
+    labels_np = np.hstack(labels_np)
+    labels_t = torch.from_numpy(labels_np)
+    labels_c = labels_t.cuda()
+
+    inputs = [x.type(torch.cuda.FloatTensor) for x in frame_list]
+    boxes = bboxes0_c
+    labels = labels_c
+
+    result = model_wf.model(inputs, boxes)
+    preds = result['x_final']
+    return labels, preds
+
 # EXPERIMENTS
 
 def finetune_preextracted_krgb(workfolder, cfg_dict, add_args):
@@ -1723,7 +1881,7 @@ def finetune_preextracted_krgb(workfolder, cfg_dict, add_args):
             dataset, man_lkrgb.preprocess_data, cut_off_bg=CUT_OFF_BG)
 
 
-def finetune_on_tubefeats(workfolder, cfg_dict, add_args):
+def finetune(workfolder, cfg_dict, add_args):
     """
     Will finetune the c2d_1x1 model directly on video frames
     """
@@ -1733,6 +1891,7 @@ def finetune_on_tubefeats(workfolder, cfg_dict, add_args):
     Ncfg_daly.set_defcfg_v2(cfg)
     _preset_defaults(cfg)
     cfg.set_defaults_yaml("""
+    detect_mode: !def ['roipooled', ['fullframe', 'roipooled']]
     """)
     cf = cfg.parse()
     cn = _config_preparations(cfg.without_prefix('CN.'))
@@ -1756,11 +1915,41 @@ def finetune_on_tubefeats(workfolder, cfg_dict, add_args):
     norm_mean_cu = np_to_gpu(cn.DATA.MEAN)
     norm_std_cu = np_to_gpu(cn.DATA.STD)
     # Sset
+    tubes_dwein_train = tubes_dwein_d[sset_train]
+    tubes_dgt_train = tubes_dgt_d[sset_train]
     tubes_dwein_eval = tubes_dwein_d[sset_eval]
     tubes_dgt_eval = tubes_dgt_d[sset_eval]
 
+    detect_mode = cf['detect_mode']
+    stride = cf['train.tubes.stride']
+    top_n_matches = cf['train.tubes.top_n_matches']
+    max_distance = cf['train.tubes.frame_dist']
+    batch_size_train = cf['train.batch_size.train']
+
+    if detect_mode == 'fullframe':
+        labeled_frames: List[Frame_labeled] = \
+            prepare_label_fullframes_for_training(
+                tubes_dgt_train, dataset, stride, max_distance)
+        output_dims = 10
+        model_wf = Model_w_freezer_fullframe(cf, cn, output_dims)
+    elif detect_mode == 'roipooled':
+        add_keyframes = cf['train.tubes.add_keyframes']
+        keyframes = create_keyframelist(dataset)
+        keyframes_train = [kf for kf in keyframes
+                if kf['vid'] in vgroup[sset_train]]
+        labeled_boxes: List[Box_labeled] = \
+          prepare_label_roiboxes_for_training(
+            tubes_dgt_train, dataset, stride, max_distance,
+            tubes_dwein_train, keyframes_train, top_n_matches,
+            add_keyframes)
+        output_dims = 11
+        model_wf = Model_w_freezer(cf, cn, output_dims)
+    else:
+        raise RuntimeError()
+
+    cut_off_bg = output_dims == 11
+
     # Model
-    model_wf = Model_w_freezer(cf, cn, 11)
     optimizer = tsf_optim.construct_optimizer(model_wf.model, cn)
     loss_fn = torch.nn.CrossEntropyLoss(reduction='mean')
     model_wf.model.init_weights(0.01)
@@ -1771,18 +1960,6 @@ def finetune_on_tubefeats(workfolder, cfg_dict, add_args):
     man_lkrgb = Manager_loader_krgb(
             cf['inputs.keyframes_rgb'], dataset,
             norm_mean_cu, norm_std_cu)
-
-    keyframes = create_keyframelist(dataset)
-    keyframes_train = [kf for kf in keyframes
-            if kf['vid'] in vgroup[sset_train]]
-
-    manli = Manager_loader_boxcons_improved(
-        tubes_dgt_d, tubes_dwein_d,
-        sset_train, dataset, cn,
-        keyframes_train,
-        cf['train.tubes.stride'],
-        cf['train.tubes.top_n_matches'],
-        norm_mean_cu, norm_std_cu)
 
     eval_krgb_loader, eval_krgb_keyframes = man_lkrgb.get_eval_loader(
         vgroup[sset_eval], cf['train.batch_size.eval'])
@@ -1800,8 +1977,6 @@ def finetune_on_tubefeats(workfolder, cfg_dict, add_args):
             cf['inputs.ckpt'], cf['train.start_epoch'])
 
     batch_size_train = cf['train.batch_size.train']
-    frame_dist = cf['train.tubes.frame_dist']
-    add_keyframes = cf['train.tubes.add_keyframes']
     NUM_WORKERS = cf['train.num_workers']
     # Training
     for i_epoch in range(start_epoch, max_epoch):
@@ -1815,20 +1990,14 @@ def finetune_on_tubefeats(workfolder, cfg_dict, add_args):
         torch.cuda.manual_seed(initial_seed+i_epoch)
         ts_rgen = np.random.default_rng(initial_seed+i_epoch)
 
-        labeled_boxes = manli.get_labeled_boxes(
-               frame_dist, add_keyframes)
-        frame_groups = manli.get_frame_groups(
-                labeled_boxes)
-        # Permute
-        fg_list = list(frame_groups.items())
-        fg_order = ts_rgen.permutation(len(fg_list))
-        fg_list = [fg_list[i] for i in fg_order]
-        frame_groups_permuted = dict(fg_list)
-        # Dataset over permuted frame groups
-        td = TDataset_over_fgroups(cf, cn, frame_groups_permuted, manli.dataset)
-        # Perform batching ourselves
-        idx_batches = snippets.misc.leqn_split(np.arange(
-            len(frame_groups_permuted)), batch_size_train, 'sharp')
+        if detect_mode == 'fullframe':
+            tdataset, idx_batches = _prepare_permute_lframes(
+                cf, cn, dataset, batch_size_train, labeled_frames, ts_rgen)
+        elif detect_mode == 'roipooled':
+            tdataset, idx_batches = _prepare_permute_lboxes(
+                cf, cn, dataset, batch_size_train, labeled_boxes, ts_rgen)
+        else:
+            raise RuntimeError()
 
         wavg_loss = snippets.misc.WindowAverager(10)
 
@@ -1836,7 +2005,7 @@ def finetune_on_tubefeats(workfolder, cfg_dict, add_args):
         def init_dataloader(i_start):
             remaining_idx_batches = idx_batches[i_start:]
             bsampler = BSampler_prepared(remaining_idx_batches)
-            train_loader = torch.utils.data.DataLoader(td,
+            train_loader = torch.utils.data.DataLoader(tdataset,
                 batch_sampler=bsampler,
                 num_workers=NUM_WORKERS,
                 collate_fn=sequence_batch_collate_v2)
@@ -1844,34 +2013,17 @@ def finetune_on_tubefeats(workfolder, cfg_dict, add_args):
 
         def batch_forward(i_batch, total_batches, data_input):
             model_wf.set_train()
-            # preprocess data, transfer to GPU
-            frame_list, metas, = data_input
-
-            # bbox transformations
-            bboxes_np = [m['bboxes'] for m in metas]
-            counts = np.array([len(x) for x in bboxes_np])
-            batch_indices = np.repeat(np.arange(len(counts)), counts)
-            bboxes0 = np.c_[batch_indices, np.vstack(bboxes_np)]
-            bboxes0 = torch.from_numpy(bboxes0)
-            bboxes0_c = bboxes0.type(torch.cuda.FloatTensor)
-
-            # labels
-            labels_np = [m['labels'] for m in metas]
-            labels_np = np.hstack(labels_np)
-            labels_t = torch.from_numpy(labels_np)
-            labels_c = labels_t.cuda()
-
-            inputs = [x.type(torch.cuda.FloatTensor) for x in frame_list]
-            boxes = bboxes0_c
-            labels = labels_c
-
             # Update learning rate
             lr = tsf_optim.get_lr_at_epoch(cn,
                     i_epoch + float(i_batch) / total_batches)
             set_lr(optimizer, lr)
 
-            result = model_wf.model(inputs, boxes)
-            preds = result['x_final']
+            if detect_mode == 'fullframe':
+                labels, preds = _lframes_forward(data_input, model_wf)
+            elif detect_mode == 'roipooled':
+                labels, preds = _lboxes_forward(data_input, model_wf)
+            else:
+                raise RuntimeError()
 
             # Compute loss
             loss = loss_fn(preds, labels)
@@ -1894,7 +2046,7 @@ def finetune_on_tubefeats(workfolder, cfg_dict, add_args):
                 model_wf.set_eval()
                 _evaluate_krgb_perf(model_wf, eval_krgb_loader,
                     eval_krgb_keyframes, tubes_dwein_eval, tubes_dgt_eval,
-                    dataset, man_lkrgb.preprocess_data, cut_off_bg=True)
+                    dataset, man_lkrgb.preprocess_data, cut_off_bg=cut_off_bg)
                 model_wf.set_train()
 
         isaver = Isaver_train_epoch(
@@ -1918,7 +2070,7 @@ def finetune_on_tubefeats(workfolder, cfg_dict, add_args):
             model_wf.set_eval()
             _evaluate_krgb_perf(model_wf, eval_krgb_loader,
                 eval_krgb_keyframes, tubes_dwein_eval, tubes_dgt_eval,
-                dataset, man_lkrgb.preprocess_data, cut_off_bg=True)
+                dataset, man_lkrgb.preprocess_data, cut_off_bg=cut_off_bg)
             fqtimer.release(f'KRGB Evaluation at epoch {i_epoch}')
 
 

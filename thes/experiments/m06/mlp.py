@@ -21,7 +21,8 @@ from thes.data.dataset.daly import (
     sample_daly_frames_from_instances,
     Frame_labeled, Box_labeled,
     prepare_label_fullframes_for_training,
-    prepare_label_roiboxes_for_training)
+    prepare_label_roiboxes_for_training
+)
 from thes.data.dataset.external import (
     Dataset_daly_ocv, Vid_daly)
 
