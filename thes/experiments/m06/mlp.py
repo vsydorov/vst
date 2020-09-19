@@ -31,7 +31,8 @@ from thes.data.tubes.types import (
     Frametube_scored,
     AV_dict, Box_connections_dwti,
     Tube_daly_wein_as_provided,
-    av_stubes_above_score, push_into_avdict
+    av_stubes_above_score, push_into_avdict,
+    get_daly_gt_tubes, dtindex_filter_split
 )
 from thes.data.tubes.routines import (
     get_dwein_overlaps_per_dgt,
@@ -1224,3 +1225,105 @@ def tubefeats_dist_train_mlp(workfolder, cfg_dict, add_args):
             model.train()
             log.info(f'Evalset perf at {i_epoch=}')
             mlp_perf_display(result, sset_eval)
+
+
+def fancy_evaluate(workfolder, cfg_dict, add_args):
+    out, = snippets.get_subfolders(workfolder, ['out'])
+    cfg = snippets.YConfig_v2(cfg_dict)
+    Ncfg_daly.set_defcfg_v2(cfg)
+    Ncfg_kfeats.set_defcfg_v2(cfg)
+    cfg.set_defaults_yaml("""
+    inputs:
+        tubes_dwein: ~
+        tubes_dwein_feats:
+            fold: ~
+            kind: !def ['roipooled', ['fullframe', 'roipooled']]
+        ckpt: ~
+    seed: 42
+    split_assignment: !def ['train/val',
+        ['train/val', 'trainval/test']]
+    data_scaler: !def ['no', ['keyframes', 'no']]
+    net:
+        kind: !def ['layer1', ['layer0', 'layer1']]
+        layer1:
+            H: 32
+        ll_dropout: 0.5
+        n_outputs: !def [~, [10, 11]]
+    eval:
+        full_tubes:
+            enabled: True
+            detect_mode: !def ['roipooled', ['fullframe', 'roipooled']]
+            nms: 0.3
+            field_nms: 'box_det_score'  # hscore
+            field_det: 'box_det_score'  # hscore*frame_cls_score
+    """)
+    cf = cfg.parse()
+    # Seeds
+    initial_seed = cf['seed']
+    torch.manual_seed(initial_seed)
+    # Data
+    # General DALY level preparation
+    dataset = Ncfg_daly.get_dataset(cf)
+    vgroup = Ncfg_daly.get_vids(cf, dataset)
+    sset_train, sset_eval = cf['split_assignment'].split('/')
+    # keyframe feats
+    tkfeats_d, scaler = Ncfg_kfeats.load_scale(cf, vgroup)
+    # wein tubes
+    tubes_dwein_d, tubes_dgt_d = load_gt_and_wein_tubes(
+            cf['inputs.tubes_dwein'], dataset, vgroup)
+    tubes_dwein_prov: Dict[I_dwein, Tube_daly_wein_as_provided] = \
+            small.load_pkl(cf['inputs.tubes_dwein'])
+
+    # synthetic tube labels
+    _, dwti_to_label_eval = qload_synthetic_tube_labels(
+            tubes_dgt_d[sset_eval], tubes_dwein_d[sset_eval], dataset)
+    # Ssset
+    tkfeats_train = tkfeats_d[sset_train]
+    tkfeats_eval = tkfeats_d[sset_eval]
+    tubes_dwein_eval = tubes_dwein_d[sset_eval]
+    tubes_dgt_eval = tubes_dgt_d[sset_eval]
+    # Try hard tubes here
+    tubes_dgt_all: Dict[I_dgt, T_dgt] = get_daly_gt_tubes(dataset)
+    tubes_dgt_eval_w_hard = dtindex_filter_split(
+            tubes_dgt_all, vgroup[sset_eval])
+
+    # Interacting with big
+    assert cf['eval.full_tubes.enabled'], 'We train on them anyway'
+    detect_mode = cf['inputs.tubes_dwein_feats.kind']
+    man_feats_dwt = _create_preextracted_feats_manager(
+            cf, scaler, detect_mode)
+    output_dims = cf['net.n_outputs']
+
+    if detect_mode == 'fullframe':
+        assert output_dims == 10
+        D_in = man_feats_dwt.fullframe_feats.shape[-1]
+    elif detect_mode == 'roipooled':
+        assert output_dims == 11
+        D_in = man_feats_dwt.BIG.shape[-1]
+    else:
+        raise RuntimeError()
+
+    # Model
+    model = define_mlp_model(cf, D_in, output_dims)
+    states = torch.load(cf['inputs.ckpt'])
+    i_epoch = states['i_epoch']
+    model.load_state_dict(states['model_sdict'])
+
+    model.eval()
+    result = mlp_perf_kf_evaluate(
+            model, tkfeats_train, tkfeats_eval,
+            tubes_dwein_eval, tubes_dgt_eval_w_hard,
+            dataset, output_dims)
+    result_fulltube = mlp_perf_fulltube_evaluate(
+            model, man_feats_dwt,
+            tubes_dwein_eval, tubes_dwein_prov,
+            tubes_dgt_eval_w_hard, dwti_to_label_eval,
+            dataset, output_dims,
+            cf['eval.full_tubes.detect_mode'],
+            cf['eval.full_tubes.nms'],
+            cf['eval.full_tubes.field_nms'],
+            cf['eval.full_tubes.field_det'])
+    result.update(result_fulltube)
+    model.train()
+    log.info(f'Evalset perf at {i_epoch=}')
+    mlp_perf_display(result, sset_eval)
