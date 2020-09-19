@@ -1238,7 +1238,8 @@ def fancy_evaluate(workfolder, cfg_dict, add_args):
         tubes_dwein_feats:
             fold: ~
             kind: !def ['roipooled', ['fullframe', 'roipooled']]
-        ckpt: ~
+        roi_ckpt: ~
+        full_ckpt: ~
     seed: 42
     split_assignment: !def ['train/val',
         ['train/val', 'trainval/test']]
@@ -1282,10 +1283,6 @@ def fancy_evaluate(workfolder, cfg_dict, add_args):
     tkfeats_eval = tkfeats_d[sset_eval]
     tubes_dwein_eval = tubes_dwein_d[sset_eval]
     tubes_dgt_eval = tubes_dgt_d[sset_eval]
-    # Try hard tubes here
-    tubes_dgt_all: Dict[I_dgt, T_dgt] = get_daly_gt_tubes(dataset)
-    tubes_dgt_eval_w_hard = dtindex_filter_split(
-            tubes_dgt_all, vgroup[sset_eval])
 
     # Interacting with big
     assert cf['eval.full_tubes.enabled'], 'We train on them anyway'
@@ -1312,12 +1309,12 @@ def fancy_evaluate(workfolder, cfg_dict, add_args):
     model.eval()
     result = mlp_perf_kf_evaluate(
             model, tkfeats_train, tkfeats_eval,
-            tubes_dwein_eval, tubes_dgt_eval_w_hard,
+            tubes_dwein_eval, tubes_dgt_eval,
             dataset, output_dims)
     result_fulltube = mlp_perf_fulltube_evaluate(
             model, man_feats_dwt,
             tubes_dwein_eval, tubes_dwein_prov,
-            tubes_dgt_eval_w_hard, dwti_to_label_eval,
+            tubes_dgt_eval, dwti_to_label_eval,
             dataset, output_dims,
             cf['eval.full_tubes.detect_mode'],
             cf['eval.full_tubes.nms'],
@@ -1327,3 +1324,168 @@ def fancy_evaluate(workfolder, cfg_dict, add_args):
     model.train()
     log.info(f'Evalset perf at {i_epoch=}')
     mlp_perf_display(result, sset_eval)
+
+
+def merge_evaluate(workfolder, cfg_dict, add_args):
+    out, = snippets.get_subfolders(workfolder, ['out'])
+    cfg = snippets.YConfig_v2(cfg_dict)
+    Ncfg_daly.set_defcfg_v2(cfg)
+    cfg.set_defaults_yaml("""
+    inputs:
+        tubes_dwein: ~
+        keyframes:
+            roi: ~
+            full: ~
+        tubes_dwein_feats:
+            roi: ~
+            full: ~
+        ckpt:
+            roi: ~
+            full: ~
+    net:
+        kind: 'layer1'
+        layer1:
+            H: 32
+        ll_dropout: 0.5
+    seed: 42
+    split_assignment: !def ['train/val',
+        ['train/val', 'trainval/test']]
+    """)
+    cf = cfg.parse()
+    # Seeds
+    initial_seed = cf['seed']
+    torch.manual_seed(initial_seed)
+    # Data
+    # General DALY level preparation
+    dataset = Ncfg_daly.get_dataset(cf)
+    vgroup = Ncfg_daly.get_vids(cf, dataset)
+    sset_train, sset_eval = cf['split_assignment'].split('/')
+
+    # wein tubes
+    tubes_dwein_d, tubes_dgt_d = load_gt_and_wein_tubes(
+            cf['inputs.tubes_dwein'], dataset, vgroup)
+    tubes_dwein_prov: Dict[I_dwein, Tube_daly_wein_as_provided] = \
+            small.load_pkl(cf['inputs.tubes_dwein'])
+
+    # / keyframe feats
+    def to_torch(kfeats):
+        tkfeats = kfeats.copy()
+        tkfeats['X'] = torch.from_numpy(tkfeats['X'])
+        tkfeats['Y'] = torch.from_numpy(tkfeats['Y'])
+        return tkfeats
+    # // ROI
+    keyframes_featfold = Path(cf['inputs.keyframes.roi'])
+    keyframes = small.load_pkl(keyframes_featfold/'keyframes.pkl')
+    outputs = small.load_pkl(
+            keyframes_featfold/'dict_outputs.pkl')['roipooled']
+    kfeats_eval_roi = to_torch(Ncfg_kfeats.split_off_D(
+            outputs, keyframes, vgroup[sset_eval]))
+    # // FULL
+    keyframes_featfold = Path(cf['inputs.keyframes.full'])
+    keyframes = small.load_pkl(keyframes_featfold/'keyframes.pkl')
+    outputs = small.load_pkl(
+            keyframes_featfold/'dict_outputs.pkl')['fullframe']
+    kfeats_eval_full = to_torch(Ncfg_kfeats.split_off_D(
+            outputs, keyframes, vgroup[sset_eval]))
+
+    # synthetic tube labels
+    _, dwti_to_label_eval = qload_synthetic_tube_labels(
+            tubes_dgt_d[sset_eval], tubes_dwein_d[sset_eval], dataset)
+    # Ssset
+    tubes_dwein_eval = tubes_dwein_d[sset_eval]
+    tubes_dgt_eval = tubes_dgt_d[sset_eval]
+
+    # Interacting with big
+    man_feats_dwt_roi = Manager_feats_tubes_dwein_roipooled(
+            cf['inputs.tubes_dwein_feats.roi'], None)
+    man_feats_dwt_full = Manager_feats_tubes_dwein_full(
+            cf['inputs.tubes_dwein_feats.full'], None)
+    D_in = man_feats_dwt_full.fullframe_feats.shape[-1]
+
+    model_roi = define_mlp_model(cf, D_in, 11)
+    states = torch.load(cf['inputs.ckpt.roi'])
+    i_epoch = states['i_epoch']
+    model_roi.load_state_dict(states['model_sdict'])
+    model_roi.eval()
+
+    model_full = define_mlp_model(cf, D_in, 10)
+    states = torch.load(cf['inputs.ckpt.full'])
+    model_full.load_state_dict(states['model_sdict'])
+    model_full.eval()
+
+    # Actual evaluation
+    iou_thresholds = [.3, .5, .7]
+    av_gt_tubes: AV_dict[T_dgt] = push_into_avdict(tubes_dgt_eval)
+
+    # ROI evaluations
+    tube_softmaxes_eval: Dict[I_dwein, np.ndarray] = {}
+    with torch.no_grad():
+        for dwti in tubes_dwein_eval.keys():
+            dwti_feats = man_feats_dwt_roi.get_all_tube_feats(dwti)
+            preds_softmax = model_roi(dwti_feats)['x_final']
+            tube_softmaxes_eval[dwti] = preds_softmax.numpy()
+    tube_softmaxes_eval_nobg = {k: v[:, :-1]
+            for k, v in tube_softmaxes_eval.items()}
+
+    # FULL evaluations
+    connections_f = man_feats_dwt_full.connections_f
+    fullframe_feats = man_feats_dwt_full.fullframe_feats
+    with torch.no_grad():
+        t_fullframe_feats = torch.from_numpy(fullframe_feats)
+        x_final = model_full(t_fullframe_feats)['x_final'].numpy()
+    # Aggregate frame scores
+    frame_scores: Dict[Tuple[Vid_daly, int], np.ndarray] = {}
+    for cons, outputs_ in zip(connections_f.values(), x_final):
+        vid = cons['vid']
+        frame_ind = cons['frame_ind']
+        frame_scores[(vid, frame_ind)] = outputs_
+
+    # Universal detector experiments
+    tubes_dwein = tubes_dwein_eval
+    av_stubes_with_scores: AV_dict[Dict] = {}
+    for dwt_index, tube in tubes_dwein.items():
+        (vid, bunch_id, tube_id) = dwt_index
+        # Human score from dwein tubes
+        hscores = tubes_dwein_prov[dwt_index]['hscores']
+        iscores = tubes_dwein_prov[dwt_index]['iscores']
+        # Scores over roi
+        softmaxes = tube_softmaxes_eval_nobg[dwt_index]
+        scores = softmaxes.mean(axis=0)
+        # Aggregated frame score
+        fscores_for_tube_ = []
+        for frame_ind in tube['frame_inds']:
+            fscore = frame_scores.get((vid, frame_ind))
+            if fscore is not None:
+                fscores_for_tube_.append(fscore)
+        fscores_for_tube = np.vstack(fscores_for_tube_)
+        for ia, (action_name, score) in enumerate(
+                zip(dataset.action_names, scores)):
+            stube = cast(Dict, tube.copy())
+            stube['hscore'] = hscores.mean()
+            stube['iscore'] = np.nanmean(iscores)
+            stube['box_det_score'] = score
+            stube['box_nonbg_score'] = scores.sum()
+            stube['frame_cls_score'] = fscores_for_tube.mean(0)[ia]
+            stube['hscore*frame_cls_score'] = \
+                    stube['hscore'] * stube['frame_cls_score']
+            stube['mean(box_det_score+frame_cls_score'] = \
+                    (stube['box_det_score'] + stube['frame_cls_score'])/2
+            stube['mean(box_det_score, hscore*frame_cls_score)'] = \
+                    (stube['box_det_score'] + stube['hscore*frame_cls_score'])/2
+            (av_stubes_with_scores
+                    .setdefault(action_name, {})
+                    .setdefault(vid, []).append(stube))
+
+    av_stubes: Any = copy.deepcopy(av_stubes_with_scores)
+    av_stubes = assign_scorefield(av_stubes, 'hscore')
+    # av_stubes = assign_scorefield(av_stubes, 'box_det_score')
+    av_stubes = av_stubes_above_score(av_stubes, 0.0)
+    av_stubes = compute_nms_for_av_stubes(av_stubes, 0.3)
+    # av_stubes = assign_scorefield(av_stubes, 'box_det_score')  # roi, 72.73
+    # av_stubes = assign_scorefield(av_stubes, 'hscore*frame_cls_score')  # full, 71.35
+    # av_stubes = assign_scorefield(av_stubes, 'mean(box_det_score,frame_cls_score)')  # 72.54
+    av_stubes = assign_scorefield(av_stubes, 'mean(box_det_score, hscore*frame_cls_score)')  # 74.72
+
+    df_ap_full = compute_ap_for_avtubes_as_df(
+        av_gt_tubes, av_stubes, iou_thresholds, False, False)
+    log.info(df_ap_full*100)
