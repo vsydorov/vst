@@ -1973,6 +1973,7 @@ def full_tube_eval(workfolder, cfg_dict, add_args):
     else:
         raise RuntimeError()
     states = torch.load(ckpt_path)
+    i_epoch = states['i_epoch']
     model_wf.model.load_state_dict(states['model_sdict'])
 
     # / Prepare conections, determine split (if any) and folder
@@ -2006,6 +2007,7 @@ def full_tube_eval(workfolder, cfg_dict, add_args):
         log.info('We can eval right away')
         _, dwti_to_label_eval = qload_synthetic_tube_labels(
             tubes_dgt_eval, tubes_dwein_eval, dataset)
+        log.info(f'Perf at [{i_epoch}]')
         finetube_perf_fulltube_evaluate(
             dict_outputs['x_final'], connections_f,
             tubes_dwein_eval, tubes_dwein_prov, tubes_dgt_eval,
