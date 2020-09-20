@@ -1,16 +1,19 @@
+import copy
 import numpy as np
 import pandas as pd
 import logging
 from sklearn.metrics import (
     accuracy_score, roc_auc_score)
 from typing import (  # NOQA
-    Dict, Any, List, Optional, Tuple, TypedDict, Set)
+    Dict, Any, List, Optional, Tuple, TypedDict, Set, cast)
 
 from thes.data.dataset.external import (
     Dataset_daly_ocv, Vid_daly)
 from thes.data.tubes.types import (
     Box_connections_dwti,
     I_dwein, T_dwein, T_dwein_scored, I_dgt, T_dgt,
+    Frametube_scored,
+    Tube_daly_wein_as_provided,
     get_daly_gt_tubes, push_into_avdict,
     AV_dict, loadconvert_tubes_dwein,
     av_stubes_above_score)
@@ -81,3 +84,76 @@ def quick_tube_eval(
     df_ap = compute_ap_for_avtubes_as_df(
         av_gt_tubes, av_stubes_, iou_thresholds, False, False)
     return df_ap, df_recall
+
+
+def assign_scorefield(av_stubes, score_field):
+    av_stubes = copy.deepcopy(av_stubes)
+    for a, v_stubes in av_stubes.items():
+        for v, stubes in v_stubes.items():
+            for stube in stubes:
+                stube['score'] = stube[score_field]
+    return cast(AV_dict[Frametube_scored], av_stubes)
+
+
+def assign_scores_to_dwt_roipooled(
+        tubes_dwein: Dict[I_dwein, T_dwein],
+        tubes_dwein_prov: Dict[I_dwein, Tube_daly_wein_as_provided],
+        tube_softmaxes_eval_nobg: Dict[I_dwein, np.ndarray],
+        dataset: Dataset_daly_ocv) -> AV_dict[Dict]:
+    """
+    Given per-tube scores obtained with roipooled detector,
+        assign scores to the DWEIN tubes
+    """
+    # Universal detector experiments
+    av_stubes_with_scores: AV_dict[Dict] = {}
+    for dwt_index, tube in tubes_dwein.items():
+        softmaxes = tube_softmaxes_eval_nobg[dwt_index]
+        scores = softmaxes.mean(axis=0)
+        hscores = tubes_dwein_prov[dwt_index]['hscores']
+        iscores = tubes_dwein_prov[dwt_index]['iscores']
+        (vid, bunch_id, tube_id) = dwt_index
+        for action_name, score in zip(dataset.action_names, scores):
+            stube = cast(Dict, tube.copy())
+            stube['hscore'] = hscores.mean()
+            stube['iscore'] = np.nanmean(iscores)
+            stube['box_det_score'] = score
+            stube['box_nonbg_score'] = scores.sum()
+            (av_stubes_with_scores
+                    .setdefault(action_name, {})
+                    .setdefault(vid, []).append(stube))
+    return av_stubes_with_scores
+
+
+def assign_scores_to_dwt_fullframe(
+        tubes_dwein: Dict[I_dwein, T_dwein],
+        tubes_dwein_prov: Dict[I_dwein, Tube_daly_wein_as_provided],
+        frame_scores: Dict[Tuple[Vid_daly, int], np.ndarray],
+        dataset: Dataset_daly_ocv) -> AV_dict[Dict]:
+    """
+    Given per-frame scores obtaiend with fullframe classifier,
+        assign scores to the DWEIN tubes
+    """
+    av_stubes_with_scores: AV_dict[Dict] = {}
+    for dwt_index, tube in tubes_dwein.items():
+        (vid, bunch_id, tube_id) = dwt_index
+        # Human score from dwein tubes
+        hscores = tubes_dwein_prov[dwt_index]['hscores']
+        iscores = tubes_dwein_prov[dwt_index]['iscores']
+        # Aggregated frame score
+        fscores_for_tube_ = []
+        for frame_ind in tube['frame_inds']:
+            fscore = frame_scores.get((vid, frame_ind))
+            if fscore is not None:
+                fscores_for_tube_.append(fscore)
+        fscores_for_tube = np.vstack(fscores_for_tube_)
+        for ia, action_name in enumerate(dataset.action_names):
+            stube = cast(Dict, tube.copy())
+            stube['hscore'] = hscores.mean()
+            stube['iscore'] = np.nanmean(iscores)
+            stube['frame_cls_score'] = fscores_for_tube.mean(0)[ia]
+            stube['hscore*frame_cls_score'] = \
+                    stube['hscore'] * stube['frame_cls_score']
+            (av_stubes_with_scores
+                    .setdefault(action_name, {})
+                    .setdefault(vid, []).append(stube))
+    return av_stubes_with_scores

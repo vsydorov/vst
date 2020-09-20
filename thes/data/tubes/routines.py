@@ -348,6 +348,7 @@ def group_tubes_on_frame_level(
 
 
 def perform_connections_split(connections_f, cc, ct, fancy=True):
+    assert (cc >= 0) and (cc < ct)
     ckeys = list(connections_f.keys())
     if fancy:
         weights_dict = {k: len(v['boxes'])

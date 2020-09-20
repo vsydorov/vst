@@ -9,7 +9,7 @@ import numpy as np
 import logging
 from pathlib import Path
 from typing import (  # NOQA
-    Dict, Any, List, Optional, Tuple, TypedDict, Set, cast)
+    Dict, Any, List, Optional, Tuple, TypedDict, Set, cast, Literal)
 from sklearn.metrics import (
     accuracy_score)
 
@@ -64,7 +64,9 @@ from thes.data.tubes.routines import (
 from thes.evaluation.ap.convert import (
     compute_ap_for_avtubes_as_df)
 from thes.evaluation.meta import (
-    cheating_tube_scoring, quick_tube_eval)
+    cheating_tube_scoring, quick_tube_eval,
+    assign_scorefield, assign_scores_to_dwt_roipooled,
+    assign_scores_to_dwt_fullframe)
 
 from thes.slowfast.cfg import (basic_sf_cfg)
 from thes.tools import snippets
@@ -781,42 +783,6 @@ class Manager_loader_krgb(object):
         return frame_list_f32c, bboxes0_c, labels_c
 
 
-def vis_frameload():
-    pass
-    # Y = (imgs[0].transpose([1, 2, 0])*255).clip(0, 255).astype(np.uint8)
-
-    # Y = imgs[0].numpy().transpose([1, 2, 0])*data_std+data_mean
-
-    # Y = imgs[0].astype(np.uint8)
-
-    # Y = imgs[:, 0].numpy().transpose([1, 2, 0])*data_std+data_mean
-    # Y = (Y*255).clip(0, 255).astype(np.uint8)[..., ::-1]
-
-    # Yo = fl_u8_bgr[0]
-    # cv2.imshow("test_o", Yo)
-    # cv2.imshow("test", Y)
-    # cv2.waitKey(0)
-    # cv2.destroyAllWindows()
-
-    # actnames = self.dataset.action_names + ['background']
-    # Y = imgs[:, 0].numpy().transpose([1, 2, 0])*data_std+data_mean
-    # Y = (Y*255).clip(0, 255).astype(np.uint8)[..., ::-1]
-    # Y = np.ascontiguousarray(Y)
-    # for i, box_ltrd in enumerate(boxes):
-    #     label = actnames[labels[i]]
-    #     snippets.misc.cv_put_box_with_text(
-    #             Y, box_ltrd, text=label)
-    # Yo = fl_u8_bgr[0].copy()
-    # for i, box_ltrd in enumerate(orig_boxes_ltrd):
-    #     label = actnames[labels[i]]
-    #     snippets.misc.cv_put_box_with_text(
-    #             Yo, box_ltrd, text=label)
-    # cv2.imshow("test", Y)
-    # cv2.imshow("test_orig", Yo)
-    # cv2.waitKey(0)
-    # cv2.destroyAllWindows()
-
-
 class TDataset_over_lframes(torch.utils.data.Dataset):
     def __init__(self, cf, cn,
             labeled_frames: List[Frame_labeled], dataset):
@@ -926,240 +892,6 @@ class TDataset_over_fgroups(torch.utils.data.Dataset):
             'orig_boxes_ltrd': orig_boxes_ltrd,
             'do_not_collate': True}
         return (packed_imgs, meta)
-
-class Manager_loader_boxcons_improved(object):
-    def __init__(self, tubes_dgt_d, tubes_dwein_d,
-            sset_train, dataset, cn,
-            keyframes_train,
-            stride, top_n_matches,
-            norm_mean_cu, norm_std_cu):
-        self.dataset = dataset
-        self.norm_mean_cu = norm_mean_cu
-        self.norm_std_cu = norm_std_cu
-        self.keyframes_train = keyframes_train
-
-        tubes_dwein_train = tubes_dwein_d[sset_train]
-        tubes_dgt_train = tubes_dgt_d[sset_train]
-
-        # // Associate tubes
-        matched_dwts: Dict[I_dgt, Dict[I_dwein, float]] = \
-            get_dwein_overlaps_per_dgt(tubes_dgt_train, tubes_dwein_train)
-        fg_meta, bg_meta = select_fg_bg_tubes(matched_dwts, top_n_matches)
-        log.info('Selected {} FG and {} BG tubes from a total of {}'.format(
-            len(fg_meta), len(bg_meta), len(tubes_dwein_train)))
-        # Merge fg/bg
-        tube_metas = {}
-        tube_metas.update(fg_meta)
-        tube_metas.update(bg_meta)
-        # Break into frames, sort by distance
-        self.dist_boxes_train = group_dwein_frames_wrt_kf_distance(
-            dataset, stride, tubes_dwein_train, tube_metas)
-
-    def get_labeled_boxes(self, max_distance, add_keyframes):
-        # fg/bf boxes -> labels
-        labeled_boxes = []
-        for i, boxes in self.dist_boxes_train.items():
-            if i > max_distance:
-                break
-            for box in boxes:
-                (vid, bunch_id, tube_id) = box['dwti']
-                if box['kind'] == 'fg':
-                    (vid, action_name, ins_id) = box['dgti']
-                    label = self.dataset.action_names.index(action_name)
-                else:
-                    label = len(self.dataset.action_names)
-                lbox = {
-                    'vid': vid,
-                    'frame_ind': box['frame_ind'],
-                    'box': box['box'],
-                    'label': label}
-                labeled_boxes.append(lbox)
-        if add_keyframes:
-            # Merge keyframes too
-            for kf in self.keyframes_train:
-                action_name = kf['action_name']
-                label = self.dataset.action_names.index(action_name)
-                lbox = {'vid': kf['vid'],
-                        'frame_ind': kf['frame0'],
-                        'box': kf['bbox'],
-                        'label': label}
-                labeled_boxes.append(lbox)
-        return labeled_boxes
-
-    @staticmethod
-    def get_frame_groups(labeled_boxes):
-        # Group into frame_groups
-        frame_groups: Dict[Tuple[Vid_daly, int], List] = {}
-        for lbox in labeled_boxes:
-            vid = lbox['vid']
-            frame_ind = lbox['frame_ind']
-            frame_groups.setdefault((vid, frame_ind), []).append(lbox)
-        return frame_groups
-
-    def preprocess_data(self, data_input):
-        frame_list, metas, = data_input
-        frame_list_f32c = [
-            to_gpu_normalize_permute(
-                x, self.norm_mean_cu,
-                self.norm_std_cu) for x in frame_list]
-
-        # bbox transformations
-        bboxes_np = [m['bboxes'] for m in metas]
-        counts = np.array([len(x) for x in bboxes_np])
-        batch_indices = np.repeat(np.arange(len(counts)), counts)
-        bboxes0 = np.c_[batch_indices, np.vstack(bboxes_np)]
-        bboxes0 = torch.from_numpy(bboxes0)
-        bboxes0_c = bboxes0.type(torch.cuda.FloatTensor)
-
-        # labels
-        labels_np = [m['labels'] for m in metas]
-        labels_np = np.hstack(labels_np)
-        labels_t = torch.from_numpy(labels_np)
-        labels_c = labels_t.cuda()
-        return frame_list_f32c, bboxes0_c, labels_c
-
-
-class Manager_loader_fullframes(object):
-    """
-    Based on Manager_loader_boxcons_improved
-    """
-    def __init__(self, tubes_dgt_train, dataset,
-            keyframes_train,
-            norm_mean_cu, norm_std_cu):
-        self.tubes_dgt_train = tubes_dgt_train
-        self.dataset = dataset
-        self.keyframes_train = keyframes_train
-        self.norm_mean_cu = norm_mean_cu
-        self.norm_std_cu = norm_std_cu
-
-    def get_labeled_frames(self):
-        labeled_frames = []
-        # Merge keyframes too
-        for kf in self.keyframes_train:
-            action_name = kf['action_name']
-            label = self.dataset.action_names.index(action_name)
-            lbox = {'vid': kf['vid'],
-                    'frame_ind': kf['frame0'],
-                    'box': kf['bbox'],
-                    'label': label}
-            labeled_frames.append(lbox)
-        return labeled_frames
-
-    def preprocess_data(self, data_input):
-        frame_list, metas, = data_input
-        frame_list_f32c = [
-            to_gpu_normalize_permute(
-                x, self.norm_mean_cu,
-                self.norm_std_cu) for x in frame_list]
-
-        # bbox transformations
-        bboxes_np = [m['bboxes'] for m in metas]
-        counts = np.array([len(x) for x in bboxes_np])
-        batch_indices = np.repeat(np.arange(len(counts)), counts)
-        bboxes0 = np.c_[batch_indices, np.vstack(bboxes_np)]
-        bboxes0 = torch.from_numpy(bboxes0)
-        bboxes0_c = bboxes0.type(torch.cuda.FloatTensor)
-
-        # labels
-        labels_np = [m['labels'] for m in metas]
-        labels_np = np.hstack(labels_np)
-        labels_t = torch.from_numpy(labels_np)
-        labels_c = labels_t.cuda()
-        return frame_list_f32c, bboxes0_c, labels_c
-
-
-class Manager_loader_boxcons(object):
-    def __init__(self, tubes_dgt_d, tubes_dwein_d,
-            sset_train, dataset, cn, cf,
-            norm_mean_cu, norm_std_cu):
-        self.dataset = dataset
-        self.norm_mean_cu = norm_mean_cu
-        self.norm_std_cu = norm_std_cu
-
-        # Prepare labeled tubes
-        dwti_to_label_train: Dict[I_dgt, int]
-        cls_labels, dwti_to_label_train = qload_synthetic_tube_labels(
-                tubes_dgt_d[sset_train], tubes_dwein_d[sset_train], dataset)
-        self.cls_vf_train: Dict[Tuple[Vid_daly, int], Bc_dwti_labeled] = \
-            self._prepare_labeled_connections(
-                cf, dataset, tubes_dwein_d[sset_train], dwti_to_label_train)
-        # Prepare sampler
-        model_nframes = cn.DATA.NUM_FRAMES
-        model_sample = cn.DATA.SAMPLING_RATE
-        slowfast_alpha = cn.SLOWFAST.ALPHA
-        self.sampler_grid = Sampler_grid(model_nframes, model_sample)
-        self.frameloader_vsf = Frameloader_video_slowfast(
-                False, slowfast_alpha, 256)
-
-    @staticmethod
-    def _prepare_labeled_connections(
-            cf, dataset, tubes_dwein_train, dwti_to_label_train):
-        # Frames to cover: keyframes and every 4th frame
-        frames_to_cover: Dict[Vid_daly, np.ndarray] = \
-            sample_daly_frames_from_instances(
-                    dataset, cf['frame_coverage.subsample'])
-        cs_vf_train_unlabeled: \
-                Dict[Tuple[Vid_daly, int], Box_connections_dwti]
-        cs_vf_train_unlabeled = group_tubes_on_frame_level(
-                tubes_dwein_train, frames_to_cover)
-        # Add labels
-        cls_vf_train: Dict[Tuple[Vid_daly, int], Bc_dwti_labeled] = {}
-        for (vid, f), bc_dwti in cs_vf_train_unlabeled.items():
-            good_i = []
-            labels = []
-            for i, dwti in enumerate(bc_dwti['dwti_sources']):
-                if dwti in dwti_to_label_train:
-                    label = dwti_to_label_train[dwti]
-                    good_i.append(i)
-                    labels.append(label)
-            if len(good_i):
-                vid = bc_dwti['vid']
-                frame_ind = bc_dwti['frame_ind']
-                boxes = [bc_dwti['boxes'][i] for i in good_i]
-                dwti_sources = [bc_dwti['dwti_sources'][i] for i in good_i]
-                bc_dwti_labeled: Bc_dwti_labeled = {
-                        'vid': vid,
-                        'frame_ind': frame_ind,
-                        'dwti_sources': dwti_sources,
-                        'boxes': boxes,
-                        'labels': np.array(labels)}
-                cls_vf_train[(vid, f)] = bc_dwti_labeled
-        return cls_vf_train
-
-    def get_train_loader(self, batch_size, rgen):
-        NUM_WORKERS = 8
-        td_bc_labeled = TDataset_over_box_connections_w_labels(
-            self.cls_vf_train, self.dataset,
-            self.sampler_grid, self.frameloader_vsf)
-        sampler = NumpyRandomSampler(td_bc_labeled, rgen)
-        loader = torch.utils.data.DataLoader(td_bc_labeled,
-            batch_size=batch_size, num_workers=NUM_WORKERS,
-            sampler=sampler, shuffle=False,
-            pin_memory=True,
-            collate_fn=sequence_batch_collate_v2)
-        return loader
-
-    def preprocess_data(self, data_input):
-        frame_list, metas, = data_input
-        frame_list_f32c = [
-            to_gpu_normalize_permute(
-                x, self.norm_mean_cu,
-                self.norm_std_cu) for x in frame_list]
-
-        # bbox transformations
-        bboxes_np = [m['bboxes'] for m in metas]
-        counts = np.array([len(x) for x in bboxes_np])
-        batch_indices = np.repeat(np.arange(len(counts)), counts)
-        bboxes0 = np.c_[batch_indices, np.vstack(bboxes_np)]
-        bboxes0 = torch.from_numpy(bboxes0)
-        bboxes0_c = bboxes0.type(torch.cuda.FloatTensor)
-
-        # labels
-        labels_np = [m['labels'] for m in metas]
-        labels_np = np.hstack(labels_np)
-        labels_t = torch.from_numpy(labels_np)
-        labels_c = labels_t.cuda()
-        return frame_list_f32c, bboxes0_c, labels_c
 
 
 def _train_epoch(
@@ -1406,6 +1138,42 @@ def _debug_krgb_vis():
         cv2.destroyAllWindows()
 
 
+def _debug_vis_frameload():
+    pass
+    # Y = (imgs[0].transpose([1, 2, 0])*255).clip(0, 255).astype(np.uint8)
+
+    # Y = imgs[0].numpy().transpose([1, 2, 0])*data_std+data_mean
+
+    # Y = imgs[0].astype(np.uint8)
+
+    # Y = imgs[:, 0].numpy().transpose([1, 2, 0])*data_std+data_mean
+    # Y = (Y*255).clip(0, 255).astype(np.uint8)[..., ::-1]
+
+    # Yo = fl_u8_bgr[0]
+    # cv2.imshow("test_o", Yo)
+    # cv2.imshow("test", Y)
+    # cv2.waitKey(0)
+    # cv2.destroyAllWindows()
+
+    # actnames = self.dataset.action_names + ['background']
+    # Y = imgs[:, 0].numpy().transpose([1, 2, 0])*data_std+data_mean
+    # Y = (Y*255).clip(0, 255).astype(np.uint8)[..., ::-1]
+    # Y = np.ascontiguousarray(Y)
+    # for i, box_ltrd in enumerate(boxes):
+    #     label = actnames[labels[i]]
+    #     snippets.misc.cv_put_box_with_text(
+    #             Y, box_ltrd, text=label)
+    # Yo = fl_u8_bgr[0].copy()
+    # for i, box_ltrd in enumerate(orig_boxes_ltrd):
+    #     label = actnames[labels[i]]
+    #     snippets.misc.cv_put_box_with_text(
+    #             Yo, box_ltrd, text=label)
+    # cv2.imshow("test", Y)
+    # cv2.imshow("test_orig", Yo)
+    # cv2.waitKey(0)
+    # cv2.destroyAllWindows()
+
+
 def _debug_finetune_vis():
     iii = 3
     for iii in range(len(metas)):
@@ -1454,104 +1222,85 @@ class BSampler_prepared(torch.utils.data.Sampler):
         return len(self.samples)
 
 
-def full_tube_perf_eval(outputs, connections_f,
-        dataset, dwti_to_label_eval,
-        tubes_dgt_eval, tubes_dwein_eval):
-    assert len(outputs) == len(connections_f)
-    # Aggregation of per-frame scores
-    dwti_preds: Dict[I_dwein, Dict[int, Dict]] = {}
-    for cons, outputs_ in zip(connections_f.values(), outputs):
-        frame_ind = cons['frame_ind']
-        for (box, source, output) in zip(
-                cons['boxes'], cons['dwti_sources'], outputs_):
-            pred = {
-                'box': box,
-                'output': output}
-            dwti_preds.setdefault(source, {})[frame_ind] = pred
+def finetube_perf_fulltube_evaluate(
+        x_final,
+        connections_f,
+        tubes_dwein_eval: Dict[I_dwein, T_dwein],
+        tubes_dwein_prov: Dict[I_dwein, Tube_daly_wein_as_provided],
+        tubes_dgt_eval: Dict[I_dgt, T_dgt],
+        dwti_to_label_eval: Dict[I_dwein, int],
+        dataset: Dataset_daly_ocv,
+        # stats for fulltube eval
+        f_detect_mode: Literal['roipooled', 'fullframe'],
+        f_nms: float,
+        f_field_nms: str,
+        f_field_det: str,
+        ):
+    iou_thresholds = [.3, .5, .7]
+    av_gt_tubes: AV_dict[T_dgt] = push_into_avdict(tubes_dgt_eval)
+    acc_flattube_synt: float
+    if f_detect_mode == 'roipooled':
+        assert len(x_final) == len(connections_f)
+        # Aggregation of per-frame scores
+        dwti_preds: Dict[I_dwein, Dict[int, Dict]] = {}
+        for cons, outputs_ in zip(connections_f.values(), x_final):
+            frame_ind = cons['frame_ind']
+            for (box, source, output) in zip(
+                    cons['boxes'], cons['dwti_sources'], outputs_):
+                pred = {'box': box, 'output': output}
+                dwti_preds.setdefault(source, {})[frame_ind] = pred
+        # Assignment of final score to each DWTI
+        tube_softmaxes_eval: Dict[I_dwein, np.ndarray] = {}
+        for dwti, preds in dwti_preds.items():
+            preds_agg_ = []
+            for frame_ind, pred in preds.items():
+                preds_agg_.append(pred['output'])
+            pred_agg = np.vstack(preds_agg_)
+            tube_softmaxes_eval[dwti] = pred_agg
+        # We assume input_dims == 11
+        assert x_final[0].shape[-1] == 11
+        tube_softmaxes_eval_bg = tube_softmaxes_eval
+        tube_softmaxes_eval_nobg = {k: v[:, :-1]
+                for k, v in tube_softmaxes_eval.items()}
+        acc_flattube_synt = compute_flattube_syntlabel_acc(
+                tube_softmaxes_eval_bg, dwti_to_label_eval)
+        # Assign scores to tubes
+        av_stubes_with_scores = assign_scores_to_dwt_roipooled(
+                tubes_dwein_eval, tubes_dwein_prov,
+                tube_softmaxes_eval_nobg, dataset)
+    elif f_detect_mode =='fullframe':
+        # We have wrongly attempted to be smart, fix this
+        x_final = np.vstack(x_final)
+        # Aggregate frame scores
+        frame_scores: Dict[Tuple[Vid_daly, int], np.ndarray] = {}
+        for cons, outputs_ in zip(connections_f.values(), x_final):
+            vid = cons['vid']
+            frame_ind = cons['frame_ind']
+            frame_scores[(vid, frame_ind)] = outputs_
+        assert len(frame_scores) == len(connections_f)
+        # Flat accuracy not possible
+        acc_flattube_synt = np.NAN
+        # Assign scores to tubes
+        av_stubes_with_scores = assign_scores_to_dwt_fullframe(
+                tubes_dwein_eval, tubes_dwein_prov,
+                frame_scores, dataset)
+    else:
+        raise RuntimeError()
 
-    # Assignment of final score to each DWTI
-    tube_softmaxes_eval: Dict[I_dwein, np.ndarray] = {}
-    for dwti, preds in dwti_preds.items():
-        preds_agg_ = []
-        for frame_ind, pred in preds.items():
-            preds_agg_.append(pred['output'])
-        pred_agg = np.vstack(preds_agg_)
-        tube_softmaxes_eval[dwti] = pred_agg
+    # Full evaluation
+    av_stubes: Any = copy.deepcopy(av_stubes_with_scores)
+    av_stubes = assign_scorefield(av_stubes, f_field_nms)
+    av_stubes = av_stubes_above_score(av_stubes, 0.0)
+    av_stubes = compute_nms_for_av_stubes(av_stubes, f_nms)
+    av_stubes = assign_scorefield(av_stubes, f_field_det)
 
-    # We assume input_dims == 11
-    tube_softmaxes_eval_bg = tube_softmaxes_eval
-    tube_softmaxes_eval_nobg = {k: v[:, :-1]
-            for k, v in tube_softmaxes_eval.items()}
-
-    acc_flattube_synt = compute_flattube_syntlabel_acc(
-            tube_softmaxes_eval_bg, dwti_to_label_eval)
-    av_stubes_eval: AV_dict[T_dwein_scored] = \
-        quick_assign_scores_to_dwein_tubes(
-            tubes_dwein_eval, tube_softmaxes_eval_nobg, dataset)
-    df_ap_full, df_recall_full = quick_tube_eval(av_stubes_eval, tubes_dgt_eval)
+    df_ap_full = compute_ap_for_avtubes_as_df(
+        av_gt_tubes, av_stubes, iou_thresholds, False, False)
 
     _df_ap_full = (df_ap_full*100).round(2)
     _apline = '/'.join(_df_ap_full.loc['all'].values.astype(str))
     log.info('AP (full tubes):\n{}'.format(_df_ap_full))
     log.info('Flattube synthetic acc: {:.2f}'.format(acc_flattube_synt*100))
-    log.info('Full tube AP357: {}'.format(_apline))
-
-def full_tube_full_frame_perf_eval(
-        x_final_broken, connections_f,
-        tubes_dwein_prov, dataset, tubes_dwein_eval, tubes_dgt_eval):
-    # // fullframe evaluation
-    # We have wrongly attempted to be smart and unbatch out connections
-    x_final = np.vstack(x_final_broken)
-    # Aggregate frame scores
-    frame_scores: Dict[Tuple[Vid_daly, int], np.ndarray] = {}
-    for cons, outputs_ in zip(connections_f.values(), x_final):
-        vid = cons['vid']
-        frame_ind = cons['frame_ind']
-        frame_scores[(vid, frame_ind)] = outputs_
-    assert len(frame_scores) == len(connections_f)
-
-    av_stubes_eval_augm: AV_dict[Dict] = {}
-    for dwt_index, tube in tubes_dwein_eval.items():
-        (vid, bunch_id, tube_id) = dwt_index
-        # Human score from dwein tubes
-        hscores = tubes_dwein_prov[dwt_index]['hscores']
-        # Aggregated frame score
-        fscores_for_tube = []
-        for frame_ind in tube['frame_inds']:
-            fscore = frame_scores.get((vid, frame_ind))
-            if fscore is not None:
-                fscores_for_tube.append(fscore)
-        fscores_for_tube = np.vstack(fscores_for_tube)
-        for ia, action_name in enumerate(dataset.action_names):
-            stube = cast(T_dwein_scored, tube.copy())
-            stube['hscore'] = hscores.mean()
-            stube['fscore'] = fscores_for_tube.mean(0)[ia]
-            stube['hfscore'] = stube['hscore'] * stube['fscore']
-            (av_stubes_eval_augm
-                    .setdefault(action_name, {})
-                    .setdefault(vid, []).append(stube))
-
-    def assign_scorefield(av_stubes, score_field):
-        for a, v_stubes in av_stubes.items():
-            for v, stubes in v_stubes.items():
-                for stube in stubes:
-                    stube['score'] = stube[score_field]
-
-    iou_thresholds = [.3, .5, .7]
-    av_gt_tubes: AV_dict[T_dgt] = push_into_avdict(tubes_dgt_eval)
-    # Full evaluation
-    av_stubes = copy.deepcopy(av_stubes_eval_augm)
-    assign_scorefield(av_stubes, 'hscore')
-    av_stubes = av_stubes_above_score(av_stubes, 0.0)
-    av_stubes = compute_nms_for_av_stubes(av_stubes, 0.3)
-
-    assign_scorefield(av_stubes, 'hfscore')
-    df_ap_hfscore = compute_ap_for_avtubes_as_df(
-        av_gt_tubes, av_stubes, iou_thresholds, False, False)
-
-    _df_ap_full = (df_ap_hfscore*100).round(2)
-    _apline = '/'.join(_df_ap_full.loc['all'].values.astype(str))
-    log.info('AP (full tubes):\n{}'.format(_df_ap_full))
     log.info('Full tube AP357: {}'.format(_apline))
 
 # interacting with data
@@ -1744,6 +1493,77 @@ def _lboxes_forward(data_input, model_wf):
     result = model_wf.model(inputs, boxes)
     preds = result['x_final']
     return labels, preds
+
+
+def _ftube_extract(
+        connections_f, model_wf, extract_fold,
+        cf, cn, dataset):
+    BATCH_SIZE = 32
+    NUM_WORKERS = 4
+    sampler_grid = Sampler_grid(
+            cn.DATA.NUM_FRAMES, cn.DATA.SAMPLING_RATE)
+    frameloader_vsf = Frameloader_video_slowfast(
+            False, cn.SLOWFAST.ALPHA, cn.DATA.CROP_SIZE, 'ltrd')
+
+    # Means
+    norm_mean_cu = np_to_gpu(cn.DATA.MEAN)
+    norm_std_cu = np_to_gpu(cn.DATA.STD)
+
+    def prepare_func(start_i):
+        # start_i defined wrt keys in connections_f
+        remaining_dict = dict(list(
+            connections_f.items())[start_i+1:])
+        tdataset_kf = TDataset_over_connections(
+            remaining_dict, dataset, sampler_grid, frameloader_vsf)
+        loader = torch.utils.data.DataLoader(tdataset_kf,
+            batch_size=BATCH_SIZE, shuffle=False,
+            num_workers=NUM_WORKERS, pin_memory=True,
+            collate_fn=sequence_batch_collate_v2)
+        return loader
+
+    def func(data_input):
+        Xts, metas = data_input
+        Xts_f32c = [to_gpu_normalize_permute(
+            x, norm_mean_cu, norm_std_cu) for x in Xts]
+        # bbox transformations
+        bboxes_np = [m['bboxes_tldr'] for m in metas]
+        counts = np.array([len(x) for x in bboxes_np])
+        batch_indices = np.repeat(np.arange(len(counts)), counts)
+        bboxes0 = np.c_[batch_indices, np.vstack(bboxes_np)]
+        bboxes0 = torch.from_numpy(bboxes0)
+        bboxes0_c = bboxes0.type(torch.cuda.FloatTensor)
+
+        with torch.no_grad():
+            result = model_wf.model.forward(Xts_f32c, bboxes0_c)
+        result_dict = {}
+        for k, v in result.items():
+            out_np = v.cpu().numpy()
+            out_split = np.split(out_np,
+                np.cumsum(counts), axis=0)[:-1]
+            result_dict[k] = out_split
+
+        # Find last index over global structure
+        # back to tuple, since dataloader casts to list
+        ckey = tuple(metas[-1]['ckey'])
+        ckeys = list(connections_f.keys())
+        last_i = ckeys.index(ckey)
+        return result_dict, last_i
+
+    disaver_fold = small.mkdir(extract_fold/'disaver')
+    total = len(connections_f)
+    disaver = Dataloader_isaver(disaver_fold, total, func, prepare_func,
+        save_interval_seconds=cf['batch_save_interval_seconds'],
+        log_interval=30)
+
+    model_wf.set_eval()
+    outputs = disaver.run()
+
+    keys = next(iter(outputs)).keys()
+    dict_outputs = {}
+    for k in keys:
+        key_outputs = [oo for o in outputs for oo in o[k]]
+        dict_outputs[k] = key_outputs
+    return dict_outputs
 
 # EXPERIMENTS
 
@@ -2077,14 +1897,17 @@ def finetune(workfolder, cfg_dict, add_args):
 def full_tube_eval(workfolder, cfg_dict, add_args):
     out, = snippets.get_subfolders(workfolder, ['out'])
     cfg = snippets.YConfig_v2(cfg_dict,
-            allowed_wo_defaults=['CN.', 'train.', 'period.'])
+            allowed_wo_defaults=[''])
     Ncfg_daly.set_defcfg_v2(cfg)
     cfg.set_defaults_yaml("""
     seed: 42
     inputs:
         tubes_dwein: ~
         keyframes_rgb: ~
-        ckpt: ~
+        ckpt:
+            fold: ~
+            epoch: ~
+            path: ~
     split_assignment: !def ['train/val',
         ['train/val', 'trainval/test']]
     freeze:
@@ -2096,10 +1919,14 @@ def full_tube_eval(workfolder, cfg_dict, add_args):
         stride: 4
     batch_save_interval_seconds: 120
     compute_split:
-        enabled: False
-        chunk: !def {default: 0, evalcheck: "VALUE >= 0"}
+        chunk: 0
         total: 1
-    mode: !def ['roi', ['roi', 'fullframe']]
+    detect_mode: !def ['roipooled', ['fullframe', 'roipooled']]
+    eval:
+        full_tubes:
+            nms: 0.3
+            field_nms: 'box_det_score'  # hscore
+            field_det: 'box_det_score'  # hscore*frame_cls_score
     """)
     cf = cfg.parse()
     cn = _config_preparations(cfg.without_prefix('CN.'))
@@ -2120,117 +1947,72 @@ def full_tube_eval(workfolder, cfg_dict, add_args):
             cf['inputs.tubes_dwein'], dataset, vgroup)
     tubes_dwein_prov: Dict[I_dwein, Tube_daly_wein_as_provided] = \
             small.load_pkl(cf['inputs.tubes_dwein'])
-    # Means
-    norm_mean_cu = np_to_gpu(cn.DATA.MEAN)
-    norm_std_cu = np_to_gpu(cn.DATA.STD)
     # Sset
     tubes_dwein_eval = tubes_dwein_d[sset_eval]
     tubes_dgt_eval = tubes_dgt_d[sset_eval]
 
-    # Model
-    if cf['mode'] == 'roi':
-        n_outputs = 11
-        model_wf = Model_w_freezer(cf, cn, n_outputs)
-    elif cf['mode'] == 'fullframe':
-        n_outputs = 10
-        model_wf = Model_w_freezer_fullframe(cf, cn, n_outputs)
+    # / Create appropriate model
+    detect_mode = cf['detect_mode']
+    if detect_mode == 'roipooled':
+        output_dims = 11
+        model_wf = Model_w_freezer(cf, cn, output_dims)
+    elif detect_mode == 'fullframe':
+        output_dims = 10
+        model_wf = Model_w_freezer_fullframe(cf, cn, output_dims)
     else:
         raise RuntimeError()
-
     model_wf.model_to_gpu()
-    # Restore checkpoint
-    states = torch.load(cf['inputs.ckpt'])
+
+    # / Restore checkpoint
+    if cf['inputs.ckpt.path']:
+        ckpt_path = cf['inputs.ckpt.path']
+    elif cf['inputs.ckpt.fold']:
+        epoch = cf['inputs.ckpt.epoch']
+        modelname = Manager_checkpoint_name.ckpt_format.format(epoch)
+        ckpt_path = str(Path(cf['inputs.ckpt.fold'])/modelname)
+    else:
+        raise RuntimeError()
+    states = torch.load(ckpt_path)
     model_wf.model.load_state_dict(states['model_sdict'])
 
-    # Prepare
+    # / Prepare conections, determine split (if any) and folder
     frames_to_cover: Dict[Vid_daly, np.ndarray] = \
         sample_daly_frames_from_instances(dataset, cf['tubes.stride'])
     connections_f: Dict[Tuple[Vid_daly, int], Box_connections_dwti]
     connections_f = group_tubes_on_frame_level(
             tubes_dwein_eval, frames_to_cover)
     # Here we'll run our connection split
-    if cf['compute_split.enabled']:
+    if cf['compute_split.total'] > 1:
         cc, ct = (cf['compute_split.chunk'], cf['compute_split.total'])
-        connections_f = perform_connections_split(connections_f, cc, ct, False)
+        if '--chunk' in add_args:
+            cc = int(add_args[add_args.index('--chunk')+1])
+            log.info('Due to shell argument chunk set {} -> {}'.format(
+                cf['compute_split.chunk'], cc))
+        compute_connections_f = perform_connections_split(
+                connections_f, cc, ct, False)
+    else:
+        compute_connections_f = connections_f
+        cc, ct = 0, 1
 
-    BATCH_SIZE = 32
-    NUM_WORKERS = 4
-    sampler_grid = Sampler_grid(cn.DATA.NUM_FRAMES, cn.DATA.SAMPLING_RATE)
-    frameloader_vsf = Frameloader_video_slowfast(
-            False, cn.SLOWFAST.ALPHA, cn.DATA.CROP_SIZE, 'ltrd')
+    extract_fold = out/f'chunk_{cc}_of_{ct}'
+    dict_outputs = _ftube_extract(
+        connections_f, model_wf, extract_fold, cf, cn, dataset)
+    small.save_pkl(extract_fold/'dict_outputs.pkl', dict_outputs)
+    small.save_pkl(extract_fold/'connections_f.pkl', compute_connections_f)
 
-    def prepare_func(start_i):
-        # start_i defined wrt keys in connections_f
-        remaining_dict = dict(list(
-            connections_f.items())[start_i+1:])
-        tdataset_kf = TDataset_over_connections(
-            remaining_dict, dataset, sampler_grid, frameloader_vsf)
-        loader = torch.utils.data.DataLoader(tdataset_kf,
-            batch_size=BATCH_SIZE, shuffle=False,
-            num_workers=NUM_WORKERS, pin_memory=True,
-            collate_fn=sequence_batch_collate_v2)
-        return loader
-
-    def func(data_input):
-        Xts, metas = data_input
-        Xts_f32c = [to_gpu_normalize_permute(
-            x, norm_mean_cu, norm_std_cu) for x in Xts]
-        # bbox transformations
-        bboxes_np = [m['bboxes_tldr'] for m in metas]
-        counts = np.array([len(x) for x in bboxes_np])
-        batch_indices = np.repeat(np.arange(len(counts)), counts)
-        bboxes0 = np.c_[batch_indices, np.vstack(bboxes_np)]
-        bboxes0 = torch.from_numpy(bboxes0)
-        bboxes0_c = bboxes0.type(torch.cuda.FloatTensor)
-
-        with torch.no_grad():
-            result = model_wf.model.forward(Xts_f32c, bboxes0_c)
-        result_dict = {}
-        for k, v in result.items():
-            out_np = v.cpu().numpy()
-            out_split = np.split(out_np,
-                np.cumsum(counts), axis=0)[:-1]
-            result_dict[k] = out_split
-
-        # Find last index over global structure
-        # back to tuple, since dataloader casts to list
-        ckey = tuple(metas[-1]['ckey'])
-        ckeys = list(connections_f.keys())
-        last_i = ckeys.index(ckey)
-        return result_dict, last_i
-
-    disaver_fold = small.mkdir(out/'disaver')
-    total = len(connections_f)
-    disaver = Dataloader_isaver(disaver_fold, total, func, prepare_func,
-        save_interval_seconds=cf['batch_save_interval_seconds'],
-        log_interval=30)
-
-    model_wf.set_eval()
-    outputs = disaver.run()
-
-    keys = next(iter(outputs)).keys()
-    dict_outputs = {}
-    for k in keys:
-        key_outputs = [oo for o in outputs for oo in o[k]]
-        dict_outputs[k] = key_outputs
-
-    small.save_pkl(out/'dict_outputs.pkl', dict_outputs)
-    small.save_pkl(out/'connections_f.pkl', connections_f)
-
-    if not cf['compute_split.enabled']:
+    attempt_eval = (cc, ct == 0, 1)
+    if attempt_eval:
+        assert ct == 1
         log.info('We can eval right away')
-        if cf['mode'] == 'roi':
-            _, dwti_to_label_eval = qload_synthetic_tube_labels(
-                tubes_dgt_eval, tubes_dwein_eval, dataset)
-            full_tube_perf_eval(dict_outputs['x_final'], connections_f,
-                dataset, dwti_to_label_eval,
-                tubes_dgt_eval, tubes_dwein_eval)
-        elif cf['mode'] == 'fullframe':
-            full_tube_full_frame_perf_eval(
-                dict_outputs['x_final'], connections_f, tubes_dwein_prov,
-                dataset, tubes_dwein_eval, tubes_dgt_eval)
-        else:
-            raise RuntimeError()
+        _, dwti_to_label_eval = qload_synthetic_tube_labels(
+            tubes_dgt_eval, tubes_dwein_eval, dataset)
+        finetube_perf_fulltube_evaluate(
+            dict_outputs['x_final'], connections_f,
+            tubes_dwein_eval, tubes_dwein_prov, tubes_dgt_eval,
+            dwti_to_label_eval, dataset, detect_mode,
+            cf['eval.full_tubes.nms'],
+            cf['eval.full_tubes.field_nms'],
+            cf['eval.full_tubes.field_det'])
 
 
 def combine_split_full_tube_eval(workfolder, cfg_dict, add_args):
@@ -2314,210 +2096,3 @@ def combine_split_full_tube_eval(workfolder, cfg_dict, add_args):
             dataset, tubes_dwein_eval, tubes_dgt_eval)
     else:
         raise RuntimeError()
-
-
-def finetune_on_fullframes(workfolder, cfg_dict, add_args):
-    """
-    Will finetune the c2d_1x1 model directly on video frames, sans boxes
-    """
-    out, = snippets.get_subfolders(workfolder, ['out'])
-    cfg = snippets.YConfig_v2(cfg_dict,
-            allowed_wo_defaults=['CN.'])
-    Ncfg_daly.set_defcfg_v2(cfg)
-    _preset_defaults(cfg)
-    cf = cfg.parse()
-    cn = _config_preparations(cfg.without_prefix('CN.'))
-
-    # Seeds
-    initial_seed = cf['seed']
-    torch.manual_seed(initial_seed)
-    torch.cuda.manual_seed(initial_seed)
-    ts_rgen = np.random.default_rng(initial_seed)
-
-    # Data
-    # General DALY level preparation
-    dataset: Dataset_daly_ocv = Ncfg_daly.get_dataset(cf)
-    vgroup: Dict[str, List[Vid_daly]] = \
-            Ncfg_daly.get_vids(cf, dataset)
-    sset_train, sset_eval = cf['split_assignment'].split('/')
-    # wein tubes
-    tubes_dwein_d, tubes_dgt_d = load_gt_and_wein_tubes(
-            cf['inputs.tubes_dwein'], dataset, vgroup)
-    # Means
-    norm_mean_cu = np_to_gpu(cn.DATA.MEAN)
-    norm_std_cu = np_to_gpu(cn.DATA.STD)
-    # Sset
-    tubes_dwein_eval = tubes_dwein_d[sset_eval]
-    tubes_dgt_eval = tubes_dgt_d[sset_eval]
-
-    # Model
-    model_wf = Model_w_freezer_fullframe(cf, cn, 10)
-    optimizer = tsf_optim.construct_optimizer(model_wf.model, cn)
-    loss_fn = torch.nn.CrossEntropyLoss(reduction='mean')
-    model_wf.model.init_weights(0.01)
-    model_wf.model_to_gpu()
-
-    # / Training setup
-    max_epoch = cn.SOLVER.MAX_EPOCH
-    man_lkrgb = Manager_loader_krgb(
-            cf['inputs.keyframes_rgb'], dataset,
-            norm_mean_cu, norm_std_cu)
-
-    keyframes = create_keyframelist(dataset)
-    keyframes_train = [kf for kf in keyframes
-            if kf['vid'] in vgroup[sset_train]]
-
-    manli_full = Manager_loader_fullframes(
-        tubes_dgt_d[sset_train], dataset,
-        keyframes_train, norm_mean_cu, norm_std_cu)
-
-    eval_krgb_loader, eval_krgb_keyframes = man_lkrgb.get_eval_loader(
-        vgroup[sset_eval], cf['train.batch_size.eval'])
-
-    man_ckpt = Manager_model_checkpoints(model_wf.model, optimizer)
-
-    # Restore previous run
-    rundir = small.mkdir(out/'rundir')
-    checkpoint_path = (Manager_checkpoint_name
-            .find_last_checkpoint(rundir))
-    if '--new' in add_args:
-        Manager_checkpoint_name.rename_old_rundir(rundir)
-        checkpoint_path = None
-    start_epoch = man_ckpt.restore_model_magic(checkpoint_path,
-            cf['inputs.ckpt'], cf['train.start_epoch'])
-
-    batch_size_train = cf['train.batch_size.train']
-    frame_dist = cf['train.tubes.frame_dist']
-    add_keyframes = cf['train.tubes.add_keyframes']
-    NUM_WORKERS = cf['train.num_workers']
-
-    # Eval check after restore
-    i_epoch = start_epoch-1
-    if checkpoint_path and check_step(i_epoch, cf['period.i_epoch.eval_krgb']):
-        fqtimer = snippets.misc.FQTimer()
-        log.info(f'Perf at [{i_epoch}]')
-        model_wf.set_eval()
-        _evaluate_krgb_perf(model_wf, eval_krgb_loader,
-            eval_krgb_keyframes, tubes_dwein_eval, tubes_dgt_eval,
-            dataset, man_lkrgb.preprocess_data, cut_off_bg=False)
-        fqtimer.release(f'KRGB Evaluation at epoch {i_epoch}')
-
-    # Training
-    for i_epoch in range(start_epoch, max_epoch):
-        log.info(f'New epoch {i_epoch}')
-        fqtimer = snippets.misc.FQTimer()
-
-        folder_epoch = small.mkdir(rundir/f'TRAIN/{i_epoch:03d}')
-
-        # Reset seed to i_epoch + seed
-        torch.manual_seed(initial_seed+i_epoch)
-        torch.cuda.manual_seed(initial_seed+i_epoch)
-        ts_rgen = np.random.default_rng(initial_seed+i_epoch)
-
-        labeled_frames = manli_full.get_labeled_frames()
-        # Permute
-        prm_order = ts_rgen.permutation(len(labeled_frames))
-        labeled_frames_permuted = [labeled_frames[i] for i in prm_order]
-        # Fake the frame_groups
-        frame_groups_permuted: Dict[Tuple[Vid_daly, int], List] = {}
-        for lfp in labeled_frames_permuted:
-            vid = lfp['vid']
-            frame_ind = lfp['frame_ind']
-            frame_groups_permuted[(vid, frame_ind)] = [lfp]
-        # Dataset over permuted frame groups
-        td = TDataset_over_fgroups(
-                cf, cn, frame_groups_permuted, manli_full.dataset)
-        # Perform batching ourselves
-        idx_batches = snippets.misc.leqn_split(np.arange(
-            len(frame_groups_permuted)), batch_size_train, 'sharp')
-
-        wavg_loss = snippets.misc.WindowAverager(10)
-
-        # Loader
-        def init_dataloader(i_start):
-            remaining_idx_batches = idx_batches[i_start:]
-            bsampler = BSampler_prepared(remaining_idx_batches)
-            train_loader = torch.utils.data.DataLoader(td,
-                batch_sampler=bsampler,
-                num_workers=NUM_WORKERS,
-                collate_fn=sequence_batch_collate_v2)
-            return train_loader
-
-        def batch_forward(i_batch, total_batches, data_input):
-            model_wf.set_train()
-            # preprocess data, transfer to GPU
-            frame_list, metas, = data_input
-
-            # bbox transformations
-            bboxes_np = [m['bboxes'] for m in metas]
-            counts = np.array([len(x) for x in bboxes_np])
-            batch_indices = np.repeat(np.arange(len(counts)), counts)
-            bboxes0 = np.c_[batch_indices, np.vstack(bboxes_np)]
-            bboxes0 = torch.from_numpy(bboxes0)
-            bboxes0_c = bboxes0.type(torch.cuda.FloatTensor)
-
-            # labels
-            labels_np = [m['labels'] for m in metas]
-            labels_np = np.hstack(labels_np)
-            labels_t = torch.from_numpy(labels_np)
-            labels_c = labels_t.cuda()
-
-            inputs = [x.type(torch.cuda.FloatTensor) for x in frame_list]
-            boxes = bboxes0_c
-            labels = labels_c
-
-            # Update learning rate
-            lr = tsf_optim.get_lr_at_epoch(cn,
-                    i_epoch + float(i_batch) / total_batches)
-            set_lr(optimizer, lr)
-
-            result = model_wf.model(inputs, boxes)
-            preds = result['x_final']
-
-            # Compute loss
-            loss = loss_fn(preds, labels)
-            # check nan Loss.
-            sf_misc.check_nan_losses(loss)
-            # Perform the backward pass.
-            optimizer.zero_grad()
-            loss.backward()
-            # Update the parameters.
-            optimizer.step()
-
-            # Loss update
-            wavg_loss.update(loss.item())
-
-            if check_step(i_batch, cf['period.i_batch.loss_log']):
-                log.info(f'[{i_epoch}, {i_batch}/{total_batches}]'
-                    f' {lr=} loss={wavg_loss}')
-            if check_step(i_batch, cf['period.i_batch.eval_krgb']):
-                log.info(f'Perf at [{i_epoch}, {i_batch}]')
-                model_wf.set_eval()
-                _evaluate_krgb_perf(model_wf, eval_krgb_loader,
-                    eval_krgb_keyframes, tubes_dwein_eval, tubes_dgt_eval,
-                    dataset, man_lkrgb.preprocess_data, cut_off_bg=False)
-                model_wf.set_train()
-
-        isaver = Isaver_train_epoch(
-                folder_epoch, len(idx_batches),
-                init_dataloader, batch_forward,
-                i_epoch, model_wf.model, optimizer,
-                interval_seconds=cf['train.batch_save_interval_seconds'])
-        isaver.run()
-
-        # Save part
-        man_ckpt.save_epoch(rundir, i_epoch)
-
-        # Remove temporary helpers
-        shutil.rmtree(folder_epoch)
-        fqtimer.release(f'Epoch {i_epoch} computations')
-
-        # Eval part
-        if check_step(i_epoch, cf['period.i_epoch.eval_krgb']):
-            fqtimer = snippets.misc.FQTimer()
-            log.info(f'Perf at [{i_epoch}]')
-            model_wf.set_eval()
-            _evaluate_krgb_perf(model_wf, eval_krgb_loader,
-                eval_krgb_keyframes, tubes_dwein_eval, tubes_dgt_eval,
-                dataset, man_lkrgb.preprocess_data, cut_off_bg=False)
-            fqtimer.release(f'KRGB Evaluation at epoch {i_epoch}')
