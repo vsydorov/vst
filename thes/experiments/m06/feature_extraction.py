@@ -282,6 +282,7 @@ class Ncfg_extractor:
             extraction_mode: ['roi', ['roi', 'fullframe']]
             fullframe_mode: ['tavg_smax', ['tavg_smax', 'ts_avg']]
             image_size: [256, int]
+            sampling_rate: [~, ~]
         extraction:
             box_orientation: ['ltrd', ['tldr', 'ltrd']]  # The other way is wrong
             batch_size: [8, int]
@@ -328,6 +329,8 @@ class Ncfg_extractor:
 
         model_nframes = sf_cfg.DATA.NUM_FRAMES
         model_sample = sf_cfg.DATA.SAMPLING_RATE
+        if (samprate := cf['extractor.sampling_rate']) is not None:
+            model_sample = samprate
         slowfast_alpha = sf_cfg.SLOWFAST.ALPHA
 
         is_slowfast = isinstance(fextractor.model,
