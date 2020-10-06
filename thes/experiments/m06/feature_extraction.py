@@ -728,22 +728,32 @@ def extract_keyframe_rgb(workfolder, cfg_dict, add_args):
     out, = snippets.get_subfolders(workfolder, ['out'])
     cfg = snippets.YConfig(cfg_dict)
     Ncfg_daly.set_defcfg(cfg)
+    cfg.set_deftype("""
+    nframes: [1, int]
+    sample: [1, int]
+    frame_size: [256, int]
+    subset_vids: [~, ~]
+    """)
     cf = cfg.parse()
     # prepare data
     dataset: Dataset_daly_ocv = Ncfg_daly.get_dataset(cf)
+    vgroup: Dict[str, List[Vid_daly]] = Ncfg_daly.get_vids(cf, dataset)
     keyframes = create_keyframelist(dataset)
+    if cf['subset_vids'] is not None:
+        subset_vids = vgroup[cf['subset_vids']]
+        keyframes = [kf for kf in keyframes if kf['vid'] in subset_vids]
     keyframes_dict = to_keyframedict(keyframes)
     # prepare others
     NUM_WORKERS = 12
     BATCH_SIZE = 32
 
-    model_nframes = 1
-    model_sample = 1
+    model_nframes = cf['nframes']
+    model_sample = cf['sample']
     is_slowfast = False
     slowfast_alpha = 8
     sampler_grid = Sampler_grid(model_nframes, model_sample)
     frameloader_vsf = Frameloader_video_slowfast(
-            is_slowfast, slowfast_alpha, 256, 'ltrd')
+            is_slowfast, slowfast_alpha, cf['frame_size'], 'ltrd')
 
     def prepare_func(start_i):
         remaining_keyframes_dict = dict(list(

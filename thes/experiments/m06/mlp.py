@@ -1166,8 +1166,7 @@ def fancy_evaluate(workfolder, cfg_dict, add_args):
         tubes_dwein_feats:
             fold: ~
             kind: !def ['roipooled', ['fullframe', 'roipooled']]
-        roi_ckpt: ~
-        full_ckpt: ~
+        ckpt: ~
     seed: 42
     split_assignment: !def ['train/val',
         ['train/val', 'trainval/test']]

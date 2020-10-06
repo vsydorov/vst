@@ -360,14 +360,14 @@ class Freezer(object):
         self.maybe_freeze_batchnorm()
 
 
-class Head_roitune(nn.Module):
+class Head_roitune_c2d_1x1(nn.Module):
     def __init__(self, cn, num_classes,
             dropout_rate, debug_outputs):
-        super(Head_roitune, self).__init__()
-        self._construct_roitune(cn, num_classes, dropout_rate)
+        super(Head_roitune_c2d_1x1, self).__init__()
+        self._construct_head(cn, num_classes, dropout_rate)
         self.debug_outputs = debug_outputs
 
-    def _construct_roitune(self, cn, num_classes, dropout_rate):
+    def _construct_head(self, cn, num_classes, dropout_rate):
         # params
         xform_resolution = 7
         resolution = [[xform_resolution] * 2]
@@ -425,47 +425,14 @@ class Head_roitune(nn.Module):
         return result
 
 
-class C2D_1x1_roitune(M_resnet):
+class Head_fullframe_c2d_1x1(nn.Module):
     def __init__(self, cn, num_classes,
             dropout_rate, debug_outputs):
-        super(M_resnet, self).__init__()
-        self.norm_module = get_norm(cn)
-        self.enable_detection = cn.DETECTION.ENABLE
-        self.num_pathways = 1
-        self._construct_network(cn)
-        self.head = Head_roitune(cn, num_classes,
-                dropout_rate, debug_outputs)
-
-    def forward(self, x, bboxes0):
-        # hforward_resnet_nopool
-        # slowfast/models/video_model_builder.py/ResNet.forward
-        x = self.s1(x)
-        x = self.s2(x)
-        x = self.s3(x)
-        x = self.s4(x)
-        x = self.s5(x)
-        x = self.head(x, bboxes0)
-        return x
-
-    def init_weights(self, init_std, ll_generator=None):
-        # Init all weights
-        init_helper.init_weights(
-            self, init_std, False)
-
-        if ll_generator is not None:
-            self.head.rt_projection.weight.data.normal_(
-                    mean=0.0, std=init_std, generator=ll_generator)
-            self.head.rt_projection.bias.data.zero_()
-
-
-class Head_fullframe(nn.Module):
-    def __init__(self, cn, num_classes,
-            dropout_rate, debug_outputs):
-        super(Head_fullframe, self).__init__()
-        self._construct_roitune(cn, num_classes, dropout_rate)
+        super(Head_fullframe_c2d_1x1, self).__init__()
+        self._construct_head(cn, num_classes, dropout_rate)
         self.debug_outputs = debug_outputs
 
-    def _construct_roitune(self, cn, num_classes, dropout_rate):
+    def _construct_head(self, cn, num_classes, dropout_rate):
         # this is us following "resnet" archi
         POOL_SIZE = SF_POOL1[cn.MODEL.ARCH]
         pool_size_head = [
@@ -508,7 +475,7 @@ class Head_fullframe(nn.Module):
         return result
 
 
-class C2D_1x1_fullframe(M_resnet):
+class C2D_1x1_roitune(M_resnet):
     def __init__(self, cn, num_classes,
             dropout_rate, debug_outputs):
         super(M_resnet, self).__init__()
@@ -516,7 +483,7 @@ class C2D_1x1_fullframe(M_resnet):
         self.enable_detection = cn.DETECTION.ENABLE
         self.num_pathways = 1
         self._construct_network(cn)
-        self.head = Head_fullframe(cn, num_classes,
+        self.head = Head_roitune_c2d_1x1(cn, num_classes,
                 dropout_rate, debug_outputs)
 
     def forward(self, x, bboxes0):
@@ -539,6 +506,149 @@ class C2D_1x1_fullframe(M_resnet):
             self.head.rt_projection.weight.data.normal_(
                     mean=0.0, std=init_std, generator=ll_generator)
             self.head.rt_projection.bias.data.zero_()
+
+
+class C2D_1x1_fullframe(M_resnet):
+    def __init__(self, cn, num_classes,
+            dropout_rate, debug_outputs):
+        super(M_resnet, self).__init__()
+        self.norm_module = get_norm(cn)
+        self.enable_detection = cn.DETECTION.ENABLE
+        self.num_pathways = 1
+        self._construct_network(cn)
+        self.head = Head_fullframe_c2d_1x1(cn, num_classes,
+                dropout_rate, debug_outputs)
+
+    def forward(self, x, bboxes0):
+        # hforward_resnet_nopool
+        # slowfast/models/video_model_builder.py/ResNet.forward
+        x = self.s1(x)
+        x = self.s2(x)
+        x = self.s3(x)
+        x = self.s4(x)
+        x = self.s5(x)
+        x = self.head(x, bboxes0)
+        return x
+
+    def init_weights(self, init_std, ll_generator=None):
+        # Init all weights
+        init_helper.init_weights(
+            self, init_std, False)
+
+        if ll_generator is not None:
+            self.head.rt_projection.weight.data.normal_(
+                    mean=0.0, std=init_std, generator=ll_generator)
+            self.head.rt_projection.bias.data.zero_()
+
+
+class Head_fullframe_sf_8x8(nn.Module):
+    def __init__(self, cn, num_classes,
+            dropout_rate, debug_outputs):
+        super(Head_fullframe_sf_8x8, self).__init__()
+        self.num_pathways = 2
+        raise NotImplementedError()
+
+    def _construct_head(self, cn, num_classes, dropout_rate):
+        raise NotImplementedError()
+
+
+class Head_roitune_sf_8x8(nn.Module):
+    def __init__(self, cn, num_classes,
+            dropout_rate, debug_outputs):
+        super(Head_roitune_sf_8x8, self).__init__()
+        self.num_pathways = 2
+        self._construct_head(cn, num_classes, dropout_rate)
+        self.debug_outputs = debug_outputs
+
+    def _construct_head(self, cn, num_classes, dropout_rate):
+        # params
+        model_nframes = cn.DATA.NUM_FRAMES
+        POOL1 = SF_POOL1[cn.MODEL.ARCH]
+        width_per_group = cn.RESNET.WIDTH_PER_GROUP
+        xform_resolution = 7
+        slowfast_alpha = cn.SLOWFAST.ALPHA
+
+        dim_in = [
+            width_per_group * 32,
+            width_per_group * 32 // cn.SLOWFAST.BETA_INV,
+        ]
+        pool_size = [
+            [model_nframes//slowfast_alpha//POOL1[0][0], 1, 1],
+            [model_nframes//POOL1[1][0], 1, 1]]
+        resolution = [[xform_resolution] * 2] * 2
+        scale_factor = [32] * 2
+
+        for pi in range(self.num_pathways):
+            tpool = nn.AvgPool3d(
+                    [pool_size[pi][0], 1, 1], stride=1)
+            self.add_module(f's{pi}_tpool', tpool)
+            roi_align = ROIAlign(
+                    resolution[pi],
+                    spatial_scale=1.0/scale_factor[pi],
+                    sampling_ratio=0,
+                    aligned=True)
+            self.add_module(f's{pi}_roi', roi_align)
+            spool = nn.MaxPool2d(resolution[pi], stride=1)
+            self.add_module(f's{pi}_spool', spool)
+
+        if dropout_rate > 0.0:
+            self.rt_dropout = nn.Dropout(dropout_rate)
+        self.rt_projection = nn.Linear(sum(dim_in), num_classes, bias=True)
+        self.rt_act = nn.Softmax(dim=-1)
+
+    def forward(self, feats_in, bboxes0):
+        pool_out = []
+        for pi in range(self.num_pathways):
+            t_pool = getattr(self, f's{pi}_tpool', None)
+            out = t_pool(feats_in[pi])
+            assert out.shape[2] == 1
+            out = torch.squeeze(out, 2)
+            roi_align = getattr(self, f's{pi}_roi')
+            out = roi_align(out, bboxes0)
+            s_pool = getattr(self, f's{pi}_spool')
+            out = s_pool(out)
+            pool_out.append(out)
+        # B C H W.
+        x = torch.cat(pool_out, 1)
+
+        # Perform dropout.
+        if hasattr(self, "rt_dropout"):
+            x = self.rt_dropout(x)
+
+        x = x.view(x.shape[0], -1)
+        x = self.rt_projection(x)
+        x = self.rt_act(x)
+        result = {}
+        result['x_final'] = x
+
+class SF_8x8_custom_head(M_slowfast):
+    def __init__(self, cn, head):
+        super(M_slowfast, self).__init__()
+        self.norm_module = get_norm(cn)
+        self.enable_detection = cn.DETECTION.ENABLE
+        self.num_pathways = 2
+        self._construct_network(cn)
+        self.head = head
+
+    def init_weights(self, init_std):
+        init_helper.init_weights(self, init_std, False)
+
+    def forward(self, x, bboxes0):
+        # slowfast/models/video_model_builder.py/SlowFast.forward
+        x = self.s1(x)
+        x = self.s1_fuse(x)
+        x = self.s2(x)
+        x = self.s2_fuse(x)
+        for pathway in range(self.num_pathways):
+            pool = getattr(self, "pathway{}_pool".format(pathway))
+            x[pathway] = pool(x[pathway])
+        x = self.s3(x)
+        x = self.s3_fuse(x)
+        x = self.s4(x)
+        x = self.s4_fuse(x)
+        x = self.s5(x)
+        x = self.head(x, bboxes0)
+        return x
 
 
 class Manager_model_checkpoints(object):
@@ -699,7 +809,7 @@ def set_lr(optimizer, new_lr):
         param_group["lr"] = new_lr
 
 
-def _config_preparations(cf_override):
+def _config_preparations_c2d_1x1(cf_override):
     # / Configs
     # // CN for C2D_1x1 we are loading
     rel_yml_path = 'Kinetics/C2D_8x8_R50_IN1K.yaml'
@@ -709,6 +819,16 @@ def _config_preparations(cf_override):
     cn.NUM_GPUS = 1
     cn.DATA.NUM_FRAMES = 1
     cn.DATA.SAMPLING_RATE = 1
+    return cn
+
+def _config_preparations_sf_8x8(cf_override):
+    # / Configs
+    # // CN for C2D_1x1 we are loading
+    rel_yml_path = 'Kinetics/c2/SLOWFAST_8x8_R50.yaml'
+    cn = basic_sf_cfg(rel_yml_path)
+    merge_cf_into_cfgnode(cn, cf_override)
+    # Set up last, since necessary for C2D_1x1
+    cn.NUM_GPUS = 1
     return cn
 
 
@@ -936,7 +1056,7 @@ def _train_epoch(
                 func(locals())
 
 
-def _evaluate_krgb_perf(model_wf, eval_loader, eval_keyframes,
+def _evaluate_krgb_perf(model, eval_loader, eval_keyframes,
         tubes_dwein_eval, tubes_dgt_eval, dataset,
         inputs_converter, cut_off_bg, print_timers=False):
     eval_timers = snippets.TicToc(
@@ -948,7 +1068,7 @@ def _evaluate_krgb_perf(model_wf, eval_loader, eval_keyframes,
         frame_list_f32c, bboxes0_c, labels_c = \
             inputs_converter(data_input)
         with torch.no_grad():
-            result = model_wf.model(frame_list_f32c, bboxes0_c)
+            result = model(frame_list_f32c, bboxes0_c)
         pred = result['x_final']
         pred_np = pred.cpu().numpy()
         all_softmaxes_.append(pred_np)
@@ -1428,7 +1548,7 @@ def _prepare_permute_lframes(
     return tdataset, idx_batches
 
 
-def _lframes_forward(data_input, model_wf):
+def _lframes_forward(data_input, model):
     frame_list, metas, = data_input
 
     labels_np = np.array([m['label'] for m in metas])
@@ -1437,7 +1557,7 @@ def _lframes_forward(data_input, model_wf):
 
     inputs = [x.type(torch.cuda.FloatTensor) for x in frame_list]
 
-    result = model_wf.model(inputs, None)
+    result = model(inputs, None)
     preds = result['x_final']
     return labels_c, preds
 
@@ -1468,7 +1588,7 @@ def _prepare_permute_lboxes(
         len(frame_groups_permuted)), batch_size_train, 'sharp')
     return tdataset, idx_batches
 
-def _lboxes_forward(data_input, model_wf):
+def _lboxes_forward(data_input, model):
     # preprocess data, transfer to GPU
     frame_list, metas, = data_input
 
@@ -1490,7 +1610,7 @@ def _lboxes_forward(data_input, model_wf):
     boxes = bboxes0_c
     labels = labels_c
 
-    result = model_wf.model(inputs, boxes)
+    result = model(inputs, boxes)
     preds = result['x_final']
     return labels, preds
 
@@ -1587,7 +1707,7 @@ def finetune_preextracted_krgb(workfolder, cfg_dict, add_args):
     n_outputs: !def [10, [10, 11]]
     """, allow_overwrite=True)
     cf = cfg.parse()
-    cn = _config_preparations(cfg.without_prefix('CN.'))
+    cn = _config_preparations_c2d_1x1(cfg.without_prefix('CN.'))
 
     # Seeds
     initial_seed = cf['seed']
@@ -1686,7 +1806,7 @@ def finetune_preextracted_krgb(workfolder, cfg_dict, add_args):
             if check_step(i_batch, cf['period.i_batch.eval_krgb']):
                 log.info(f'Perf at [{i_epoch}, {i_batch}]')
                 model_wf.set_eval()
-                _evaluate_krgb_perf(model_wf, eval_krgb_loader,
+                _evaluate_krgb_perf(model_wf.model, eval_krgb_loader,
                     eval_krgb_keyframes, tubes_dwein_eval, tubes_dgt_eval,
                     dataset, man_lkrgb.preprocess_data, cut_off_bg=CUT_OFF_BG)
                 model_wf.set_train()
@@ -1696,7 +1816,7 @@ def finetune_preextracted_krgb(workfolder, cfg_dict, add_args):
         # Eval part
         model_wf.set_eval()
         log.info(f'Perf at [{i_epoch}]')
-        _evaluate_krgb_perf(model_wf, eval_krgb_loader,
+        _evaluate_krgb_perf(model_wf.model, eval_krgb_loader,
             eval_krgb_keyframes, tubes_dwein_eval, tubes_dgt_eval,
             dataset, man_lkrgb.preprocess_data, cut_off_bg=CUT_OFF_BG)
 
@@ -1714,7 +1834,7 @@ def finetune(workfolder, cfg_dict, add_args):
     detect_mode: !def ['roipooled', ['fullframe', 'roipooled']]
     """)
     cf = cfg.parse()
-    cn = _config_preparations(cfg.without_prefix('CN.'))
+    cn = _config_preparations_c2d_1x1(cfg.without_prefix('CN.'))
 
     # Seeds
     initial_seed = cf['seed']
@@ -1839,9 +1959,9 @@ def finetune(workfolder, cfg_dict, add_args):
             set_lr(optimizer, lr)
 
             if detect_mode == 'fullframe':
-                labels, preds = _lframes_forward(data_input, model_wf)
+                labels, preds = _lframes_forward(data_input, model_wf.model)
             elif detect_mode == 'roipooled':
-                labels, preds = _lboxes_forward(data_input, model_wf)
+                labels, preds = _lboxes_forward(data_input, model_wf.model)
             else:
                 raise RuntimeError()
 
@@ -1864,7 +1984,7 @@ def finetune(workfolder, cfg_dict, add_args):
             if check_step(i_batch, cf['period.i_batch.eval_krgb']):
                 log.info(f'Perf at [{i_epoch}, {i_batch}]')
                 model_wf.set_eval()
-                _evaluate_krgb_perf(model_wf, eval_krgb_loader,
+                _evaluate_krgb_perf(model_wf.model, eval_krgb_loader,
                     eval_krgb_keyframes, tubes_dwein_eval, tubes_dgt_eval,
                     dataset, man_lkrgb.preprocess_data, cut_off_bg=cut_off_bg)
                 model_wf.set_train()
@@ -1888,7 +2008,206 @@ def finetune(workfolder, cfg_dict, add_args):
             fqtimer = snippets.misc.FQTimer()
             log.info(f'Perf at [{i_epoch}]')
             model_wf.set_eval()
-            _evaluate_krgb_perf(model_wf, eval_krgb_loader,
+            _evaluate_krgb_perf(model_wf.model, eval_krgb_loader,
+                eval_krgb_keyframes, tubes_dwein_eval, tubes_dgt_eval,
+                dataset, man_lkrgb.preprocess_data, cut_off_bg=cut_off_bg)
+            fqtimer.release(f'KRGB Evaluation at epoch {i_epoch}')
+
+
+def finetune_sf8x8(workfolder, cfg_dict, add_args):
+    """
+    Will finetune the c2d_1x1 model directly on video frames
+    """
+    out, = snippets.get_subfolders(workfolder, ['out'])
+    cfg = snippets.YConfig_v2(cfg_dict,
+            allowed_wo_defaults=['CN.'])
+    Ncfg_daly.set_defcfg_v2(cfg)
+    _preset_defaults(cfg)
+    cfg.set_defaults_yaml("""
+    detect_mode: !def ['roipooled', ['fullframe', 'roipooled']]
+    """)
+    cf = cfg.parse()
+    cn = _config_preparations_sf_8x8(cfg.without_prefix('CN.'))
+
+    # Seeds
+    initial_seed = cf['seed']
+    torch.manual_seed(initial_seed)
+    torch.cuda.manual_seed(initial_seed)
+    ts_rgen = np.random.default_rng(initial_seed)
+
+    # Data
+    # General DALY level preparation
+    dataset: Dataset_daly_ocv = Ncfg_daly.get_dataset(cf)
+    vgroup: Dict[str, List[Vid_daly]] = \
+            Ncfg_daly.get_vids(cf, dataset)
+    sset_train, sset_eval = cf['split_assignment'].split('/')
+    # wein tubes
+    tubes_dwein_d, tubes_dgt_d = load_gt_and_wein_tubes(
+            cf['inputs.tubes_dwein'], dataset, vgroup)
+    # Means
+    norm_mean_cu = np_to_gpu(cn.DATA.MEAN)
+    norm_std_cu = np_to_gpu(cn.DATA.STD)
+    # Sset
+    tubes_dwein_train = tubes_dwein_d[sset_train]
+    tubes_dgt_train = tubes_dgt_d[sset_train]
+    tubes_dwein_eval = tubes_dwein_d[sset_eval]
+    tubes_dgt_eval = tubes_dgt_d[sset_eval]
+
+    detect_mode = cf['detect_mode']
+    stride = cf['train.tubes.stride']
+    top_n_matches = cf['train.tubes.top_n_matches']
+    max_distance = cf['train.tubes.frame_dist']
+    batch_size_train = cf['train.batch_size.train']
+
+    if detect_mode == 'fullframe':
+        labeled_frames: List[Frame_labeled] = \
+            prepare_label_fullframes_for_training(
+                tubes_dgt_train, dataset, stride, max_distance)
+        output_dims = 10
+        head = Head_fullframe_sf_8x8(cn, output_dims,
+                cf['ll_dropout'], cf['debug_outputs'])
+    elif detect_mode == 'roipooled':
+        add_keyframes = cf['train.tubes.add_keyframes']
+        keyframes = create_keyframelist(dataset)
+        keyframes_train = [kf for kf in keyframes
+                if kf['vid'] in vgroup[sset_train]]
+        labeled_boxes: List[Box_labeled] = \
+          prepare_label_roiboxes_for_training(
+            tubes_dgt_train, dataset, stride, max_distance,
+            tubes_dwein_train, keyframes_train, top_n_matches,
+            add_keyframes)
+        output_dims = 11
+        head = Head_roitune_sf_8x8(cn, output_dims,
+                cf['ll_dropout'], cf['debug_outputs'])
+    else:
+        raise RuntimeError()
+
+    model = SF_8x8_custom_head(cn, head)
+
+    cut_off_bg = output_dims == 11
+
+    # Model
+    optimizer = tsf_optim.construct_optimizer(model, cn)
+    loss_fn = torch.nn.CrossEntropyLoss(reduction='mean')
+    model.init_weights(0.01)
+    # move to gpu
+    cur_device = torch.cuda.current_device()
+    model = model.cuda(device=cur_device)
+
+    # / Training setup
+    max_epoch = cn.SOLVER.MAX_EPOCH
+    man_lkrgb = Manager_loader_krgb(
+            cf['inputs.keyframes_rgb'], dataset,
+            norm_mean_cu, norm_std_cu)
+
+    eval_krgb_loader, eval_krgb_keyframes = man_lkrgb.get_eval_loader(
+        vgroup[sset_eval], cf['train.batch_size.eval'])
+
+    man_ckpt = Manager_model_checkpoints(model, optimizer)
+
+    # Restore previous run
+    rundir = small.mkdir(out/'rundir')
+    checkpoint_path = (Manager_checkpoint_name
+            .find_last_checkpoint(rundir))
+    if '--new' in add_args:
+        Manager_checkpoint_name.rename_old_rundir(rundir)
+        checkpoint_path = None
+    start_epoch = man_ckpt.restore_model_magic(checkpoint_path,
+            cf['inputs.ckpt'], cf['train.start_epoch'])
+
+    batch_size_train = cf['train.batch_size.train']
+    NUM_WORKERS = cf['train.num_workers']
+    # Training
+    for i_epoch in range(start_epoch, max_epoch):
+        log.info(f'New epoch {i_epoch}')
+        fqtimer = snippets.misc.FQTimer()
+
+        folder_epoch = small.mkdir(rundir/f'TRAIN/{i_epoch:03d}')
+
+        # Reset seed to i_epoch + seed
+        torch.manual_seed(initial_seed+i_epoch)
+        torch.cuda.manual_seed(initial_seed+i_epoch)
+        ts_rgen = np.random.default_rng(initial_seed+i_epoch)
+
+        if detect_mode == 'fullframe':
+            tdataset, idx_batches = _prepare_permute_lframes(
+                cf, cn, dataset, batch_size_train, labeled_frames, ts_rgen)
+        elif detect_mode == 'roipooled':
+            tdataset, idx_batches = _prepare_permute_lboxes(
+                cf, cn, dataset, batch_size_train, labeled_boxes, ts_rgen)
+        else:
+            raise RuntimeError()
+
+        wavg_loss = snippets.misc.WindowAverager(10)
+
+        # Loader
+        def init_dataloader(i_start):
+            remaining_idx_batches = idx_batches[i_start:]
+            bsampler = BSampler_prepared(remaining_idx_batches)
+            train_loader = torch.utils.data.DataLoader(tdataset,
+                batch_sampler=bsampler,
+                num_workers=NUM_WORKERS,
+                collate_fn=sequence_batch_collate_v2)
+            return train_loader
+
+        def batch_forward(i_batch, total_batches, data_input):
+            model.train()
+            # Update learning rate
+            lr = tsf_optim.get_lr_at_epoch(cn,
+                    i_epoch + float(i_batch) / total_batches)
+            set_lr(optimizer, lr)
+
+            if detect_mode == 'fullframe':
+                labels, preds = _lframes_forward(data_input, model)
+            elif detect_mode == 'roipooled':
+                labels, preds = _lboxes_forward(data_input, model)
+            else:
+                raise RuntimeError()
+
+            # Compute loss
+            loss = loss_fn(preds, labels)
+            # check nan Loss.
+            sf_misc.check_nan_losses(loss)
+            # Perform the backward pass.
+            optimizer.zero_grad()
+            loss.backward()
+            # Update the parameters.
+            optimizer.step()
+
+            # Loss update
+            wavg_loss.update(loss.item())
+
+            if check_step(i_batch, cf['period.i_batch.loss_log']):
+                log.info(f'[{i_epoch}, {i_batch}/{total_batches}]'
+                    f' {lr=} loss={wavg_loss}')
+            if check_step(i_batch, cf['period.i_batch.eval_krgb']):
+                log.info(f'Perf at [{i_epoch}, {i_batch}]')
+                model.eval()
+                _evaluate_krgb_perf(model, eval_krgb_loader,
+                    eval_krgb_keyframes, tubes_dwein_eval, tubes_dgt_eval,
+                    dataset, man_lkrgb.preprocess_data, cut_off_bg=cut_off_bg)
+                model.train()
+
+        isaver = Isaver_train_epoch(
+                folder_epoch, len(idx_batches),
+                init_dataloader, batch_forward,
+                i_epoch, model, optimizer,
+                interval_seconds=cf['train.batch_save_interval_seconds'])
+        isaver.run()
+
+        # Save part
+        man_ckpt.save_epoch(rundir, i_epoch)
+
+        # Remove temporary helpers
+        shutil.rmtree(folder_epoch)
+        fqtimer.release(f'Epoch {i_epoch} computations')
+
+        # Eval part
+        if check_step(i_epoch, cf['period.i_epoch.eval_krgb']):
+            fqtimer = snippets.misc.FQTimer()
+            log.info(f'Perf at [{i_epoch}]')
+            model.set_eval()
+            _evaluate_krgb_perf(model, eval_krgb_loader,
                 eval_krgb_keyframes, tubes_dwein_eval, tubes_dgt_eval,
                 dataset, man_lkrgb.preprocess_data, cut_off_bg=cut_off_bg)
             fqtimer.release(f'KRGB Evaluation at epoch {i_epoch}')
@@ -1929,7 +2248,7 @@ def full_tube_eval(workfolder, cfg_dict, add_args):
             field_det: 'box_det_score'  # hscore*frame_cls_score
     """)
     cf = cfg.parse()
-    cn = _config_preparations(cfg.without_prefix('CN.'))
+    cn = _config_preparations_c2d_1x1(cfg.without_prefix('CN.'))
 
     # Seeds
     initial_seed = cf['seed']
