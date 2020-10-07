@@ -1277,6 +1277,7 @@ def merge_evaluate(workfolder, cfg_dict, add_args):
     seed: 42
     split_assignment: !def ['train/val',
         ['train/val', 'trainval/test']]
+    nms_scorefield: 'hscore'
     """)
     cf = cfg.parse()
     # Seeds
@@ -1404,8 +1405,8 @@ def merge_evaluate(workfolder, cfg_dict, add_args):
                     .setdefault(vid, []).append(stube))
 
     av_stubes: Any = copy.deepcopy(av_stubes_with_scores)
-    av_stubes = assign_scorefield(av_stubes, 'hscore')
-    # av_stubes = assign_scorefield(av_stubes, 'box_det_score')
+    nms_scorefield = cf['nms_scorefield']
+    av_stubes = assign_scorefield(av_stubes, nms_scorefield)
     av_stubes = av_stubes_above_score(av_stubes, 0.0)
     av_stubes = compute_nms_for_av_stubes(av_stubes, 0.3)
     # av_stubes = assign_scorefield(av_stubes, 'box_det_score')  # roi, 72.73
@@ -1416,3 +1417,5 @@ def merge_evaluate(workfolder, cfg_dict, add_args):
     df_ap_full = compute_ap_for_avtubes_as_df(
         av_gt_tubes, av_stubes, iou_thresholds, False, False)
     log.info(df_ap_full*100)
+    apline = '/'.join((df_ap_full*100).round(2).loc['all'].values.astype(str))
+    log.info('AP357: {}'.format(apline))
