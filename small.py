@@ -448,7 +448,7 @@ def add_pypath(path):
         sys.path.insert(0, path)
 
 
-def check_step_sslice(
+def check_step(
         step: int,
         period_sslice: str) -> bool:
     """

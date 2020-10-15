@@ -111,7 +111,7 @@ class Isaver_simple(Isaver_mixin_restore_save, Isaver_base):
         for i in pbar:
             self.result.append(self.func(self.arg_list[i]))
             # Save check
-            SAVE = small.check_step_sslice(i, self._save_period)
+            SAVE = small.check_step(i, self._save_period)
             if self._save_interval:
                 since_last_save = time.perf_counter() - self._time_last_save
                 SAVE |= since_last_save > self._save_interval
