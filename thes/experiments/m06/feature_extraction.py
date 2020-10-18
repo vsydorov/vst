@@ -143,7 +143,6 @@ class Head_featextract_fullframe(nn.Module):
                 raise RuntimeError()
 
     def forward(self, x):
-        # / Roi_Pooling
         pool_out = []
         for pi in range(self.num_pathways):
             if self.ffmode == 'tavg_smax':
@@ -729,10 +728,13 @@ def extract_keyframe_rgb(workfolder, cfg_dict, add_args):
     cfg = snippets.YConfig(cfg_dict)
     Ncfg_daly.set_defcfg(cfg)
     cfg.set_deftype("""
+    is_slowfast: [False, bool]
+    slowfast_alpha: [4, int]
     nframes: [1, int]
     sample: [1, int]
     frame_size: [256, int]
     subset_vids: [~, ~]
+    num_workers: [12, int]
     """)
     cf = cfg.parse()
     # prepare data
@@ -744,13 +746,13 @@ def extract_keyframe_rgb(workfolder, cfg_dict, add_args):
         keyframes = [kf for kf in keyframes if kf['vid'] in subset_vids]
     keyframes_dict = to_keyframedict(keyframes)
     # prepare others
-    NUM_WORKERS = 12
+    NUM_WORKERS = cf['num_workers']
     BATCH_SIZE = 32
 
     model_nframes = cf['nframes']
     model_sample = cf['sample']
-    is_slowfast = False
-    slowfast_alpha = 8
+    is_slowfast = cf['is_slowfast']
+    slowfast_alpha = cf['slowfast_alpha']
     sampler_grid = Sampler_grid(model_nframes, model_sample)
     frameloader_vsf = Frameloader_video_slowfast(
             is_slowfast, slowfast_alpha, cf['frame_size'], 'ltrd')
