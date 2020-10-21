@@ -620,6 +620,7 @@ class Head_roitune_sf_8x8(nn.Module):
         x = self.rt_act(x)
         result = {}
         result['x_final'] = x
+        return result
 
 class SF_8x8_custom_head(M_slowfast):
     def __init__(self, cn, head):
@@ -831,6 +832,19 @@ def _config_preparations_sf_8x8(cf_override):
     cn.NUM_GPUS = 1
     return cn
 
+class Manager_loader_krgb_sf8x8(object):
+    def __init__(self, keyframes_rgb_fold, dataset,
+            norm_mean_cu, norm_std_cu):
+        krgb_prefix = Path(keyframes_rgb_fold)
+        with small.QTimer('Loading rgb.npy'):
+            self.krgb_array = np.load(krgb_prefix/'rgb.npy')
+        self.krgb_dict_outputs = \
+                small.load_pkl(krgb_prefix/'dict_outputs.pkl')
+
+        import pudb; pudb.set_trace()  # XXX BREAKPOINT
+        self.norm_mean_cu = norm_mean_cu
+        self.norm_std_cu = norm_std_cu
+
 
 class Manager_loader_krgb(object):
 
@@ -915,7 +929,7 @@ class TDataset_over_lframes(torch.utils.data.Dataset):
         self.sampler_grid = Sampler_grid(model_nframes, model_sample)
 
         self.cn = cn
-        self._is_slowfast = False
+        self._is_slowfast = self.cn.MODEL.ARCH == 'slowfast'
 
         # Enable augmentations
         self.augment_scale = cf['train.augment.scale']
@@ -942,9 +956,9 @@ class TDataset_over_lframes(torch.utils.data.Dataset):
         imgs = _data_augment_nobox(
                 self.cn, self.augment_scale, self.augment_hflip, fl_u8_bgr)
 
-        # Pack pathways
+        # Pack pathways (we are going at CTHW here, TIME_DIM=1)
         packed_imgs = pack_pathway_output(imgs,
-                self._is_slowfast, self.cn.SLOWFAST.ALPHA)
+                self._is_slowfast, self.cn.SLOWFAST.ALPHA, TIME_DIM=1)
 
         meta = {
             'index': index,
@@ -965,7 +979,7 @@ class TDataset_over_fgroups(torch.utils.data.Dataset):
         self.sampler_grid = Sampler_grid(model_nframes, model_sample)
 
         self.cn = cn
-        self._is_slowfast = False
+        self._is_slowfast = self.cn.MODEL.ARCH == 'slowfast'
 
         # Enable augmentations
         self.augment_scale = cf['train.augment.scale']
@@ -1000,9 +1014,9 @@ class TDataset_over_fgroups(torch.utils.data.Dataset):
             fl_u8_bgr, boxes_ltrd,
         )
 
-        # Pack pathways
+        # Pack pathways (we are going at CTHW here, TIME_DIM=1)
         packed_imgs = pack_pathway_output(imgs,
-                self._is_slowfast, self.cn.SLOWFAST.ALPHA)
+                self._is_slowfast, self.cn.SLOWFAST.ALPHA, TIME_DIM=1)
 
         meta = {
             'labels': labels,
@@ -2096,10 +2110,9 @@ def finetune_sf8x8(workfolder, cfg_dict, add_args):
 
     # / Training setup
     max_epoch = cn.SOLVER.MAX_EPOCH
-    man_lkrgb = Manager_loader_krgb(
+    man_lkrgb = Manager_loader_krgb_sf8x8(
             cf['inputs.keyframes_rgb'], dataset,
             norm_mean_cu, norm_std_cu)
-
     eval_krgb_loader, eval_krgb_keyframes = man_lkrgb.get_eval_loader(
         vgroup[sset_eval], cf['train.batch_size.eval'])
 
@@ -2137,6 +2150,8 @@ def finetune_sf8x8(workfolder, cfg_dict, add_args):
                 cf, cn, dataset, batch_size_train, labeled_boxes, ts_rgen)
         else:
             raise RuntimeError()
+
+        idx_batches = idx_batches[:5]
 
         wavg_loss = snippets.misc.WindowAverager(10)
 

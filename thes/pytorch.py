@@ -58,6 +58,7 @@ class Frameloader_video_slowfast(object):
                 video_path, test_crop_size,
                 finds_to_sample, video_read_method)
         Xt = torch.from_numpy(X)
+        # N H W C
         frame_list = pack_pathway_output(
                 Xt, is_slowfast, slowfast_alpha)
         return frame_list, resize_params, ccrop_params
@@ -168,10 +169,9 @@ def prepare_video_resize_crop_flip(
     return X, resize_params, ccrop_params
 
 
-def pack_pathway_output(Xt, is_slowfast, slowfast_alpha):
+def pack_pathway_output(Xt, is_slowfast, slowfast_alpha, TIME_DIM=0):
     if is_slowfast:
         # slowfast/datasets/utils.py/pack_pathway_output
-        TIME_DIM = 0
         fast_pathway = Xt
         slow_pathway = torch.index_select(
             Xt,

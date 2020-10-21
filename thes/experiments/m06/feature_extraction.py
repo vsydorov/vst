@@ -772,7 +772,11 @@ def extract_keyframe_rgb(workfolder, cfg_dict, add_args):
         metas, frame_list, bboxes_tldr = data_input
         kkeys = [tuple(m['kkey']) for m in metas]
         bboxes_np = bboxes_tldr.cpu().numpy()
-        Xts_np = frame_list[0].cpu().numpy()
+        if is_slowfast:
+            # Get the non-subsampled version
+            Xts_np = frame_list[1].cpu().numpy()
+        else:
+            Xts_np = frame_list[0].cpu().numpy()
         pkl_part = {
                 'bboxes': bboxes_np,
                 'kkeys': kkeys}
