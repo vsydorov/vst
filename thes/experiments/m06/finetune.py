@@ -833,17 +833,71 @@ def _config_preparations_sf_8x8(cf_override):
     return cn
 
 class Manager_loader_krgb_sf8x8(object):
+
+    class TDataset_over_krgb(torch.utils.data.Dataset):
+        def __init__(self, array, bboxes, keyframes):
+            self.array = array
+            self.bboxes = bboxes
+            self.keyframes = keyframes
+
+        def __len__(self):
+            return len(self.keyframes)
+
+        def __getitem__(self, index):
+            rgb = self.array[index]
+            bbox = self.bboxes[index]
+            keyframe = self.keyframes[index]
+            keyframe['do_not_collate'] = True
+            label = keyframe['action_id']
+            # Recreate SlowFast sampling
+            rgb = torch.from_numpy(rgb)
+            packed_imgs = pack_pathway_output(rgb, True, 4, 0)
+            return packed_imgs, bbox, label, keyframe
+
     def __init__(self, keyframes_rgb_fold, dataset,
-            norm_mean_cu, norm_std_cu):
+            vgroup, norm_mean_cu, norm_std_cu):
         krgb_prefix = Path(keyframes_rgb_fold)
         with small.QTimer('Loading rgb.npy'):
             self.krgb_array = np.load(krgb_prefix/'rgb.npy')
         self.krgb_dict_outputs = \
                 small.load_pkl(krgb_prefix/'dict_outputs.pkl')
+        self.krgb_bboxes = np.vstack(self.krgb_dict_outputs['bboxes'])
+        keyframes = create_keyframelist(dataset)
+        # For SF8x8 we extracted only val keyframes
+        subset_vids = vgroup['val']
+        keyframes = [kf for kf in keyframes if kf['vid'] in subset_vids]
+        self.keyframes = keyframes
 
-        import pudb; pudb.set_trace()  # XXX BREAKPOINT
         self.norm_mean_cu = norm_mean_cu
         self.norm_std_cu = norm_std_cu
+
+    def _get_krgb_tdataset(self, vids: List[Vid_daly]):
+        inds_kf = [i for i, kf in enumerate(self.keyframes)
+                if kf['vid'] in vids]
+        krgb_array = self.krgb_array[inds_kf]
+        krgb_bboxes = self.krgb_bboxes[inds_kf]
+        keyframes = [self.keyframes[i] for i in inds_kf]
+        tdataset = Manager_loader_krgb_sf8x8.TDataset_over_krgb(
+            krgb_array, krgb_bboxes, keyframes)
+        return tdataset
+
+    def get_eval_loader(self, vids, batch_size):
+        tdataset = self._get_krgb_tdataset(vids)
+        loader = torch.utils.data.DataLoader(tdataset,
+                batch_size=batch_size, shuffle=False,
+                num_workers=0, pin_memory=True,
+                drop_last=False,
+                collate_fn=sequence_batch_collate_v2)
+        return loader, tdataset.keyframes
+
+    def preprocess_data(self, data_input):
+        Xts, bboxes_t, labels, keyframes = data_input
+        Xts_f32c = [to_gpu_normalize_permute(
+                x, self.norm_mean_cu, self.norm_std_cu) for x in Xts]
+        bboxes0_t = add_roi_batch_indices(bboxes_t)
+        bboxes0_c = bboxes0_t.type(torch.cuda.FloatTensor)
+        labels_c = labels.cuda()
+        return Xts_f32c, bboxes0_c, labels_c
 
 
 class Manager_loader_krgb(object):
@@ -878,7 +932,7 @@ class Manager_loader_krgb(object):
         self.norm_mean_cu = norm_mean_cu
         self.norm_std_cu = norm_std_cu
 
-    def get_krgb_tdataset(self, vids: List[Vid_daly]):
+    def _get_krgb_tdataset(self, vids: List[Vid_daly]):
         inds_kf = [i for i, kf in enumerate(self.keyframes)
                 if kf['vid'] in vids]
         krgb_array = self.krgb_array[inds_kf]
@@ -889,7 +943,7 @@ class Manager_loader_krgb(object):
         return tdataset
 
     def get_train_loader(self, vids, batch_size, train_sampler_rgen):
-        tdataset = self.get_krgb_tdataset(vids)
+        tdataset = self._get_krgb_tdataset(vids)
         sampler = NumpyRandomSampler(tdataset, train_sampler_rgen)
         loader = torch.utils.data.DataLoader(tdataset,
                 batch_size=batch_size,
@@ -899,7 +953,7 @@ class Manager_loader_krgb(object):
         return loader
 
     def get_eval_loader(self, vids, batch_size):
-        tdataset = self.get_krgb_tdataset(vids)
+        tdataset = self._get_krgb_tdataset(vids)
         loader = torch.utils.data.DataLoader(tdataset,
                 batch_size=batch_size, shuffle=False,
                 num_workers=0, pin_memory=True,
@@ -2112,7 +2166,7 @@ def finetune_sf8x8(workfolder, cfg_dict, add_args):
     max_epoch = cn.SOLVER.MAX_EPOCH
     man_lkrgb = Manager_loader_krgb_sf8x8(
             cf['inputs.keyframes_rgb'], dataset,
-            norm_mean_cu, norm_std_cu)
+            vgroup, norm_mean_cu, norm_std_cu)
     eval_krgb_loader, eval_krgb_keyframes = man_lkrgb.get_eval_loader(
         vgroup[sset_eval], cf['train.batch_size.eval'])
 
@@ -2150,8 +2204,8 @@ def finetune_sf8x8(workfolder, cfg_dict, add_args):
                 cf, cn, dataset, batch_size_train, labeled_boxes, ts_rgen)
         else:
             raise RuntimeError()
-
-        idx_batches = idx_batches[:5]
+        #
+        # idx_batches = idx_batches[:5]
 
         wavg_loss = snippets.misc.WindowAverager(10)
 
@@ -2221,7 +2275,7 @@ def finetune_sf8x8(workfolder, cfg_dict, add_args):
         if check_step(i_epoch, cf['period.i_epoch.eval_krgb']):
             fqtimer = snippets.misc.FQTimer()
             log.info(f'Perf at [{i_epoch}]')
-            model.set_eval()
+            model.eval()
             _evaluate_krgb_perf(model, eval_krgb_loader,
                 eval_krgb_keyframes, tubes_dwein_eval, tubes_dgt_eval,
                 dataset, man_lkrgb.preprocess_data, cut_off_bg=cut_off_bg)
