@@ -45,27 +45,10 @@ from thes.pytorch import (
     hforward_resnet, hforward_resnet_nopool, hforward_slowfast,
     np_to_gpu, to_gpu_normalize_permute,
     TDataset_over_keyframes, TDataset_over_connections,
-    Sampler_grid, Frameloader_video_slowfast, Dataloader_isaver)
+    Sampler_grid, Frameloader_video_slowfast, Dataloader_isaver,
+    CHECKPOINTS_PREFIX, CHECKPOINTS, REL_YAML_PATHS)
 
 log = logging.getLogger(__name__)
-
-CHECKPOINTS_PREFIX = Path('/home/vsydorov/projects/deployed/2019_12_Thesis/links/scratch2/102_slowfast/20_zoo_checkpoints/')
-CHECKPOINTS = {
-    'SLOWFAST_8x8_R50': 'kinetics400/SLOWFAST_8x8_R50.pkl',
-    'SLOWFAST_4x16_R50': 'kinetics400/SLOWFAST_4x16_R50.pkl',
-    'I3D_8x8_R50': 'kinetics400/I3D_8x8_R50.pkl',
-    'c2d': 'kin400_video_nonlocal/c2d_baseline_8x8_IN_pretrain_400k.pkl',  # https://github.com/facebookresearch/SlowFast/issues/163
-    'c2d_1x1': 'kin400_video_nonlocal/c2d_baseline_8x8_IN_pretrain_400k.pkl',
-    'c2d_imnet': 'imagenet/R50_IN1K.pyth',
-}
-REL_YAML_PATHS = {
-    'SLOWFAST_8x8_R50': 'Kinetics/c2/SLOWFAST_8x8_R50.yaml',
-    'SLOWFAST_4x16_R50': 'Kinetics/c2/SLOWFAST_4x16_R50.yaml',
-    'I3D_8x8_R50': 'Kinetics/c2/I3D_8x8_R50.yaml',
-    'c2d': 'Kinetics/C2D_8x8_R50_IN1K.yaml',
-    'c2d_1x1': 'Kinetics/C2D_8x8_R50_IN1K.yaml',
-    'c2d_imnet': 'Kinetics/C2D_8x8_R50_IN1K.yaml',
-}
 
 class Head_featextract_roi(nn.Module):
     def __init__(self, dim_in, temp_pool_size, resolution, scale_factor):

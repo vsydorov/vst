@@ -78,8 +78,8 @@ from thes.pytorch import (
     to_gpu_normalize_permute, Sampler_grid,
     Frameloader_video_slowfast, NumpyRandomSampler,
     merge_cf_into_cfgnode, pack_pathway_output,
-    Dataloader_isaver,
-    TDataset_over_connections)
+    Dataloader_isaver, TDataset_over_connections,
+    CHECKPOINTS_PREFIX, CHECKPOINTS, REL_YAML_PATHS)
 from thes.training import (
     Manager_checkpoint_name)
 
@@ -227,110 +227,6 @@ class TDataset_over_box_connections_w_labels(torch.utils.data.Dataset):
         return (frame_list, meta)
 
 
-class SlowFast_roitune(M_slowfast):
-    def __init__(self, cn, num_classes):
-        super(M_slowfast, self).__init__()
-        self.norm_module = get_norm(cn)
-        self.enable_detection = cn.DETECTION.ENABLE
-        self.num_pathways = 2
-        self._construct_network(cn)
-        self._construct_roitune(cn, num_classes)
-        init_helper.init_weights(
-            self, cn.MODEL.FC_INIT_STD, cn.RESNET.ZERO_INIT_FINAL_BN
-        )
-        # Weight init
-        last_layer_generator = torch.Generator(2147483647)
-        self.rt_projection.weight.data.normal_(
-            mean=0.0, std=0.01, generator=last_layer_generator)
-        self.rt_projection.weight.data.zero_()
-
-    def _construct_roitune(self, cn, num_classes):
-        # DETECTION.ROI_XFORM_RESOLUTION
-        xform_resolution = 7
-        resolution = [[xform_resolution] * 2] * 2
-        scale_factor = [32] * 2
-        # since extraction mode is roi
-        _POOL_SIZE = [[1, 1, 1], [1, 1, 1]]
-        model_nframes = cn.DATA.NUM_FRAMES
-        slowfast_alpha = cn.SLOWFAST.ALPHA
-        head_pool_size = [
-            [model_nframes//slowfast_alpha//_POOL_SIZE[0][0], 1, 1],
-            [model_nframes//_POOL_SIZE[1][0], 1, 1]]
-        dropout_rate = 0.5
-        width_per_group = cn.RESNET.WIDTH_PER_GROUP
-        dim_in=[
-            width_per_group * 32,
-            width_per_group * 32 // cn.SLOWFAST.BETA_INV,
-        ]
-
-        for pi in range(self.num_pathways):
-            tpool = nn.AvgPool3d(
-                    [head_pool_size[pi][0], 1, 1], stride=1)
-            self.add_module(f'rt_s{pi}_tpool', tpool)
-            roi_align = ROIAlign(
-                    resolution[pi],
-                    spatial_scale=1.0/scale_factor[pi],
-                    sampling_ratio=0,
-                    aligned=True)
-            self.add_module(f'rt_s{pi}_roi', roi_align)
-            spool = nn.MaxPool2d(resolution[pi], stride=1)
-            self.add_module(f'rt_s{pi}_spool', spool)
-
-        if dropout_rate > 0.0:
-            self.rt_dropout = nn.Dropout(dropout_rate)
-        self.rt_projection = nn.Linear(sum(dim_in), num_classes, bias=True)
-        self.rt_act = nn.Softmax(dim=-1)
-
-    def _headless_forward(self, x):
-        # slowfast/models/video_model_builder.py/SlowFast.forward
-        x = self.s1(x)
-        x = self.s1_fuse(x)
-        x = self.s2(x)
-        x = self.s2_fuse(x)
-        for pathway in range(self.num_pathways):
-            pool = getattr(self, "pathway{}_pool".format(pathway))
-            x[pathway] = pool(x[pathway])
-        x = self.s3(x)
-        x = self.s3_fuse(x)
-        x = self.s4(x)
-        x = self.s4_fuse(x)
-        x = self.s5(x)
-        return x
-
-    def _roitune_forward(self, x, bboxes0):
-        # / Roi_Pooling
-        pool_out = []
-        for pi in range(self.num_pathways):
-            t_pool = getattr(self, f'rt_s{pi}_tpool')
-            out = t_pool(x[pi])
-            assert out.shape[2] == 1
-            out = torch.squeeze(out, 2)
-
-            # Roi, assuming 1 box per 1 batch_ind
-            roi_align = getattr(self, f'rt_s{pi}_roi')
-            out = roi_align(out, bboxes0)
-
-            s_pool = getattr(self, f'rt_s{pi}_spool')
-            out = s_pool(out)
-            pool_out.append(out)
-        # B C H W.
-        x = torch.cat(pool_out, 1)
-
-        # Perform dropout.
-        if hasattr(self, "rt_dropout"):
-            x = self.rt_dropout(x)
-
-        x = x.view(x.shape[0], -1)
-        x = self.rt_projection(x)
-        x = self.rt_act(x)
-        return x
-
-    def forward(self, x, bboxes0):
-        x = self._headless_forward(x)
-        x = self._roitune_forward(x, bboxes0)
-        return x
-
-
 class Freezer(object):
     def __init__(self, model, freeze_level, bn_freeze):
         self.model = model
@@ -434,15 +330,15 @@ class Head_fullframe_c2d_1x1(nn.Module):
 
     def _construct_head(self, cn, num_classes, dropout_rate):
         # this is us following "resnet" archi
-        POOL_SIZE = SF_POOL1[cn.MODEL.ARCH]
+        POOL1 = SF_POOL1[cn.MODEL.ARCH]
         pool_size_head = [
-            cn.DATA.NUM_FRAMES // POOL_SIZE[0][0],
-            cn.DATA.CROP_SIZE // 32 // POOL_SIZE[0][1],
-            cn.DATA.CROP_SIZE // 32 // POOL_SIZE[0][2]]
+            cn.DATA.NUM_FRAMES // POOL1[0][0],
+            cn.DATA.CROP_SIZE // 32 // POOL1[0][1],
+            cn.DATA.CROP_SIZE // 32 // POOL1[0][2]]
         # BUT, we are doing c2d_1x1, hence
         pool_size_head[0] = 1
         self.pool_size_head = pool_size_head
-        self.dim_in = [cn.RESNET.WIDTH_PER_GROUP * 32]
+        dim_in = [cn.RESNET.WIDTH_PER_GROUP * 32]
 
         pi = 0
         avg_pool = nn.AvgPool3d(pool_size_head, stride=1)
@@ -451,7 +347,7 @@ class Head_fullframe_c2d_1x1(nn.Module):
         if dropout_rate > 0.0:
             self.rt_dropout = nn.Dropout(dropout_rate)
         self.rt_projection = nn.Linear(
-                sum(self.dim_in), num_classes, bias=True)
+                sum(dim_in), num_classes, bias=True)
         self.rt_act = nn.Softmax(dim=-1)
 
     def forward(self, feats_in, bboxes0):
@@ -546,10 +442,58 @@ class Head_fullframe_sf_8x8(nn.Module):
             dropout_rate, debug_outputs):
         super(Head_fullframe_sf_8x8, self).__init__()
         self.num_pathways = 2
-        raise NotImplementedError()
+        self._construct_head(cn, num_classes, dropout_rate)
+        self.debug_outputs = debug_outputs
 
     def _construct_head(self, cn, num_classes, dropout_rate):
-        raise NotImplementedError()
+        model_nframes = cn.DATA.NUM_FRAMES
+        POOL1 = SF_POOL1[cn.MODEL.ARCH]
+        width_per_group = cn.RESNET.WIDTH_PER_GROUP
+        slowfast_alpha = cn.SLOWFAST.ALPHA
+
+        dim_in = [
+            width_per_group * 32,
+            width_per_group * 32 // cn.SLOWFAST.BETA_INV]
+        pool_size = [
+            [model_nframes // slowfast_alpha // POOL1[0][0],
+             cn.DATA.CROP_SIZE // 32 // POOL1[0][1],
+             cn.DATA.CROP_SIZE // 32 // POOL1[0][2]],
+            [model_nframes // POOL1[1][0],
+             cn.DATA.CROP_SIZE // 32 // POOL1[1][1],
+             cn.DATA.CROP_SIZE // 32 // POOL1[1][2]]
+        ]
+        # spat_pool_size = [IMAGE_SIZE//32, IMAGE_SIZE//32]
+        # temp_pool_size = [s[0] for s in pool_size]
+
+        for pi in range(self.num_pathways):
+            avg_pool = nn.AvgPool3d(pool_size[pi], stride=1)
+            self.add_module(f's{pi}_avg_pool', avg_pool)
+
+        if dropout_rate > 0.0:
+            self.rt_dropout = nn.Dropout(dropout_rate)
+        self.rt_projection = nn.Linear(
+                sum(dim_in), num_classes, bias=True)
+        self.rt_act = nn.Softmax(dim=-1)
+
+    def forward(self, feats_in, boxes):
+        pool_out = []
+        for pi in range(self.num_pathways):
+            avg_pool = getattr(self, f's{pi}_avg_pool')
+            out = avg_pool(feats_in[pi])
+            pool_out.append(out)
+        # B C H W.
+        x = torch.cat(pool_out, 1)
+
+        # Perform dropout.
+        if hasattr(self, "rt_dropout"):
+            x = self.rt_dropout(x)
+
+        x = x.view(x.shape[0], -1)
+        x = self.rt_projection(x)
+        x = self.rt_act(x)
+        result = {}
+        result['x_final'] = x
+        return result
 
 
 class Head_roitune_sf_8x8(nn.Module):
@@ -653,16 +597,14 @@ class SF_8x8_custom_head(M_slowfast):
 
 
 class Manager_model_checkpoints(object):
-    def __init__(self, model, optimizer):
+    def __init__(self, model, optimizer, model_id):
         self.model = model
         self.optimizer = optimizer
+        self.model_id = model_id
 
-    @staticmethod
-    def load_model_initial(model):
-        CHECKPOINTS_PREFIX = Path('/home/vsydorov/projects/deployed/2019_12_Thesis/links/scratch2/102_slowfast/20_zoo_checkpoints/')
-        rel = 'kin400_video_nonlocal/c2d_baseline_8x8_IN_pretrain_400k.pkl'
-        CHECKPOINT_FILE_PATH = CHECKPOINTS_PREFIX/rel
-
+    def load_model_initial(self, model):
+        assert self.model_id in ['c2d_1x1', 'SLOWFAST_8x8_R50']
+        CHECKPOINT_FILE_PATH = CHECKPOINTS_PREFIX/CHECKPOINTS[self.model_id]
         # Load model
         with vt_log.logging_disabled(logging.WARNING):
             sf_cu.load_checkpoint(
@@ -1835,7 +1777,7 @@ def finetune_preextracted_krgb(workfolder, cfg_dict, add_args):
     man_lkrgb = Manager_loader_krgb(
             cf['inputs.keyframes_rgb'], dataset,
             norm_mean_cu, norm_std_cu)
-    man_ckpt = Manager_model_checkpoints(model_wf.model, optimizer)
+    man_ckpt = Manager_model_checkpoints(model_wf.model, optimizer, 'c2d_1x1')
 
     # Restore previous run
     rundir = small.mkdir(out/'rundir')
@@ -1994,7 +1936,7 @@ def finetune(workfolder, cfg_dict, add_args):
     eval_krgb_loader, eval_krgb_keyframes = man_lkrgb.get_eval_loader(
         vgroup[sset_eval], cf['train.batch_size.eval'])
 
-    man_ckpt = Manager_model_checkpoints(model_wf.model, optimizer)
+    man_ckpt = Manager_model_checkpoints(model_wf.model, optimizer, 'c2d_1x1')
 
     # Restore previous run
     rundir = small.mkdir(out/'rundir')
@@ -2192,7 +2134,7 @@ def finetune_sf8x8(workfolder, cfg_dict, add_args):
             norm_mean_cu, norm_std_cu, sset_eval,
             cf['train.batch_size.eval'])
 
-    man_ckpt = Manager_model_checkpoints(model, optimizer)
+    man_ckpt = Manager_model_checkpoints(model, optimizer, 'SLOWFAST_8x8_R50')
 
     # Restore previous run
     rundir = small.mkdir(out/'rundir')
