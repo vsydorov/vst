@@ -911,12 +911,12 @@ class Lazy_Manager_krgb(object):
         self.man_lkrgb = None
 
     def actual_load(self):
+        log.info('Loading (lazily) the very slow KRGB manager')
         self.man_lkrgb = Manager_loader_krgb_sf8x8(*self.manager_args)
         self.eval_krgb_loader, self.eval_krgb_keyframes = \
                 self.man_lkrgb.get_eval_loader(*self.loader_args)
 
     def lazy_load(self):
-        log.info('Lazy load of the very slow KRGB manager')
         if self.man_lkrgb is None:
             self.actual_load()
         return self.man_lkrgb, self.eval_krgb_loader, self.eval_krgb_keyframes
