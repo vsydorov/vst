@@ -490,7 +490,8 @@ class Head_fullframe_sf_8x8(nn.Module):
 
         x = x.view(x.shape[0], -1)
         x = self.rt_projection(x)
-        x = self.rt_act(x)
+        if not self.training:
+            x = self.rt_act(x)
         result = {}
         result['x_final'] = x
         return result
@@ -561,22 +562,30 @@ class Head_roitune_sf_8x8(nn.Module):
 
         x = x.view(x.shape[0], -1)
         x = self.rt_projection(x)
-        x = self.rt_act(x)
+        if not self.training:
+            x = self.rt_act(x)
         result = {}
         result['x_final'] = x
         return result
 
 class SF_8x8_custom_head(M_slowfast):
-    def __init__(self, cn, head):
+    def __init__(self, cn, detect_mode, output_dims,
+            ll_dropout, debug_outputs):
         super(M_slowfast, self).__init__()
         self.norm_module = get_norm(cn)
         self.enable_detection = cn.DETECTION.ENABLE
         self.num_pathways = 2
         self._construct_network(cn)
-        self.head = head
+        if detect_mode == 'fullframe':
+            self.head = Head_fullframe_sf_8x8(cn, output_dims,
+                    ll_dropout, debug_outputs)
+        elif detect_mode == 'roipooled':
+            self.head = Head_roitune_sf_8x8(cn, output_dims,
+                    ll_dropout, debug_outputs)
 
     def init_weights(self, init_std):
         init_helper.init_weights(self, init_std, False)
+        # init_helper.init_weights(self.head, init_std, False)
 
     def forward(self, x, bboxes0):
         # slowfast/models/video_model_builder.py/SlowFast.forward
@@ -606,10 +615,10 @@ class Manager_model_checkpoints(object):
         assert self.model_id in ['c2d_1x1', 'SLOWFAST_8x8_R50']
         CHECKPOINT_FILE_PATH = CHECKPOINTS_PREFIX/CHECKPOINTS[self.model_id]
         # Load model
-        with vt_log.logging_disabled(logging.WARNING):
-            sf_cu.load_checkpoint(
-                CHECKPOINT_FILE_PATH, model, False, None,
-                inflation=False, convert_from_caffe2=True,)
+        # with vt_log.logging_disabled(logging.WARNING):
+        sf_cu.load_checkpoint(
+            CHECKPOINT_FILE_PATH, model, False, None,
+            inflation=False, convert_from_caffe2=True,)
 
     def save_epoch(self, rundir, i_epoch):
         # model_{epoch} - "after epoch was finished"
@@ -2096,8 +2105,6 @@ def finetune_sf8x8(workfolder, cfg_dict, add_args):
             prepare_label_fullframes_for_training(
                 tubes_dgt_train, dataset, stride, max_distance)
         output_dims = 10
-        head = Head_fullframe_sf_8x8(cn, output_dims,
-                cf['ll_dropout'], cf['debug_outputs'])
     elif detect_mode == 'roipooled':
         add_keyframes = cf['train.tubes.add_keyframes']
         keyframes = create_keyframelist(dataset)
@@ -2109,12 +2116,11 @@ def finetune_sf8x8(workfolder, cfg_dict, add_args):
             tubes_dwein_train, keyframes_train, top_n_matches,
             add_keyframes)
         output_dims = 11
-        head = Head_roitune_sf_8x8(cn, output_dims,
-                cf['ll_dropout'], cf['debug_outputs'])
     else:
         raise RuntimeError()
 
-    model = SF_8x8_custom_head(cn, head)
+    model = SF_8x8_custom_head(cn, detect_mode, output_dims,
+            cf['ll_dropout'], cf['debug_outputs'])
 
     cut_off_bg = output_dims == 11
 
