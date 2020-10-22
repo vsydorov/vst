@@ -900,6 +900,28 @@ class Manager_loader_krgb_sf8x8(object):
         return Xts_f32c, bboxes0_c, labels_c
 
 
+class Lazy_Manager_krgb(object):
+    def __init__(self, keyframes_rgb_fold, dataset,
+            vgroup, norm_mean_cu, norm_std_cu,
+            sset_eval, batch_size_eval):
+        self.manager_args = [keyframes_rgb_fold, dataset,
+                vgroup, norm_mean_cu, norm_std_cu]
+        self.loader_args = [vgroup[sset_eval], batch_size_eval]
+
+        self.man_lkrgb = None
+
+    def actual_load(self):
+        self.man_lkrgb = Manager_loader_krgb_sf8x8(*self.manager_args)
+        self.eval_krgb_loader, self.eval_krgb_keyframes = \
+                self.man_lkrgb.get_eval_loader(*self.loader_args)
+
+    def lazy_load(self):
+        log.info('Lazy load of the very slow KRGB manager')
+        if self.man_lkrgb is None:
+            self.actual_load()
+        return self.man_lkrgb, self.eval_krgb_loader, self.eval_krgb_keyframes
+
+
 class Manager_loader_krgb(object):
 
     class TDataset_over_krgb(torch.utils.data.Dataset):
@@ -2164,11 +2186,11 @@ def finetune_sf8x8(workfolder, cfg_dict, add_args):
 
     # / Training setup
     max_epoch = cn.SOLVER.MAX_EPOCH
-    man_lkrgb = Manager_loader_krgb_sf8x8(
-            cf['inputs.keyframes_rgb'], dataset,
-            vgroup, norm_mean_cu, norm_std_cu)
-    eval_krgb_loader, eval_krgb_keyframes = man_lkrgb.get_eval_loader(
-        vgroup[sset_eval], cf['train.batch_size.eval'])
+
+    lmanager = Lazy_Manager_krgb(
+            cf['inputs.keyframes_rgb'], dataset, vgroup,
+            norm_mean_cu, norm_std_cu, sset_eval,
+            cf['train.batch_size.eval'])
 
     man_ckpt = Manager_model_checkpoints(model, optimizer)
 
@@ -2252,6 +2274,8 @@ def finetune_sf8x8(workfolder, cfg_dict, add_args):
             if check_step(i_batch, cf['period.i_batch.eval_krgb']):
                 log.info(f'Perf at [{i_epoch}, {i_batch}]')
                 model.eval()
+                (man_lkrgb, eval_krgb_loader, eval_krgb_keyframes) = \
+                        lmanager.lazy_load()
                 _evaluate_krgb_perf(model, eval_krgb_loader,
                     eval_krgb_keyframes, tubes_dwein_eval, tubes_dgt_eval,
                     dataset, man_lkrgb.preprocess_data, cut_off_bg=cut_off_bg)
@@ -2276,6 +2300,8 @@ def finetune_sf8x8(workfolder, cfg_dict, add_args):
             fqtimer = snippets.misc.FQTimer()
             log.info(f'Perf at [{i_epoch}]')
             model.eval()
+            (man_lkrgb, eval_krgb_loader, eval_krgb_keyframes) = \
+                    lmanager.lazy_load()
             _evaluate_krgb_perf(model, eval_krgb_loader,
                 eval_krgb_keyframes, tubes_dwein_eval, tubes_dgt_eval,
                 dataset, man_lkrgb.preprocess_data, cut_off_bg=cut_off_bg)
