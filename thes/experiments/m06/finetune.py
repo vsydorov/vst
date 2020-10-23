@@ -1153,7 +1153,7 @@ def _preset_defaults(cfg):
         tubes_dwein: ~
         keyframes_rgb: ~
         ckpt: ~
-    split_assignment: !def ['train/val', ['train/val', 'trainval/test']]
+    split_assignment: !def ['train/val', ['train/val', 'trainval/test', 'trainval/val']]
     freeze:
         level: -1
         freeze_bn: False
