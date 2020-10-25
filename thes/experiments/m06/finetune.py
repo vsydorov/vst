@@ -19,6 +19,7 @@ import torch.utils.data
 
 from detectron2.layers import ROIAlign
 
+import slowfast.models
 import slowfast.utils.checkpoint as sf_cu
 import slowfast.utils.weight_init_helper as init_helper
 import slowfast.utils.misc as sf_misc
@@ -1657,14 +1658,18 @@ def _lboxes_forward(data_input, model):
 
 
 def _ftube_extract(
-        connections_f, model_wf, extract_fold,
+        connections_f, model, extract_fold,
         cf, cn, dataset):
     BATCH_SIZE = 32
     NUM_WORKERS = 4
+
+
     sampler_grid = Sampler_grid(
             cn.DATA.NUM_FRAMES, cn.DATA.SAMPLING_RATE)
+    is_slowfast = isinstance(model,
+            slowfast.models.video_model_builder.SlowFast)
     frameloader_vsf = Frameloader_video_slowfast(
-            False, cn.SLOWFAST.ALPHA, cn.DATA.CROP_SIZE, 'ltrd')
+            is_slowfast, cn.SLOWFAST.ALPHA, cn.DATA.CROP_SIZE, 'ltrd')
 
     # Means
     norm_mean_cu = np_to_gpu(cn.DATA.MEAN)
@@ -1695,7 +1700,7 @@ def _ftube_extract(
         bboxes0_c = bboxes0.type(torch.cuda.FloatTensor)
 
         with torch.no_grad():
-            result = model_wf.model.forward(Xts_f32c, bboxes0_c)
+            result = model.forward(Xts_f32c, bboxes0_c)
         result_dict = {}
         for k, v in result.items():
             out_np = v.cpu().numpy()
@@ -1716,7 +1721,7 @@ def _ftube_extract(
         save_interval_seconds=cf['batch_save_interval_seconds'],
         log_interval=30)
 
-    model_wf.set_eval()
+    model.eval()
     outputs = disaver.run()
 
     keys = next(iter(outputs)).keys()
@@ -2359,7 +2364,133 @@ def full_tube_eval(workfolder, cfg_dict, add_args):
 
     extract_fold = out/f'chunk_{cc}_of_{ct}'
     dict_outputs = _ftube_extract(
-        connections_f, model_wf, extract_fold, cf, cn, dataset)
+        connections_f, model_wf.model, extract_fold, cf, cn, dataset)
+    small.save_pkl(extract_fold/'dict_outputs.pkl', dict_outputs)
+    small.save_pkl(extract_fold/'connections_f.pkl', compute_connections_f)
+
+    attempt_eval = (cc, ct == 0, 1)
+    if attempt_eval:
+        assert ct == 1
+        log.info('We can eval right away')
+        _, dwti_to_label_eval = qload_synthetic_tube_labels(
+            tubes_dgt_eval, tubes_dwein_eval, dataset)
+        log.info(f'Perf at [{i_epoch}]')
+        finetube_perf_fulltube_evaluate(
+            dict_outputs['x_final'], connections_f,
+            tubes_dwein_eval, tubes_dwein_prov, tubes_dgt_eval,
+            dwti_to_label_eval, dataset, detect_mode,
+            cf['eval.full_tubes.nms'],
+            cf['eval.full_tubes.field_nms'],
+            cf['eval.full_tubes.field_det'])
+
+
+def full_tube_eval_sf8x8(workfolder, cfg_dict, add_args):
+    out, = snippets.get_subfolders(workfolder, ['out'])
+    cfg = snippets.YConfig_v2(cfg_dict,
+            allowed_wo_defaults=[''])
+    Ncfg_daly.set_defcfg_v2(cfg)
+    cfg.set_defaults_yaml("""
+    seed: 42
+    inputs:
+        tubes_dwein: ~
+        keyframes_rgb: ~
+        ckpt:
+            fold: ~
+            epoch: ~
+            path: ~
+    split_assignment: !def ['train/val',
+        ['train/val', 'trainval/test']]
+    freeze:
+        level: -1
+        freeze_bn: False
+    debug_outputs: False
+    ll_dropout: 0.5
+    tubes:
+        stride: 4
+    batch_save_interval_seconds: 120
+    compute_split:
+        chunk: 0
+        total: 1
+    detect_mode: !def ['roipooled', ['fullframe', 'roipooled']]
+    eval:
+        full_tubes:
+            nms: 0.3
+            field_nms: 'box_det_score'  # hscore
+            field_det: 'box_det_score'  # hscore*frame_cls_score
+    """)
+    cf = cfg.parse()
+    cn = _config_preparations_sf_8x8(cfg.without_prefix('CN.'))
+
+    # Seeds
+    initial_seed = cf['seed']
+    torch.manual_seed(initial_seed)
+    torch.cuda.manual_seed(initial_seed)
+
+    # Data
+    # General DALY level preparation
+    dataset: Dataset_daly_ocv = Ncfg_daly.get_dataset(cf)
+    vgroup: Dict[str, List[Vid_daly]] = \
+            Ncfg_daly.get_vids(cf, dataset)
+    sset_train, sset_eval = cf['split_assignment'].split('/')
+    # wein tubes
+    tubes_dwein_d, tubes_dgt_d = load_gt_and_wein_tubes(
+            cf['inputs.tubes_dwein'], dataset, vgroup)
+    tubes_dwein_prov: Dict[I_dwein, Tube_daly_wein_as_provided] = \
+            small.load_pkl(cf['inputs.tubes_dwein'])
+    # Sset
+    tubes_dwein_eval = tubes_dwein_d[sset_eval]
+    tubes_dgt_eval = tubes_dgt_d[sset_eval]
+
+    # / Create appropriate model
+    detect_mode = cf['detect_mode']
+    if detect_mode == 'roipooled':
+        output_dims = 11
+    elif detect_mode == 'fullframe':
+        output_dims = 10
+    else:
+        raise RuntimeError()
+
+    model = SF_8x8_custom_head(cn, detect_mode, output_dims,
+            cf['ll_dropout'], cf['debug_outputs'])
+
+    cur_device = torch.cuda.current_device()
+    model = model.cuda(device=cur_device)
+
+    # / Restore checkpoint
+    if cf['inputs.ckpt.path']:
+        ckpt_path = cf['inputs.ckpt.path']
+    elif cf['inputs.ckpt.fold']:
+        epoch = cf['inputs.ckpt.epoch']
+        modelname = Manager_checkpoint_name.ckpt_format.format(epoch)
+        ckpt_path = str(Path(cf['inputs.ckpt.fold'])/modelname)
+    else:
+        raise RuntimeError()
+    states = torch.load(ckpt_path)
+    i_epoch = states['i_epoch']
+    model.load_state_dict(states['model_sdict'])
+
+    # / Prepare conections, determine split (if any) and folder
+    frames_to_cover: Dict[Vid_daly, np.ndarray] = \
+        sample_daly_frames_from_instances(dataset, cf['tubes.stride'])
+    connections_f: Dict[Tuple[Vid_daly, int], Box_connections_dwti]
+    connections_f = group_tubes_on_frame_level(
+            tubes_dwein_eval, frames_to_cover)
+    # Here we'll run our connection split
+    if cf['compute_split.total'] > 1:
+        cc, ct = (cf['compute_split.chunk'], cf['compute_split.total'])
+        if '--chunk' in add_args:
+            cc = int(add_args[add_args.index('--chunk')+1])
+            log.info('Due to shell argument chunk set {} -> {}'.format(
+                cf['compute_split.chunk'], cc))
+        compute_connections_f = perform_connections_split(
+                connections_f, cc, ct, False)
+    else:
+        compute_connections_f = connections_f
+        cc, ct = 0, 1
+
+    extract_fold = out/f'chunk_{cc}_of_{ct}'
+    dict_outputs = _ftube_extract(
+        connections_f, model, extract_fold, cf, cn, dataset)
     small.save_pkl(extract_fold/'dict_outputs.pkl', dict_outputs)
     small.save_pkl(extract_fold/'connections_f.pkl', compute_connections_f)
 
@@ -2380,86 +2511,87 @@ def full_tube_eval(workfolder, cfg_dict, add_args):
 
 
 def combine_split_full_tube_eval(workfolder, cfg_dict, add_args):
-    out, = snippets.get_subfolders(workfolder, ['out'])
-    cfg = snippets.YConfig_v2(cfg_dict,
-            allowed_wo_defaults=[''])
-    Ncfg_daly.set_defcfg_v2(cfg)
-    cfg.set_defaults_yaml("""
-    seed: 42
-    inputs:
-        tubes_dwein: ~
-        rpath_splits: ~
-    split_assignment: !def ['train/val',
-        ['train/val', 'trainval/test']]
-    tubes:
-        stride: 4
-    mode: !def ['roi', ['roi', 'fullframe']]
-    """)
-    cf = cfg.parse()
-
-    # Data
-    # General DALY level preparation
-    dataset: Dataset_daly_ocv = Ncfg_daly.get_dataset(cf)
-    vgroup: Dict[str, List[Vid_daly]] = \
-            Ncfg_daly.get_vids(cf, dataset)
-    sset_train, sset_eval = cf['split_assignment'].split('/')
-    # wein tubes
-    tubes_dwein_d, tubes_dgt_d = load_gt_and_wein_tubes(
-            cf['inputs.tubes_dwein'], dataset, vgroup)
-    tubes_dwein_prov: Dict[I_dwein, Tube_daly_wein_as_provided] = \
-            small.load_pkl(cf['inputs.tubes_dwein'])
-
-    # Sset
-    tubes_dwein_eval = tubes_dwein_d[sset_eval]
-    tubes_dgt_eval = tubes_dgt_d[sset_eval]
-
-    # Prepare
-    frames_to_cover: Dict[Vid_daly, np.ndarray] = \
-        sample_daly_frames_from_instances(dataset, cf['tubes.stride'])
-    connections_f_: Dict[Tuple[Vid_daly, int], Box_connections_dwti]
-    connections_f_ = group_tubes_on_frame_level(
-            tubes_dwein_eval, frames_to_cover)
-
-    # search relativefolder
-    import dervo.experiment
-    fold_rpath = cf['inputs.rpath_splits']
-    fold = (dervo.experiment.EXPERIMENT_PATH/fold_rpath).resolve()
-    runs = list(glob(f'{fold}/**/dict_outputs.pkl', recursive=True))
-    level = 1
-    dfdict = {}
-    for f in runs:
-        rpath = os.path.relpath(f, fold)
-        name = '.'.join(rpath.split('/')[:level])
-        dfdict[name] = Path(f).parent
-    log.info('{} chunks found:\n{}'.format(
-        len(dfdict), pprint.pformat(list(dfdict.keys()))))
-
-    # Chunk merge
-    dict_outputs = {}
-    connections_f = {}
-    for name, path in dfdict.items():
-        path = Path(path)
-        local_outputs = small.load_pkl(path/'dict_outputs.pkl')
-        for k, v in local_outputs.items():
-            dict_outputs.setdefault(k, []).extend(v)
-        connections_f.update(small.load_pkl(path/'connections_f.pkl'))
-    # Check consistency
-    if connections_f.keys() != connections_f_.keys():
-        log.error('Loaded connections inconsistent with expected ones')
-
-    # Now we can eval
-    if cf['mode'] == 'roi':
-        _, dwti_to_label_eval = qload_synthetic_tube_labels(
-            tubes_dgt_eval, tubes_dwein_eval, dataset)
-        full_tube_perf_eval(dict_outputs['x_final'], connections_f,
-            dataset, dwti_to_label_eval,
-            tubes_dgt_eval, tubes_dwein_eval)
-    elif cf['mode'] == 'fullframe':
-        full_tube_full_frame_perf_eval(
-            dict_outputs['x_final'], connections_f, tubes_dwein_prov,
-            dataset, tubes_dwein_eval, tubes_dgt_eval)
-    else:
-        raise RuntimeError()
+    raise NotImplementedError()
+    # out, = snippets.get_subfolders(workfolder, ['out'])
+    # cfg = snippets.YConfig_v2(cfg_dict,
+    #         allowed_wo_defaults=[''])
+    # Ncfg_daly.set_defcfg_v2(cfg)
+    # cfg.set_defaults_yaml("""
+    # seed: 42
+    # inputs:
+    #     tubes_dwein: ~
+    #     rpath_splits: ~
+    # split_assignment: !def ['train/val',
+    #     ['train/val', 'trainval/test']]
+    # tubes:
+    #     stride: 4
+    # mode: !def ['roi', ['roi', 'fullframe']]
+    # """)
+    # cf = cfg.parse()
+    #
+    # # Data
+    # # General DALY level preparation
+    # dataset: Dataset_daly_ocv = Ncfg_daly.get_dataset(cf)
+    # vgroup: Dict[str, List[Vid_daly]] = \
+    #         Ncfg_daly.get_vids(cf, dataset)
+    # sset_train, sset_eval = cf['split_assignment'].split('/')
+    # # wein tubes
+    # tubes_dwein_d, tubes_dgt_d = load_gt_and_wein_tubes(
+    #         cf['inputs.tubes_dwein'], dataset, vgroup)
+    # tubes_dwein_prov: Dict[I_dwein, Tube_daly_wein_as_provided] = \
+    #         small.load_pkl(cf['inputs.tubes_dwein'])
+    #
+    # # Sset
+    # tubes_dwein_eval = tubes_dwein_d[sset_eval]
+    # tubes_dgt_eval = tubes_dgt_d[sset_eval]
+    #
+    # # Prepare
+    # frames_to_cover: Dict[Vid_daly, np.ndarray] = \
+    #     sample_daly_frames_from_instances(dataset, cf['tubes.stride'])
+    # connections_f_: Dict[Tuple[Vid_daly, int], Box_connections_dwti]
+    # connections_f_ = group_tubes_on_frame_level(
+    #         tubes_dwein_eval, frames_to_cover)
+    #
+    # # search relativefolder
+    # import dervo.experiment
+    # fold_rpath = cf['inputs.rpath_splits']
+    # fold = (dervo.experiment.EXPERIMENT_PATH/fold_rpath).resolve()
+    # runs = list(glob(f'{fold}/**/dict_outputs.pkl', recursive=True))
+    # level = 1
+    # dfdict = {}
+    # for f in runs:
+    #     rpath = os.path.relpath(f, fold)
+    #     name = '.'.join(rpath.split('/')[:level])
+    #     dfdict[name] = Path(f).parent
+    # log.info('{} chunks found:\n{}'.format(
+    #     len(dfdict), pprint.pformat(list(dfdict.keys()))))
+    #
+    # # Chunk merge
+    # dict_outputs = {}
+    # connections_f = {}
+    # for name, path in dfdict.items():
+    #     path = Path(path)
+    #     local_outputs = small.load_pkl(path/'dict_outputs.pkl')
+    #     for k, v in local_outputs.items():
+    #         dict_outputs.setdefault(k, []).extend(v)
+    #     connections_f.update(small.load_pkl(path/'connections_f.pkl'))
+    # # Check consistency
+    # if connections_f.keys() != connections_f_.keys():
+    #     log.error('Loaded connections inconsistent with expected ones')
+    #
+    # # Now we can eval
+    # if cf['mode'] == 'roi':
+    #     _, dwti_to_label_eval = qload_synthetic_tube_labels(
+    #         tubes_dgt_eval, tubes_dwein_eval, dataset)
+    #     full_tube_perf_eval(dict_outputs['x_final'], connections_f,
+    #         dataset, dwti_to_label_eval,
+    #         tubes_dgt_eval, tubes_dwein_eval)
+    # elif cf['mode'] == 'fullframe':
+    #     full_tube_full_frame_perf_eval(
+    #         dict_outputs['x_final'], connections_f, tubes_dwein_prov,
+    #         dataset, tubes_dwein_eval, tubes_dgt_eval)
+    # else:
+    #     raise RuntimeError()
 
 
 def merge_evaluate_full_and_roi(workfolder, cfg_dict, add_args):
