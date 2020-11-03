@@ -3,8 +3,6 @@ import json
 import numpy as np
 import copy
 import concurrent
-import imageio
-import cv2
 import logging
 from pathlib import Path
 from tqdm import tqdm
@@ -12,6 +10,8 @@ from tqdm import tqdm
 import natsort
 
 import vst
+
+from retr.misc import imread_func
 
 log = logging.getLogger(__name__)
 
@@ -21,19 +21,6 @@ __ROOT = Path('/home/vlad/projects/dervo_deployed/2020_11_02_retrieve')
 
 def get_dataset_path(data_id):
     return __ROOT/'links/datasets'/data_id
-
-
-def imread_func(path):
-    # Returns RGB
-    spath = str(path)
-    image = cv2.imread(spath)
-    if image is not None:
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    elif spath.endswith('.gif'):
-        image = imageio.mimread(spath)[0][..., :4]
-    else:
-        raise RuntimeError(f'Can not read {path}')
-    return image
 
 
 class Isaver_threading(
