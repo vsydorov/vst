@@ -147,8 +147,15 @@ def demo(workfolder, cfg_dict, add_arg):
         for imkey in cluster['imkeys']:
             all_images[imkey]['cluster'] = cluster['name']
 
-    dev_json = root_path/'dev_copyright_dataset.json'
-    with dev_json.open('r') as f:
+    # all_transforms = []
+    # for x in dev['positives_queries'].values():
+    #     for ti in x['target_images']:
+    #         if (t := ti['transformations']) is not None:
+    #             all_transforms.append(t)
+
+    # path_json_dev = Path('/home/navee/Navee/repositories/rise-research/data/dev_copyright_dataset.json')
+    path_json_dev = root_path/'dev_copyright_dataset.json'
+    with path_json_dev.open('r') as f:
         dev = json.load(f)
 
     test_json = root_path/'test_copyright_dataset.json'
@@ -159,7 +166,7 @@ def demo(workfolder, cfg_dict, add_arg):
     pq_test = test['positives_queries'].keys()
     log.info('PQ dev={} PQ test={}'.format(len(pq_dev), len(pq_test)))
 
-    pq = dev['positives_queries']
+    pq = copy.deepcopy(dev['positives_queries'])
     pq.update(test['positives_queries'])
 
     pq_lens = pd.Series({k: len(v['target_images'])

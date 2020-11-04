@@ -1,3 +1,6 @@
+import concurrent
+import pprint
+import re
 import time
 import logging
 from pathlib import Path
@@ -6,9 +9,12 @@ from typing import (  # NOQA
             Any, Union, Callable, TypeVar)
 
 import cv2
+import pandas as pd
 import numpy as np
 import albumentations as A
 import albumentations.pytorch
+import sklearn.preprocessing
+import sklearn.metrics
 from tqdm import tqdm
 
 import torch
@@ -153,6 +159,58 @@ class TDataset_simple(torch.utils.data.Dataset):
         return im_torch, meta
 
 
+class Isaver_threading(
+        vst.isave.Isaver_mixin_restore_save, vst.isave.Isaver_base):
+    """
+    Will process a list with a func, in async manner
+    """
+    def __init__(self, folder, in_list, func,
+            save_every=25, max_workers=5):
+        super().__init__(folder, len(in_list))
+        self.in_list = in_list
+        self.result = {}
+        self.func = func
+        self._save_every = save_every
+        self._max_workers = max_workers
+
+    def run(self):
+        self._restore()
+        all_ii = set(range(len(self.in_list)))
+        remaining_ii = all_ii - set(self.result.keys())
+
+        io_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=self._max_workers)
+        io_futures = []
+        for i in remaining_ii:
+            args = self.in_list[i]
+            submitted = io_executor.submit(self.func, args)
+            submitted.i = i
+            io_futures.append(submitted)
+
+        flush_dict = {}
+
+        def flush_purge():
+            self.result.update(flush_dict)
+            flush_dict.clear()
+            self._save(len(self.result))
+            self._purge_intermediate_files()
+
+        for io_future in tqdm(concurrent.futures.as_completed(io_futures),
+                total=len(io_futures)):
+            result = io_future.result()
+            i = io_future.i
+            flush_dict[i] = result
+            if len(flush_dict) >= self._save_every:
+                flush_purge()
+        flush_purge()
+        assert len(self.result) == len(self.in_list)
+        result_list = [self.result[i] for i in all_ii]
+        return result_list
+
+
+# Experiments
+
+
 def predict_convfeatures(workfolder, cfg_dict, add_arg):
     out, = vst.exp.get_subfolders(workfolder, ['out'])
     cfg = vst.exp.YConfig(cfg_dict, 'threshdict.')
@@ -186,7 +244,7 @@ def predict_convfeatures(workfolder, cfg_dict, add_arg):
         remaining_paths = img_paths[start_i+1:]
         dset = TDataset_simple(remaining_paths)
         batch_size = 32
-        num_workers = 0
+        num_workers = 8
         dataloader = torch.utils.data.DataLoader(
                 dset, batch_size=batch_size,
                 shuffle=False, num_workers=num_workers,
@@ -220,3 +278,203 @@ def predict_convfeatures(workfolder, cfg_dict, add_arg):
     metadict = {
             'img_paths': img_paths, 'img_names': img_names}
     vst.save_pkl(out/'metadict.pkl', metadict)
+    np.save(str(out/'concat_feats.npy'), conc)
+
+
+def estimate_distances(workfolder, cfg_dict, add_arg):
+    out, = vst.exp.get_subfolders(workfolder, ['out'])
+    cfg = vst.exp.YConfig(cfg_dict, 'threshdict.')
+    cfg.set_defaults_yaml("""
+    inputs:
+        dataset: ~
+        featurefold: ~
+    seed: 42
+    """)
+    cf = cfg.parse()
+
+    dataset = vst.load_pkl(cf['inputs.dataset'])
+    ffold = Path(cf['inputs.featurefold'])
+    meta = vst.load_pkl(ffold/'metadict.pkl')
+
+    def qreduce():
+        conc = np.load(str(ffold/'concat_feats.npy'))
+        mean_pooled_conc = conc.mean(axis=(2, 3))
+        max_pooled_conc = conc.max(axis=(2, 3))
+        return mean_pooled_conc, max_pooled_conc
+
+    (mean_pooled_conc, max_pooled_conc) = vst.stash2(
+            out/'qreduced_feats.pkl')(qreduce)
+
+    # (X[0]**2).sum() ~= 1
+    X = sklearn.preprocessing.normalize(max_pooled_conc)
+    # This is X indexed over img_names
+    img_names = np.array(meta['img_names'])
+
+    # Get xi and cluster_name for all queries
+    # (xi is common index over X and img_names)
+    reg = r'(.+)/(.+)\.'
+    cluster_xi_mapping = {}
+    for xi, img_name in enumerate(meta['img_names']):
+        m = re.search(reg, img_name)
+        cluster_name, im_name = m.groups()
+        if cluster_name == 'negative_images':
+            continue
+        cluster = cluster_xi_mapping.setdefault(cluster_name, {})
+        if im_name == 'query':
+            cluster['query_xi'] = xi
+        else:
+            cluster.setdefault('data_xis', []).append(xi)
+
+    ap_per_cluster = {}
+    pbar = enumerate(cluster_xi_mapping.items())
+    pbar = tqdm(pbar, total=len(cluster_xi_mapping))
+    for i, (cluster_name, cluster) in pbar:
+        qxi = cluster['query_xi']
+        dxi = np.array(cluster['data_xis'])
+        # Match to all database values
+        x_query = X[qxi]
+        similarity = X @ x_query.T
+
+        # Positives are other guys from the cluster
+        Y = np.zeros_like(similarity, dtype=np.int)
+        Y[dxi] = 1
+        # Remove query
+        similarity_noquery = np.delete(similarity, qxi)
+        Y_noquery = np.delete(Y, qxi)
+        #
+        # ap = sklearn.metrics.average_precision_score(Y_noquery, similarity_noquery)
+        # ap_per_cluster[cluster_name] = ap
+
+        # if i > 20:
+        #     break
+
+        # closest_inds = np.argsort(similarity)[::-1][:10]
+        # closest_values = similarity[closest_inds]
+        # closest_names = [meta['img_names'][i] for i in closest_inds]
+        # query_name = meta['img_names'][ind]
+        # s = pd.Series(closest_values, closest_names)
+        # log.info('for file {} we found such top10 matches:\n{}'.format(
+        #     query_name, s))
+        #
+    pprint.pprint(ap_per_cluster)
+
+
+def estimate_mathieu_eval(workfolder, cfg_dict, add_arg):
+    out, = vst.exp.get_subfolders(workfolder, ['out'])
+    cfg = vst.exp.YConfig(cfg_dict, 'threshdict.')
+    cfg.set_defaults_yaml("""
+    inputs:
+        dataset: ~
+        featurefold: ~
+    seed: 42
+    """)
+    cf = cfg.parse()
+
+    dataset = vst.load_pkl(cf['inputs.dataset'])
+    ffold = Path(cf['inputs.featurefold'])
+    meta = vst.load_pkl(ffold/'metadict.pkl')
+
+    def qreduce():
+        conc = np.load(str(ffold/'concat_feats.npy'))
+        mean_pooled_conc = conc.mean(axis=(2, 3))
+        max_pooled_conc = conc.max(axis=(2, 3))
+        return mean_pooled_conc, max_pooled_conc
+
+    (mean_pooled_conc, max_pooled_conc) = vst.stash2(
+            out/'qreduced_feats.pkl')(qreduce)
+
+    X = sklearn.preprocessing.normalize(max_pooled_conc)
+    img_names_lst = meta['img_names']
+    img_names = np.array(img_names_lst)
+
+    score_keys = ["all", "alone_framing_different", "alone_color_change",
+            "alone_layer_modification_superposition", "alone_other",
+            "alone_similar", "framing_different", "color_change",
+            "layer_modification_superposition", "other", "similar"]
+
+    xis_negative = []
+    reg = r'(.+)/(.+)\.'
+    for xi, img_name in enumerate(img_names):
+        m = re.search(reg, img_name)
+        cluster_name, im_name = m.groups()
+        if cluster_name == 'negative_images':
+            xis_negative.append(xi)
+    xis_negative = np.array(xis_negative)
+
+    def compute_query_score(key, qi):
+        query_score = {k: [] for k in score_keys}
+        # Find query
+        query_imgname = '{}/{}'.format(key, qi['query_image'])
+        qxi = img_names_lst.index(query_imgname)
+        x_query = X[qxi]
+        similarity = X @ x_query
+        for target_image in qi["target_images"]:
+            target_imgname = '{}/{}'.format(key, target_image['image'])
+            target_xi = img_names_lst.index(target_imgname)
+            good_xis = np.r_[target_xi, xis_negative]
+            scores_gxis = similarity[good_xis]
+
+            argsorted_order10 = np.argsort(scores_gxis)[::-1][:10]
+            argsorted_gxis = list(good_xis[argsorted_order10])
+
+            # Inspired of MRR: Mean Reciprocal Rank
+            score = (1/(argsorted_gxis.index(target_xi) + 1)) \
+                if target_xi in argsorted_gxis else 0
+            scores = [score] * target_image["multiplicator"]
+
+            query_score["all"].extend(scores)
+            transformations = target_image["transformations"]
+            if transformations is not None:
+                for transformation in transformations:
+                    query_score[transformation].extend(scores)
+                    if len(transformations) == 1:
+                        query_score["alone_{}".format(
+                            transformation)].extend(scores)
+        return query_score
+
+    isaver = Isaver_threading(
+            vst.mkdir(out/'isave_qscore'),
+            list(dataset.dev["positives_queries"].items()),
+            lambda x: compute_query_score(x[0], x[1]),
+            1000, 20)
+    isaver_items = isaver.run()
+
+    global_score = {k: [] for k in score_keys}
+    for query_score in isaver_items:
+        for k, v in query_score.items():
+            if len(v) > 0:
+                global_score[k].append(sum(v)/len(v))
+
+    to_tabulate = []
+    for transformation, list_score in global_score.items():
+        if len(list_score) > 0:
+            row = [transformation,
+                  len(list_score),
+                  "{:.4f}".format(sum(list_score)/len(list_score)),
+                  "{:.2f}%".format(len([s for s in list_score if s != 0])/len(list_score) * 100)]
+        else:
+            row = [transformation, 0, 0, "0.00%"]
+        to_tabulate.append(row)
+
+    from tabulate import tabulate
+    table = tabulate(to_tabulate,
+             headers=['transformation', 'nb items', 'mean ranking score',
+                 'percentage found'])
+
+    log.info('Results:\n{}'.format(table))
+
+    # for query_ind in query_indices[:10]:
+    #     # Query process
+    #     query_x = X[query_ind]
+    #     similarity = X @ query_x.T
+    #
+    #     # Evaluation
+    #     cluster_name = query_clusters[query_ind]
+    #     cluster_imkeys = dataset.clusters[cluster_name]['imkeys']
+    #     cluster_indices = [meta['img_names'].index(imkey)
+    #             for imkey in cluster_imkeys]
+    #
+    #     query_name = meta['img_names'][ind]
+    #     s = pd.Series(closest_values, closest_names)
+    #     log.info('for file {} we found such top10 matches:\n{}'.format(
+    #         query_name, s))
