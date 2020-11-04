@@ -1,3 +1,4 @@
+import urllib
 import concurrent
 import pprint
 import re
@@ -281,7 +282,7 @@ def predict_convfeatures(workfolder, cfg_dict, add_arg):
     np.save(str(out/'concat_feats.npy'), conc)
 
 
-def estimate_distances(workfolder, cfg_dict, add_arg):
+def estimate_distances_map(workfolder, cfg_dict, add_arg):
     out, = vst.exp.get_subfolders(workfolder, ['out'])
     cfg = vst.exp.YConfig(cfg_dict, 'threshdict.')
     cfg.set_defaults_yaml("""
@@ -305,16 +306,16 @@ def estimate_distances(workfolder, cfg_dict, add_arg):
     (mean_pooled_conc, max_pooled_conc) = vst.stash2(
             out/'qreduced_feats.pkl')(qreduce)
 
-    # (X[0]**2).sum() ~= 1
+    # X is indexed over img_names
     X = sklearn.preprocessing.normalize(max_pooled_conc)
-    # This is X indexed over img_names
-    img_names = np.array(meta['img_names'])
+    img_names_lst = meta['img_names']
+    img_names = np.array(img_names_lst)
 
     # Get xi and cluster_name for all queries
     # (xi is common index over X and img_names)
     reg = r'(.+)/(.+)\.'
     cluster_xi_mapping = {}
-    for xi, img_name in enumerate(meta['img_names']):
+    for xi, img_name in enumerate(img_names_lst):
         m = re.search(reg, img_name)
         cluster_name, im_name = m.groups()
         if cluster_name == 'negative_images':
@@ -325,10 +326,17 @@ def estimate_distances(workfolder, cfg_dict, add_arg):
         else:
             cluster.setdefault('data_xis', []).append(xi)
 
-    ap_per_cluster = {}
-    pbar = enumerate(cluster_xi_mapping.items())
-    pbar = tqdm(pbar, total=len(cluster_xi_mapping))
-    for i, (cluster_name, cluster) in pbar:
+    xis_negative = []
+    reg = r'(.+)/(.+)\.'
+    for xi, img_name in enumerate(img_names):
+        m = re.search(reg, img_name)
+        cluster_name, im_name = m.groups()
+        if cluster_name == 'negative_images':
+            xis_negative.append(xi)
+    xis_negative = np.array(xis_negative)
+
+    def compute_cluster_ap(x):
+        cluster_name, cluster = x
         qxi = cluster['query_xi']
         dxi = np.array(cluster['data_xis'])
         # Match to all database values
@@ -341,22 +349,85 @@ def estimate_distances(workfolder, cfg_dict, add_arg):
         # Remove query
         similarity_noquery = np.delete(similarity, qxi)
         Y_noquery = np.delete(Y, qxi)
-        #
-        # ap = sklearn.metrics.average_precision_score(Y_noquery, similarity_noquery)
-        # ap_per_cluster[cluster_name] = ap
 
-        # if i > 20:
-        #     break
+        ap = sklearn.metrics.average_precision_score(
+                Y_noquery, similarity_noquery)
 
-        # closest_inds = np.argsort(similarity)[::-1][:10]
-        # closest_values = similarity[closest_inds]
-        # closest_names = [meta['img_names'][i] for i in closest_inds]
-        # query_name = meta['img_names'][ind]
-        # s = pd.Series(closest_values, closest_names)
-        # log.info('for file {} we found such top10 matches:\n{}'.format(
-        #     query_name, s))
-        #
-    pprint.pprint(ap_per_cluster)
+        # Easy version only THESE guys and negatives
+        easy_xis = np.r_[dxi, xis_negative]
+        similarity_easy = similarity[easy_xis]
+        Y_easy = np.zeros_like(similarity_easy, dtype=np.int)
+        Y_easy[:len(dxi)] = 1
+        ap_easy = sklearn.metrics.average_precision_score(
+                Y_easy, similarity_easy)
+
+        result = {'ap': ap, 'ap_easy': ap_easy, 'similarity': similarity}
+        return result
+
+    isaver = Isaver_threading(
+            vst.mkdir(out/'isave_qscore'),
+            list(cluster_xi_mapping.items()),
+            lambda x: compute_cluster_ap(x),
+            1000, 20)
+    isaver_items = isaver.run()
+    mean_ap = np.mean([it['ap'] for it in isaver_items])
+    mean_ap_easy = np.mean([it['ap_easy'] for it in isaver_items])
+
+    log.info('General perf: mAP: {:2f}, easy-mAP: {:2f}'.format(
+        mean_ap*100, mean_ap_easy*100))
+
+    # Visualization
+    for (cluster_name, cluster), result in zip(cluster_xi_mapping.items(), isaver_items):
+        qxi = cluster['query_xi']
+        dxi = np.array(cluster['data_xis'])
+        similarity = result['similarity']
+        # Set positives
+        Y = np.zeros_like(similarity, dtype=np.int)
+        Y[dxi] = 1
+        # Remove query
+        similarity_noquery = np.delete(similarity, qxi)
+        Y_noquery = np.delete(Y, qxi)
+        img_names_noquery = np.delete(img_names, qxi)
+        # Sort according to decreasing similarity
+        order_decr = np.argsort(similarity_noquery)[::-1]
+        sim_decr = similarity_noquery[order_decr]
+        Y_decr = Y_noquery[order_decr]
+        img_names_decr = img_names_noquery[order_decr]
+        # Find index at which all positives are found
+        cs = Y_decr.cumsum()
+        all_found_index = np.searchsorted(cs, cs[-1])
+        # Display matches until MAXN or all found+5
+        MAXN = 10
+        cutoff = min(MAXN, all_found_index+5)
+
+        fold = vst.mkdir(out/'vis'/f'cluster_{cluster_name}')
+        pbar = enumerate(zip(sim_decr, Y_decr, img_names_decr, cs))
+        pbar = tqdm(pbar)
+        for i, (sim, Y, img_name, csi) in pbar:
+            if i > cutoff:
+                break
+            impath = dataset.all_images[img_name]['path']
+            image = imread_func(impath)
+            H, W = image.shape[:2]
+            text = 'sim {}, name {}, found {}/{}'.format(
+                    sim, img_name, csi, cs[-1])
+            if Y:
+                box_color = (0, 200, 0)
+            else:
+                box_color = (0, 0, 200)
+
+            vst.plot.cv_put_text(image, text, (0, 40), 0.9, (0, 0, 0))
+            vst.plot.cv_put_text(image, text, (0, H-20), 0.9)
+
+            vst.plot.cv_put_box_with_text(
+                image, (0, 0, W, H), rec_color=box_color)
+
+            escaped_url = re.sub(r'[\/\.]', '',
+                        urllib.parse.quote(result['source']))
+
+            imname = fold/(f'{i:05d}_'+escaped_url+'.jpg')
+            cv2.imwrite(str(imname), cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
+
 
 
 def estimate_mathieu_eval(workfolder, cfg_dict, add_arg):
@@ -383,6 +454,7 @@ def estimate_mathieu_eval(workfolder, cfg_dict, add_arg):
     (mean_pooled_conc, max_pooled_conc) = vst.stash2(
             out/'qreduced_feats.pkl')(qreduce)
 
+    # X is indexed over img_names
     X = sklearn.preprocessing.normalize(max_pooled_conc)
     img_names_lst = meta['img_names']
     img_names = np.array(img_names_lst)
