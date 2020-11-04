@@ -57,6 +57,25 @@ def cv_put_box_with_text(
     return image
 
 
+def cv_put_text(
+        image, text,
+        text_pos,
+        text_size=0.6,
+        text_color=(255, 255, 255),
+        text_thickness=2,
+        text_position='left_down'
+        ):
+    fontFace = cv2.FONT_HERSHEY_SIMPLEX
+    cv2.putText(
+            image,
+            text,
+            text_pos,
+            fontFace=fontFace,
+            fontScale=text_size,
+            color=text_color,
+            thickness=text_thickness)
+
+
 def plot_close(f, legend_list=[], impath=None):
     if impath:
         f.savefig(impath,

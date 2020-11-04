@@ -61,7 +61,7 @@ def load_pkl_whichever(*filepaths):
                 pkl = pickle.load(f)
             return pkl
         except (FileNotFoundError, IsADirectoryError) as err:
-            log.info(f'Skipping.. Failed to load {filepath}. Error {err}')
+            log.debug(f'Skipping.. Failed to load {filepath}. Error {err}')
     raise FileNotFoundError('Failed to load pkl from a list of files', list(
         filepaths))
 
@@ -87,13 +87,13 @@ def compute_or_load_pkl(
         with filepath.open('rb') as f:
             pkl_bytes = f.read()
             pkl = pickle.loads(pkl_bytes)
-        log.info(f'Unpickled {filepath} in {timer() - start:.2f}s')
+        log.debug(f'Unpickled {filepath} in {timer() - start:.2f}s')
     except (EOFError, FileNotFoundError) as e:
-        log.info(f'Caught "{e}" error, Computing {function}(*args, **kwargs)')
+        log.debug(f'Caught "{e}" error, Computing {function}(*args, **kwargs)')
         pkl = function(*args, **kwargs)
         with filepath.open('wb') as f:
             pickle.dump(pkl, f, pickle.HIGHEST_PROTOCOL)
-        log.info(f'Computed and pickled to {filepath} in {timer() - start:.2f}s')
+        log.debug(f'Computed and pickled to {filepath} in {timer() - start:.2f}s')
     return pkl
 
 
