@@ -1,3 +1,0 @@
-* VST - Vladyslav Sydorov Tools
-
-- Snippets and useful boilerplate
