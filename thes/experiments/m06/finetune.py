@@ -1659,10 +1659,7 @@ def _lboxes_forward(data_input, model):
 
 def _ftube_extract(
         connections_f, model, extract_fold,
-        cf, cn, dataset):
-    BATCH_SIZE = 32
-    NUM_WORKERS = 4
-
+        BATCH_SIZE, NUM_WORKERS, save_interval_seconds, cn, dataset):
 
     sampler_grid = Sampler_grid(
             cn.DATA.NUM_FRAMES, cn.DATA.SAMPLING_RATE)
@@ -1718,7 +1715,7 @@ def _ftube_extract(
     disaver_fold = small.mkdir(extract_fold/'disaver')
     total = len(connections_f)
     disaver = Dataloader_isaver(disaver_fold, total, func, prepare_func,
-        save_interval_seconds=cf['batch_save_interval_seconds'],
+        save_interval_seconds=save_interval_seconds,
         log_interval=30)
 
     model.eval()
@@ -2364,7 +2361,9 @@ def full_tube_eval(workfolder, cfg_dict, add_args):
 
     extract_fold = out/f'chunk_{cc}_of_{ct}'
     dict_outputs = _ftube_extract(
-        connections_f, model_wf.model, extract_fold, cf, cn, dataset)
+        connections_f, model_wf.model, extract_fold,
+        cf['eval.batch_size'], cf['eval.num_workers'],
+        cf['batch_save_interval_seconds'], cn, dataset)
     small.save_pkl(extract_fold/'dict_outputs.pkl', dict_outputs)
     small.save_pkl(extract_fold/'connections_f.pkl', compute_connections_f)
 
@@ -2413,6 +2412,8 @@ def full_tube_eval_sf8x8(workfolder, cfg_dict, add_args):
         total: 1
     detect_mode: !def ['roipooled', ['fullframe', 'roipooled']]
     eval:
+        batch_size: 32
+        num_workers: 8
         full_tubes:
             nms: 0.3
             field_nms: 'box_det_score'  # hscore
@@ -2490,7 +2491,9 @@ def full_tube_eval_sf8x8(workfolder, cfg_dict, add_args):
 
     extract_fold = out/f'chunk_{cc}_of_{ct}'
     dict_outputs = _ftube_extract(
-        connections_f, model, extract_fold, cf, cn, dataset)
+        connections_f, model, extract_fold,
+        cf['eval.batch_size'], cf['eval.num_workers'],
+        cf['batch_save_interval_seconds'], cn, dataset)
     small.save_pkl(extract_fold/'dict_outputs.pkl', dict_outputs)
     small.save_pkl(extract_fold/'connections_f.pkl', compute_connections_f)
 
