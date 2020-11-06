@@ -1,6 +1,7 @@
 """
 Module with small snippets
 """
+import json
 import re
 import io
 import sys
@@ -42,15 +43,26 @@ def mkdir(directory) -> Path:
     return directory
 
 
-def save_pkl(filepath, pkl):
+def save_json(filepath, obj):
+    with Path(filepath).open('w') as f:
+        json.dump(obj, f)
+
+
+def load_json(filepath):
+    with Path(filepath).open('r') as f:
+        obj = json.load(f)
+    return obj
+
+
+def save_pkl(filepath, obj):
     with Path(filepath).open('wb') as f:
-        pickle.dump(pkl, f, pickle.HIGHEST_PROTOCOL)
+        pickle.dump(obj, f, pickle.HIGHEST_PROTOCOL)
 
 
 def load_pkl(filepath):
     with Path(filepath).resolve().open('rb') as f:
-        pkl = pickle.load(f)
-    return pkl
+        obj = pickle.load(f)
+    return obj
 
 
 def load_pkl_whichever(*filepaths):
