@@ -55,6 +55,7 @@ def load_wein_tubes(workfolder, cfg_dict, add_args):
     dataset:
         cache_folder: [~, str]
         mirror: ['uname', ~]
+    wein_index: [0, int]  # 0 = 510 cut tubes, 1 = 200 uncut tubes
     """)
     cf = cfg.parse()
     # Dataset
@@ -62,7 +63,7 @@ def load_wein_tubes(workfolder, cfg_dict, add_args):
     dataset.populate_from_folder(cf['dataset.cache_folder'])
     # Tubes
     # 0 has 510 elements, 1 has 200 elements
-    wein_package = small.load_py2_pkl(cf['wein_tubes'])[0]
+    wein_package = small.load_py2_pkl(cf['wein_tubes'])[cf['wein_index']]
     # We got a dictionary of filenames (w .mp4 suffix)
     extracted_tubes: Dict[I_dwein, Tube_daly_wein_as_provided] = {}
     for vid_mp4, wein_bunches in wein_package.items():
