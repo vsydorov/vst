@@ -124,7 +124,7 @@ def compute_or_load_pkl_silently(
     return pkl
 
 
-def stash2(stash_to, active=True, silent=False) -> Callable:
+def stash2(stash_to, *, active=True, silent=False) -> Callable:
     if silent:
         c_pkl_func = compute_or_load_pkl_silently
     else:
