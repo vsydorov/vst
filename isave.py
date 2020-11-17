@@ -1,19 +1,49 @@
 # Incremental savers
+import concurrent
 import time
 import re
 import logging
-import numpy as np
-from tqdm import tqdm
 from abc import ABC
 from pathlib import Path
 from typing import (  # NOQA
             Optional, Iterable, List, Dict,
             Any, Union, Callable, TypeVar)
 
-from vst import small
+import numpy as np
+from tqdm import tqdm
+
+import vst
 
 
 log = logging.getLogger(__name__)
+
+
+class Counter_repeated_action(object):
+    """
+    Will check whether repeated action should be performed
+    """
+    def __init__(self, sslice='::', seconds=None, iters=None):
+        self.sslice = sslice
+        self.seconds = seconds
+        self.iters = iters
+        self.tic(-1)
+
+    def tic(self, i=None):
+        self._time_last = time.perf_counter()
+        if i is not None:
+            self._i_last = i
+
+    def check(self, i=None):
+        ACTION = False
+        if i is not None:
+            ACTION |= vst.check_step(i, self.sslice)
+            if self.iters is not None:
+                ACTION |= (i - self._i_last) >= self.iters
+
+        if self.seconds is not None:
+            time_since_last = time.perf_counter() - self._time_last
+            ACTION |= time_since_last >= self.seconds
+        return ACTION
 
 
 class Isaver_base(ABC):
@@ -25,8 +55,12 @@ class Isaver_base(ABC):
 
         self._folder = folder
         self._total = total
+        if self._folder is None:
+            log.debug('Isaver without folder, no saving will be performed')
 
     def _get_filenames(self, i) -> Dict[str, Path]:
+        if self._folder is None:
+            raise RuntimeError('Filenames are undefined without folder')
         base_filenames = {
             'finished': self._fmt_finished.format(i, self._total)}
         base_filenames['pkl'] = Path(base_filenames['finished']).with_suffix('.pkl')
@@ -35,6 +69,8 @@ class Isaver_base(ABC):
 
     def _get_intermediate_files(self) -> Dict[int, Dict[str, Path]]:
         """Check re_finished, query existing filenames"""
+        if (self._folder is None) or (not self._folder.exists()):
+            return {}
         intermediate_files = {}
         for ffilename in self._folder.iterdir():
             matched = re.match(self._re_finished, ffilename.name)
@@ -49,6 +85,9 @@ class Isaver_base(ABC):
         return intermediate_files
 
     def _purge_intermediate_files(self):
+        if self._folder is None:
+            log.debug('Isaver folder is None, no purging')
+            return
         """Remove old saved states"""
         intermediate_files: Dict[int, Dict[str, Path]] = \
                 self._get_intermediate_files()
@@ -63,8 +102,6 @@ class Isaver_base(ABC):
         log.debug('Purged {} states, {} files'.format(
             len(inds_to_purge), files_purged))
 
-
-class Isaver_mixin_restore_save(object):
     def _restore(self):
         intermediate_files: Dict[int, Dict[str, Path]] = \
                 self._get_intermediate_files()
@@ -72,18 +109,22 @@ class Isaver_mixin_restore_save(object):
                 default=(-1, None))
         if ifiles is not None:
             restore_from = ifiles['pkl']
-            self.result = small.load_pkl(restore_from)
+            self.result = vst.load_pkl(restore_from)
             log.info('Restore from {}'.format(restore_from))
         return start_i
 
     def _save(self, i):
+        if self._folder is None:
+            log.debug('Isaver folder is None, no saving')
+            return
         ifiles = self._get_filenames(i)
         savepath = ifiles['pkl']
-        small.save_pkl(savepath, self.result)
+        vst.mkdir(savepath.parent)
+        vst.save_pkl(savepath, self.result)
         ifiles['finished'].touch()
 
 
-class Isaver_simple(Isaver_mixin_restore_save, Isaver_base):
+class Isaver_simple(Isaver_base):
     """
     Will process a list with a func
 
@@ -111,7 +152,7 @@ class Isaver_simple(Isaver_mixin_restore_save, Isaver_base):
         for i in pbar:
             self.result.append(self.func(self.arg_list[i]))
             # Save check
-            SAVE = small.check_step(i, self._save_period)
+            SAVE = vst.check_step(i, self._save_period)
             if self._save_interval:
                 since_last_save = time.perf_counter() - self._time_last_save
                 SAVE |= since_last_save > self._save_interval
@@ -124,6 +165,110 @@ class Isaver_simple(Isaver_mixin_restore_save, Isaver_base):
             if self._log_interval:
                 since_last_log = time.perf_counter() - self._time_last_log
                 if since_last_log > self._log_interval:
-                    log.info(small.tqdm_str(pbar))
+                    log.info(vst.tqdm_str(pbar))
                     self._time_last_log = time.perf_counter()
+        return self.result
+
+
+class Isaver_threading(Isaver_base):
+    """
+    Will process a list with a func, in async manner
+    """
+    def __init__(self, folder, arg_list, func,
+            save_iters=np.inf,
+            save_interval=120,
+            max_workers=5):
+        super().__init__(folder, len(arg_list))
+        self.arg_list = arg_list
+        self.result = {}
+        self.func = func
+        self._save_iters = save_iters
+        self._save_interval = save_interval
+        self._max_workers = max_workers
+
+    def run(self):
+        self._restore()
+        countra = Counter_repeated_action(
+                seconds=self._save_interval)
+
+        all_ii = set(range(len(self.arg_list)))
+        remaining_ii = all_ii - set(self.result.keys())
+
+        io_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=self._max_workers)
+        io_futures = []
+        for i in remaining_ii:
+            args = self.arg_list[i]
+            submitted = io_executor.submit(self.func, args)
+            submitted.i = i
+            io_futures.append(submitted)
+
+        flush_dict = {}
+
+        def flush_purge():
+            self.result.update(flush_dict)
+            flush_dict.clear()
+            self._save(len(self.result))
+            self._purge_intermediate_files()
+
+        pbar = concurrent.futures.as_completed(io_futures)
+        pbar = tqdm(pbar, 'isaver_threading', total=len(io_futures))
+        for io_future in pbar:
+            result = io_future.result()
+            i = io_future.i
+            flush_dict[i] = result
+            # A bit dirty, but should still work
+            if countra.check() or len(flush_dict) >= self._save_iters:
+                flush_purge()
+                countra.tic()
+        flush_purge()
+        assert len(self.result) == len(self.arg_list)
+        result_list = [self.result[i] for i in all_ii]
+        return result_list
+
+
+class Dataloader_isaver(
+        vst.isave.Isaver_base):
+    """
+    Will process a list with a 'func',
+    - prepare_func(start_i) is to be run before processing
+    """
+    def __init__(self, folder,
+            total, func, prepare_func,
+            save_period='::',
+            save_interval=120,
+            log_interval=None,):
+        super().__init__(folder, total)
+        self.func = func
+        self.prepare_func = prepare_func
+        self._save_period = save_period
+        self._save_interval = save_interval
+        self._log_interval = log_interval
+        self.result = []
+
+    def run(self):
+        i_last = self._restore()
+        countra = Counter_repeated_action(
+                sslice=self._save_period,
+                seconds=self._save_interval)
+
+        result_cache = []
+
+        def flush_purge():
+            self.result.extend(result_cache)
+            result_cache.clear()
+            with vst.QTimer('saving pkl'):
+                self._save(i_last)
+            self._purge_intermediate_files()
+
+        loader = self.prepare_func(i_last)
+        pbar = tqdm(loader, total=len(loader))
+        for i_batch, data_input in enumerate(pbar):
+            result_dict, i_last = self.func(data_input)
+            result_cache.append(result_dict)
+            if countra.check(i_batch):
+                flush_purge()
+                log.debug(vst.tqdm_str(pbar))
+                countra.tic(i_batch)
+        flush_purge()
         return self.result
