@@ -174,17 +174,24 @@ class Isaver_threading(Isaver_base):
     """
     Will process a list with a func, in async manner
     """
-    def __init__(self, folder, arg_list, func,
+    def __init__(
+            self, folder,
+            arg_list: List[List[Any]],
+            func: Callable, *,
             save_iters=np.inf,
             save_interval=120,
-            max_workers=5):
+            max_workers=None,
+            progress: Optional[str] = None
+            ):
+        arg_list = list(arg_list)
         super().__init__(folder, len(arg_list))
         self.arg_list = arg_list
-        self.result = {}
         self.func = func
         self._save_iters = save_iters
         self._save_interval = save_interval
         self._max_workers = max_workers
+        self._progress = progress
+        self.result = {}
 
     def run(self):
         self._restore()
@@ -199,7 +206,7 @@ class Isaver_threading(Isaver_base):
         io_futures = []
         for i in remaining_ii:
             args = self.arg_list[i]
-            submitted = io_executor.submit(self.func, args)
+            submitted = io_executor.submit(self.func, *args)
             submitted.i = i
             io_futures.append(submitted)
 
@@ -212,7 +219,8 @@ class Isaver_threading(Isaver_base):
             self._purge_intermediate_files()
 
         pbar = concurrent.futures.as_completed(io_futures)
-        pbar = tqdm(pbar, 'isaver_threading', total=len(io_futures))
+        if self._progress:
+            pbar = tqdm(pbar, self._progress, total=len(io_futures))
         for io_future in pbar:
             result = io_future.result()
             i = io_future.i
@@ -227,23 +235,27 @@ class Isaver_threading(Isaver_base):
         return result_list
 
 
-class Dataloader_isaver(
+class Isaver_dataloader(
         vst.isave.Isaver_base):
     """
     Will process a list with a 'func',
     - prepare_func(start_i) is to be run before processing
     """
-    def __init__(self, folder,
-            total, func, prepare_func,
+    def __init__(
+            self, folder,
+            total, func, prepare_func, *,
             save_period='::',
             save_interval=120,
-            log_interval=None,):
+            log_interval=None,
+            progress: Optional[str] = None
+            ):
         super().__init__(folder, total)
         self.func = func
         self.prepare_func = prepare_func
         self._save_period = save_period
         self._save_interval = save_interval
         self._log_interval = log_interval
+        self._progress = progress
         self.result = []
 
     def run(self):
@@ -257,18 +269,20 @@ class Dataloader_isaver(
         def flush_purge():
             self.result.extend(result_cache)
             result_cache.clear()
-            with vst.QTimer('saving pkl'):
-                self._save(i_last)
+            self._save(i_last)
             self._purge_intermediate_files()
 
         loader = self.prepare_func(i_last)
-        pbar = tqdm(loader, total=len(loader))
-        for i_batch, data_input in enumerate(pbar):
+        pbar = enumerate(loader)
+        if self._progress:
+            pbar = tqdm(pbar, self._progress, total=len(loader))
+        for i_batch, data_input in pbar:
             result_dict, i_last = self.func(data_input)
             result_cache.append(result_dict)
             if countra.check(i_batch):
                 flush_purge()
-                log.debug(vst.tqdm_str(pbar))
+                if self._progress:
+                    log.debug(vst.tqdm_str(pbar))
                 countra.tic(i_batch)
         flush_purge()
         return self.result
