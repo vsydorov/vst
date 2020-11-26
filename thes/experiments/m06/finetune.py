@@ -1163,9 +1163,7 @@ def _preset_defaults(cfg):
     train:
         start_epoch: 0
         batch_save_interval_seconds: 120
-        batch_size:
-            train: 32
-            eval: 64
+        batch_size: 32
         tubes:
             top_n_matches: ~
             stride: 4
@@ -1176,6 +1174,9 @@ def _preset_defaults(cfg):
             scale: False
             hflip: False
             color: False
+    eval:
+        batch_size: 64
+        num_workers: 8
     period:
         i_batch:
             loss_log: '0::10'
@@ -1799,7 +1800,7 @@ def finetune_preextracted_krgb(workfolder, cfg_dict, add_args):
     start_epoch = (man_ckpt.restore_model_magic(checkpoint_path))
 
     eval_krgb_loader, eval_krgb_keyframes = man_lkrgb.get_eval_loader(
-        vids_eval, cf['train.batch_size.eval'])
+        vids_eval, cf['eval.batch_size'])
 
     # Training
     for i_epoch in range(start_epoch, max_epoch):
@@ -1812,7 +1813,7 @@ def finetune_preextracted_krgb(workfolder, cfg_dict, add_args):
         model_wf.set_train()
         train_loader = man_lkrgb.get_train_loader(
                 vgroup[sset_train],
-                cf['train.batch_size.train'], ts_rgen)
+                cf['train.batch_size'], ts_rgen)
         inputs_converter = man_lkrgb.preprocess_data
 
         wavg_loss = snippets.misc.WindowAverager(10)
@@ -1907,7 +1908,7 @@ def finetune(workfolder, cfg_dict, add_args):
     stride = cf['train.tubes.stride']
     top_n_matches = cf['train.tubes.top_n_matches']
     max_distance = cf['train.tubes.frame_dist']
-    batch_size_train = cf['train.batch_size.train']
+    batch_size_train = cf['train.batch_size']
 
     if detect_mode == 'fullframe':
         labeled_frames: List[Frame_labeled] = \
@@ -1945,7 +1946,7 @@ def finetune(workfolder, cfg_dict, add_args):
             norm_mean_cu, norm_std_cu)
 
     eval_krgb_loader, eval_krgb_keyframes = man_lkrgb.get_eval_loader(
-        vgroup[sset_eval], cf['train.batch_size.eval'])
+        vgroup[sset_eval], cf['eval.batch_size'])
 
     man_ckpt = Manager_model_checkpoints(model_wf.model, optimizer, 'c2d_1x1')
 
@@ -1959,7 +1960,7 @@ def finetune(workfolder, cfg_dict, add_args):
     start_epoch = man_ckpt.restore_model_magic(checkpoint_path,
             cf['inputs.ckpt'], cf['train.start_epoch'])
 
-    batch_size_train = cf['train.batch_size.train']
+    batch_size_train = cf['train.batch_size']
     NUM_WORKERS = cf['train.num_workers']
     # Training
     for i_epoch in range(start_epoch, max_epoch):
@@ -2100,7 +2101,7 @@ def finetune_sf8x8(workfolder, cfg_dict, add_args):
     stride = cf['train.tubes.stride']
     top_n_matches = cf['train.tubes.top_n_matches']
     max_distance = cf['train.tubes.frame_dist']
-    batch_size_train = cf['train.batch_size.train']
+    batch_size_train = cf['train.batch_size']
 
     if detect_mode == 'fullframe':
         labeled_frames: List[Frame_labeled] = \
@@ -2140,7 +2141,7 @@ def finetune_sf8x8(workfolder, cfg_dict, add_args):
     lmanager = Lazy_Manager_krgb(
             cf['inputs.keyframes_rgb'], dataset, vgroup,
             norm_mean_cu, norm_std_cu, sset_eval,
-            cf['train.batch_size.eval'])
+            cf['eval.batch_size'])
 
     man_ckpt = Manager_model_checkpoints(model, optimizer, 'SLOWFAST_8x8_R50')
 
@@ -2154,7 +2155,7 @@ def finetune_sf8x8(workfolder, cfg_dict, add_args):
     start_epoch = man_ckpt.restore_model_magic(checkpoint_path,
             cf['inputs.ckpt'], cf['train.start_epoch'])
 
-    batch_size_train = cf['train.batch_size.train']
+    batch_size_train = cf['train.batch_size']
     NUM_WORKERS = cf['train.num_workers']
     # Training
     for i_epoch in range(start_epoch, max_epoch):
@@ -2287,6 +2288,8 @@ def full_tube_eval(workfolder, cfg_dict, add_args):
         total: 1
     detect_mode: !def ['roipooled', ['fullframe', 'roipooled']]
     eval:
+        batch_size: 32
+        num_workers: 8
         full_tubes:
             nms: 0.3
             field_nms: 'box_det_score'  # hscore
