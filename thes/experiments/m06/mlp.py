@@ -64,7 +64,7 @@ from thes.mlp import (
     Manager_feats_tubes_dwein_full,
     define_mlp_model, mlp_perf_kf_evaluate,
     mlp_perf_fulltube_evaluate, mlp_perf_display,
-    quick_accuracy_over_kfeat)
+    quick_accuracy_over_kfeat, Net_mlp_onelayer)
 
 log = logging.getLogger(__name__)
 
@@ -411,119 +411,26 @@ def _kffeats_train_mlp_single_run(
     return result
 
 
+class Manager_feats_keyframes(object):
+    def __init__(self, fold, featname):
+        keyframes_featfold = Path(fold)
+        self.outputs = small.load_pkl(
+                keyframes_featfold/'dict_outputs.pkl')[featname]
+        self.keyframes = small.load_pkl(keyframes_featfold/'keyframes.pkl')
+
+    def split_off(self, vids, to_torch: bool):
+        global_kf_vids = [kf['vid'] for kf in self.keyframes]
+        X = Ncfg_kfeats.split_off(self.outputs, global_kf_vids, vids)
+        kf = Ncfg_kfeats.split_off(self.keyframes, global_kf_vids, vids)
+        Y = np.array([kf['action_id'] for kf in kf])
+        if to_torch:
+            X = torch.from_numpy(X)
+            Y = torch.from_numpy(Y)
+        d = {'X': X, 'kf': kf, 'Y': Y}
+        return d
+
+
 # Experiments
-
-
-def kffeats_train_mlp(workfolder, cfg_dict, add_args):
-    """
-    Train a classification MLP on keyframes only. Simple to do.
-    """
-    out, = snippets.get_subfolders(workfolder, ['out'])
-    cfg = snippets.YConfig_v2(cfg_dict)
-    Ncfg_daly.set_defcfg_v2(cfg)
-    Ncfg_kfeats.set_defcfg_v2(cfg)
-    cfg.set_defaults_yaml("""
-    inputs:
-        tubes_dwein: ~
-        tubes_dwein_feats:
-            fold: ~
-            kind: !def ['roipooled', ['fullframe', 'roipooled']]
-    seed: 42
-    split_assignment: !def ['train/val', ['train/val', 'trainval/test']]
-    data_scaler: !def ['keyframes', ['keyframes', 'no']]
-    net:
-        kind: !def ['layer1', ['layer0', 'layer1']]
-        layer1:
-            H: 32
-        ll_dropout: 0.5
-        n_outputs: !def [10, [10, 11]]
-    train:
-        lr: 1.0e-5
-        weight_decay: 5.0e-2
-        n_epochs: 2001
-        period:
-            log: '0::500'
-            eval: '0::500'
-            ibatch_loss: '::'  # only relevant for partial
-        batch_mode: !def ['full', ['full', 'partial']]
-        batch_mode_partial:
-            train_batch_size: 32
-    eval:
-        full_tubes:
-            enabled: False
-            detect_mode: !def ['roipooled', ['fullframe', 'roipooled']]
-            nms: 0.3
-            field_nms: 'box_det_score'  # hscore
-            field_det: 'box_det_score'  # hscore*frame_cls_score
-    n_trials: 1
-    """)
-    cf = cfg.parse()
-    # params
-    initial_seed = cf['seed']
-    n_trials = cf['n_trials']
-    sset_train, sset_eval = cf['split_assignment'].split('/')
-    # Inputs
-    dataset = Ncfg_daly.get_dataset(cf)
-    vgroup = Ncfg_daly.get_vids(cf, dataset)
-    tkfeats_d, scaler = Ncfg_kfeats.load_scale(cf, vgroup)
-    tubes_dwein_d, tubes_dgt_d = load_gt_and_wein_tubes(
-            cf['inputs.tubes_dwein'], dataset, vgroup)
-    tubes_dwein_prov: Dict[I_dwein, Tube_daly_wein_as_provided] = \
-            small.load_pkl(cf['inputs.tubes_dwein'])
-    detect_mode = cf['eval.full_tubes.detect_mode']
-    if cf['eval.full_tubes.enabled']:
-        man_feats_dwt = create_preextracted_feats_manager(
-                cf, scaler, detect_mode)
-    else:
-        man_feats_dwt = None
-
-    # / Torch section
-    tkfeats_train = tkfeats_d[sset_train]
-    tkfeats_eval = tkfeats_d[sset_eval]
-    tubes_dwein_eval = tubes_dwein_d[sset_eval]
-    tubes_dgt_eval = tubes_dgt_d[sset_eval]
-
-    log.info(f'Train/eval splits: {sset_train} {sset_eval=}')
-    # Folder for trained models
-    fold_trmodels = small.mkdir(out/'trained_models')
-
-    def experiment(i):
-        log.info(f'Experiment {i}')
-        result = _kffeats_train_mlp_single_run(
-            cf, fold_trmodels, i,
-            initial_seed+i, man_feats_dwt,
-            tkfeats_train, tkfeats_eval,
-            tubes_dwein_eval, tubes_dgt_eval,
-            tubes_dwein_prov, dataset, sset_eval)
-        return result
-
-    if n_trials == 1:
-        experiment(0)
-        return
-
-    isaver = snippets.Isaver_simple(
-            small.mkdir(out/'isaver_ntrials'),
-            range(n_trials), experiment)
-    trial_results = isaver.run()
-
-    df_keys = ['df_recall_cheat', 'df_ap_cheat']
-    scalar_keys = ['kacc_train', 'kacc_eval']
-    if 'df_ap_full' in trial_results[0]:
-        df_keys.append('df_ap_full')
-    if 'df_ap_full' in trial_results[0]:
-        df_keys.append('df_recall_full')
-    if 'acc_flattube_synt' in trial_results[0]:
-        scalar_keys.append('acc_flattube_synt')
-    avg_result = {}
-    for k in scalar_keys:
-        avg_result[k] = np.mean([tr[k] for tr in trial_results])
-    for k in df_keys:
-        to_avg = [tr[k] for tr in trial_results]
-        df = pd.concat(to_avg,
-                keys=range(len(to_avg)), axis=1).mean(axis=1, level=1)
-        avg_result[k] = df
-    log.info('Results for average over {} trials'.format(n_trials))
-    mlp_perf_display(avg_result, sset_eval)
 
 
 def tubefeats_dist_train_mlp(workfolder, cfg_dict, add_args):
@@ -533,7 +440,12 @@ def tubefeats_dist_train_mlp(workfolder, cfg_dict, add_args):
     out, = snippets.get_subfolders(workfolder, ['out'])
     cfg = snippets.YConfig_v2(cfg_dict)
     Ncfg_daly.set_defcfg_v2(cfg)
-    Ncfg_kfeats.set_defcfg_v2(cfg)
+    cfg.set_defaults_yaml("""
+    inputs:
+        keyframes:
+            fold: ~
+            featname: ~
+    """)
     cfg.set_defaults_yaml("""
     inputs:
         tubes_dwein: ~
@@ -546,10 +458,6 @@ def tubefeats_dist_train_mlp(workfolder, cfg_dict, add_args):
         ['train/val', 'trainval/test']]
     data_scaler: !def ['no', ['keyframes', 'no']]
     net:
-        kind: !def ['layer1', ['layer0', 'layer1']]
-        layer1:
-            H: 32
-        ll_dropout: 0.5
         n_outputs: !def [~, [10, 11]]
     train:
         lr: 1.0e-05
@@ -586,8 +494,9 @@ def tubefeats_dist_train_mlp(workfolder, cfg_dict, add_args):
     dataset = Ncfg_daly.get_dataset(cf)
     vgroup = Ncfg_daly.get_vids(cf, dataset)
     sset_train, sset_eval = cf['split_assignment'].split('/')
-    # keyframe feats
-    tkfeats_d, scaler = Ncfg_kfeats.load_scale(cf, vgroup)
+    vids_train, vids_eval = vgroup[sset_train], vgroup[sset_eval]
+    man_feats_kf = Manager_feats_keyframes(
+            cf['inputs.keyframes.fold'], cf['inputs.keyframes.featname'])
     # wein tubes
     tubes_dwein_d, tubes_dgt_d = load_gt_and_wein_tubes(
             cf['inputs.tubes_dwein'], dataset, vgroup)
@@ -599,8 +508,8 @@ def tubefeats_dist_train_mlp(workfolder, cfg_dict, add_args):
             tubes_dgt_d[sset_eval], tubes_dwein_d[sset_eval], dataset)
 
     # Ssset
-    tkfeats_train = tkfeats_d[sset_train]
-    tkfeats_eval = tkfeats_d[sset_eval]
+    tkfeats_train = man_feats_kf.split_off(vids_train, True)
+    tkfeats_eval = man_feats_kf.split_off(vids_eval, True)
     tubes_dwein_train = tubes_dwein_d[sset_train]
     tubes_dwein_eval = tubes_dwein_d[sset_eval]
     tubes_dgt_train = tubes_dgt_d[sset_train]
@@ -612,7 +521,7 @@ def tubefeats_dist_train_mlp(workfolder, cfg_dict, add_args):
     stride = cf['train.tubes.stride']
     detect_mode = cf['inputs.tubes_dwein_feats.kind']
     man_feats_dwt = create_preextracted_feats_manager(
-            cf, scaler, detect_mode)
+            cf, None, detect_mode)
 
     max_distance = cf['train.tubes.frame_dist']
     output_dims = cf['net.n_outputs']
@@ -631,8 +540,9 @@ def tubefeats_dist_train_mlp(workfolder, cfg_dict, add_args):
         D_in = man_feats_dwt.fullframe_feats.shape[-1]
     elif detect_mode == 'roipooled':
         # roitubes
-        keyframes_train = tkfeats_train['kf']
-        keyframe_feats_train = tkfeats_train['X'].numpy()
+        tkfeats_train_numpy = man_feats_kf.split_off(vids_train, False)
+        keyframes_train = tkfeats_train_numpy['kf']
+        keyframe_feats_train = tkfeats_train_numpy['X']
         labeled_boxes: List[Box_labeled] = \
           prepare_label_roiboxes_for_training(
             tubes_dgt_train, dataset, stride, max_distance,
@@ -649,7 +559,8 @@ def tubefeats_dist_train_mlp(workfolder, cfg_dict, add_args):
         raise RuntimeError()
 
     # Model
-    model = define_mlp_model(cf, D_in, output_dims)
+    model = Net_mlp_onelayer(
+        D_in, output_dims, 32, 0.5)
     loss_fn = torch.nn.CrossEntropyLoss(reduction='mean')
     optimizer = torch.optim.AdamW(model.parameters(),
             lr=cf['train.lr'], weight_decay=cf['train.weight_decay'])
@@ -704,6 +615,7 @@ def tubefeats_dist_train_mlp(workfolder, cfg_dict, add_args):
         ckpt.save_epoch(rundir, i_epoch)
         if check_step(i_epoch, cf['period.i_epoch.loss_log']):
             log.info(f'Loss at {i_epoch=}: {l_avg.avg}')
+
         if check_step(i_epoch, cf['period.i_epoch.q_eval']):
             model.eval()
             kacc_train = quick_accuracy_over_kfeat(
@@ -773,8 +685,9 @@ def fancy_evaluate(workfolder, cfg_dict, add_args):
     dataset = Ncfg_daly.get_dataset(cf)
     vgroup = Ncfg_daly.get_vids(cf, dataset)
     sset_train, sset_eval = cf['split_assignment'].split('/')
-    # keyframe feats
-    tkfeats_d, scaler = Ncfg_kfeats.load_scale(cf, vgroup)
+    vids_train, vids_eval = vgroup[sset_train], vgroup[sset_eval]
+    man_feats_kf = Manager_feats_keyframes(
+            cf['inputs.keyframes.fold'], cf['inputs.keyframes.featname'])
     # wein tubes
     tubes_dwein_d, tubes_dgt_d = load_gt_and_wein_tubes(
             cf['inputs.tubes_dwein'], dataset, vgroup)
@@ -785,8 +698,8 @@ def fancy_evaluate(workfolder, cfg_dict, add_args):
     _, dwti_to_label_eval = qload_synthetic_tube_labels(
             tubes_dgt_d[sset_eval], tubes_dwein_d[sset_eval], dataset)
     # Ssset
-    tkfeats_train = tkfeats_d[sset_train]
-    tkfeats_eval = tkfeats_d[sset_eval]
+    tkfeats_train = man_feats_kf.split_off(vids_train, True)
+    tkfeats_eval = man_feats_kf.split_off(vids_eval, True)
     tubes_dwein_eval = tubes_dwein_d[sset_eval]
     tubes_dgt_eval = tubes_dgt_d[sset_eval]
 
@@ -794,7 +707,7 @@ def fancy_evaluate(workfolder, cfg_dict, add_args):
     assert cf['eval.full_tubes.enabled'], 'We train on them anyway'
     detect_mode = cf['inputs.tubes_dwein_feats.kind']
     man_feats_dwt = create_preextracted_feats_manager(
-            cf, scaler, detect_mode)
+            cf, None, detect_mode)
     output_dims = cf['net.n_outputs']
 
     if detect_mode == 'fullframe':
@@ -807,7 +720,8 @@ def fancy_evaluate(workfolder, cfg_dict, add_args):
         raise RuntimeError()
 
     # Model
-    model = define_mlp_model(cf, D_in, output_dims)
+    model = Net_mlp_onelayer(
+        D_in, output_dims, 32, 0.5)
     states = torch.load(cf['inputs.ckpt'])
     i_epoch = states['i_epoch']
     model.load_state_dict(states['model_sdict'])
@@ -880,20 +794,6 @@ def merge_evaluate(workfolder, cfg_dict, add_args):
         tkfeats['X'] = torch.from_numpy(tkfeats['X'])
         tkfeats['Y'] = torch.from_numpy(tkfeats['Y'])
         return tkfeats
-    # // ROI
-    keyframes_featfold = Path(cf['inputs.keyframes.roi'])
-    keyframes = small.load_pkl(keyframes_featfold/'keyframes.pkl')
-    outputs = small.load_pkl(
-            keyframes_featfold/'dict_outputs.pkl')['roipooled']
-    kfeats_eval_roi = to_torch(Ncfg_kfeats.split_off_D(
-            outputs, keyframes, vgroup[sset_eval]))
-    # // FULL
-    keyframes_featfold = Path(cf['inputs.keyframes.full'])
-    keyframes = small.load_pkl(keyframes_featfold/'keyframes.pkl')
-    outputs = small.load_pkl(
-            keyframes_featfold/'dict_outputs.pkl')['fullframe']
-    kfeats_eval_full = to_torch(Ncfg_kfeats.split_off_D(
-            outputs, keyframes, vgroup[sset_eval]))
 
     # synthetic tube labels
     _, dwti_to_label_eval = qload_synthetic_tube_labels(
@@ -911,7 +811,6 @@ def merge_evaluate(workfolder, cfg_dict, add_args):
 
     model_roi = define_mlp_model(cf, D_in, 11)
     states = torch.load(cf['inputs.ckpt.roi'])
-    i_epoch = states['i_epoch']
     model_roi.load_state_dict(states['model_sdict'])
     model_roi.eval()
 
@@ -988,10 +887,8 @@ def merge_evaluate(workfolder, cfg_dict, add_args):
     av_stubes = assign_scorefield(av_stubes, nms_scorefield)
     av_stubes = av_stubes_above_score(av_stubes, 0.0)
     av_stubes = compute_nms_for_av_stubes(av_stubes, 0.3)
-    # av_stubes = assign_scorefield(av_stubes, 'box_det_score')  # roi, 72.73
-    # av_stubes = assign_scorefield(av_stubes, 'hscore*frame_cls_score')  # full, 71.35
-    # av_stubes = assign_scorefield(av_stubes, 'mean(box_det_score,frame_cls_score)')  # 72.54
-    av_stubes = assign_scorefield(av_stubes, 'mean(box_det_score, hscore*frame_cls_score)')  # 74.72
+    av_stubes = assign_scorefield(
+            av_stubes, 'mean(box_det_score, hscore*frame_cls_score)')
 
     df_ap_full = compute_ap_for_avtubes_as_df(
         av_gt_tubes, av_stubes, iou_thresholds, False, False)
