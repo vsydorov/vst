@@ -92,6 +92,8 @@ def _config_assign_defaults(cf, cf_defaults,
         raise_without_defaults=True):
     # // Assign defaults
     cf_with_defaults = copy.deepcopy(cf)
+    assert isinstance(allowed_wo_defaults, list), \
+            'Wrong spec for allowed_wo_defaults'
 
     keys_cf = np.array(list(cf.keys()))
     keys_cf_default = np.array(list(cf_defaults.keys()))
