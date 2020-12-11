@@ -235,8 +235,7 @@ class Isaver_threading(Isaver_base):
         return result_list
 
 
-class Isaver_dataloader(
-        vst.isave.Isaver_base):
+class Isaver_dataloader(Isaver_base):
     """
     Will process a list with a 'func',
     - prepare_func(start_i) is to be run before processing
