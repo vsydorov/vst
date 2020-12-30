@@ -45,7 +45,7 @@ def mkdir(directory) -> Path:
 
 def save_json(filepath, obj):
     with Path(filepath).open('w') as f:
-        json.dump(obj, f)
+        json.dump(obj, f, indent=4, sort_keys=True)
 
 
 def load_json(filepath):
