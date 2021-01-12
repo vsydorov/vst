@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
+from contextlib import contextmanager
 from typing import (  # NOQA
             Optional, Iterable, List, Dict,
             Any, Union, Callable, TypeVar)
@@ -84,3 +85,11 @@ def plot_close(f, legend_list=[], impath=None):
     else:
         plt.show()
     plt.close(f)
+
+
+@contextmanager
+def plt_backend(backend_name):
+    original = plt.get_backend()
+    plt.switch_backend(backend_name)
+    yield
+    plt.switch_backend(original)
