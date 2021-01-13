@@ -150,7 +150,8 @@ class Isaver_simple(Isaver_base):
         self._time_last_log = time.perf_counter()
         pbar = tqdm(run_range)
         for i in pbar:
-            self.result.append(self.func(self.arg_list[i]))
+            args = self.arg_list[i]
+            self.result.append(self.func(*args))
             # Save check
             SAVE = vst.check_step(i, self._save_period)
             if self._save_interval:
