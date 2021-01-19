@@ -240,6 +240,23 @@ class Isaver_dataloader(Isaver_base):
     """
     Will process a list with a 'func',
     - prepare_func(start_i) is to be run before processing
+
+    Example:
+        def prepare_func(i_last):
+            dset = creator_tdata_eval(negatives_cvt[i_last+1:])
+            dload = creator_dload_eval(dset)
+            return dload
+
+        def func(data_input):
+            data, target, meta = helper_metamodel.data_preprocess(data_input)
+            data, target = map(lambda x: x.to(device), (data, target))
+            with torch.no_grad():
+                output = helper_metamodel.get_eval_output(data, meta)
+            score_np = output.detach().cpu().numpy()
+            inds = [x['item']['ind'] for x in meta]
+            result_dict = {'score': score_np, 'ind': inds}
+            i_last = negatives_inds.index(inds[-1])
+            return result_dict, i_last
     """
     def __init__(
             self, folder,
