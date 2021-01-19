@@ -27,9 +27,14 @@ def flatten_nested_dict(d, parent_key='', sep='.'):
     return dict(items)
 
 
+class ConfigLoader(yaml.SafeLoader):
+    pass
+
+
 class Ydefault(yaml.YAMLObject):
     yaml_tag = '!def'
     argnames = ('default', 'values', 'typecheck', 'evalcheck')
+    yaml_loader = [ConfigLoader]
 
     def __init__(self,
             default=None,
@@ -75,6 +80,9 @@ class Ydefault(yaml.YAMLObject):
                 items.append(f'{arg}: {attr}')
         s = 'Ydef[{}]'.format(', '.join(items))
         return s
+
+
+# ConfigLoader.add_constructor('!def', Ydefault)
 
 
 def _flat_config_merge(merge_into, merge_from, prefix, allow_overwrite):
@@ -173,7 +181,7 @@ class YConfig(object):
             merge_from: str, prefix='', allow_overwrite=False):
         """ Set defaults from YAML string """
         assert isinstance(merge_from, str)
-        yaml_loaded = yaml.load(merge_from, yaml.Loader)
+        yaml_loaded = yaml.load(merge_from, ConfigLoader)
         if not yaml_loaded:
             return
         loaded_flat = flatten_nested_dict(yaml_loaded)
