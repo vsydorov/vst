@@ -5,7 +5,8 @@ from typing import (  # NOQA
 
 from thes.data.dataset.external import (
     Vid_daly, Dataset_daly_ocv,
-    get_daly_split_vids, split_off_validation_set)
+    get_daly_split_vids, split_off_validation_set,
+    Video_daly_ocv)
 
 from thes.data.tubes.types import (
     I_dwein, T_dwein, T_dwein_scored, I_dgt, T_dgt,
@@ -83,6 +84,22 @@ class Ncfg_daly:
         return vgroup
 
 
+def get_keyframe_ranges(v: Video_daly_ocv, include_diff: bool):
+    # general keyframe ranges of all instances
+    instance_ranges = []
+    for action_name, instances in v['instances'].items():
+        for ins_ind, instance in enumerate(instances):
+            fl = instance['flags']
+            diff = fl['isReflection'] or fl['isAmbiguous']
+            if not include_diff and diff:
+                continue
+            s, e = instance['start_frame'], instance['end_frame']
+            keyframes = [int(kf['frame'])
+                    for kf in instance['keyframes']]
+            instance_ranges.append((s, e, keyframes))
+    return instance_ranges
+
+
 def sample_daly_frames_from_instances(
         dataset: Dataset_daly_ocv,
         stride: int,
@@ -105,18 +122,7 @@ def sample_daly_frames_from_instances(
     frames_to_cover: Dict[Vid_daly, np.ndarray] = {}
     for vid in vids:
         v = dataset.videos_ocv[vid]
-        # general keyframe ranges of all instances
-        instance_ranges = []
-        for action_name, instances in v['instances'].items():
-            for ins_ind, instance in enumerate(instances):
-                fl = instance['flags']
-                diff = fl['isReflection'] or fl['isAmbiguous']
-                if not include_diff and diff:
-                    continue
-                s, e = instance['start_frame'], instance['end_frame']
-                keyframes = [int(kf['frame'])
-                        for kf in instance['keyframes']]
-                instance_ranges.append((s, e, keyframes))
+        instance_ranges = get_keyframe_ranges(v, include_diff)
         good = set()
         for s, e, keyframes in instance_ranges:
             if add_keyframes:
@@ -248,6 +254,7 @@ def prepare_label_fullframes_for_training(
         ) -> List[Frame_labeled]:
     # Frames which we consider for this experiment
     # (universal, present in every experiment)
+    import pudb; pudb.set_trace()  # XXX BREAKPOINT
     vids_good_nums: Dict[Vid_daly, np.ndarray] = \
             sample_daly_frames_from_instances(dataset, stride=stride)
     # Retrieve frames from GT tubes

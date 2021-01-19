@@ -182,52 +182,6 @@ def prepare_box(bbox_ltrd, resize_params, ccrop_params):
     return bbox_tldr
 
 
-class TDataset_over_box_connections_w_labels(torch.utils.data.Dataset):
-    cls_vf: Dict[Tuple[Vid_daly, int], Bc_dwti_labeled] = {}
-    keys_vf: List[Tuple[Vid_daly, int]]
-
-    def __init__(self, cls_vf, dataset,
-            sampler_grid, frameloader_vsf):
-        self.cls_vf = cls_vf
-        self.keys_vf = list(cls_vf.keys())
-        self.dataset = dataset
-        self.sampler_grid = sampler_grid
-        self.frameloader_vsf = frameloader_vsf
-
-    def __len__(self):
-        return len(self.cls_vf)
-
-    def __getitem__(self, index):
-        key_vf = self.keys_vf[index]
-        connections = self.cls_vf[key_vf]
-
-        vid = connections['vid']
-        i0 = connections['frame_ind']
-        bboxes_ltrd = connections['boxes']
-        labels = connections['labels']
-        assert key_vf == (vid, i0)
-
-        video_path = str(self.dataset.videos_ocv[vid]['path'])
-        nframes = self.dataset.videos_ocv[vid]['nframes']
-
-        finds_to_sample = self.sampler_grid.apply(i0, nframes)
-        frame_list, resize_params, ccrop_params = \
-            self.frameloader_vsf.prepare_frame_list(
-                    video_path, finds_to_sample)
-        prepared_bboxes = []
-        for box_ltrd in bboxes_ltrd:
-            prepared_bbox_tldr = self.frameloader_vsf.prepare_box(
-                box_ltrd, resize_params, ccrop_params)
-            prepared_bboxes.append(prepared_bbox_tldr)
-        meta = {
-            'labels': labels,
-            'index': index,
-            'ckey': key_vf,
-            'bboxes': np.stack(prepared_bboxes, axis=0),
-            'do_not_collate': True}
-        return (frame_list, meta)
-
-
 class Freezer(object):
     def __init__(self, model, freeze_level, bn_freeze):
         self.model = model
