@@ -214,6 +214,8 @@ class Isaver_threading(Isaver_base):
         flush_dict = {}
 
         def flush_purge():
+            if not len(flush_dict):
+                return
             self.result.update(flush_dict)
             flush_dict.clear()
             self._save(len(self.result))
@@ -284,6 +286,8 @@ class Isaver_dataloader(Isaver_base):
         result_cache = []
 
         def flush_purge():
+            if not len(result_cache):
+                return
             self.result.extend(result_cache)
             result_cache.clear()
             self._save(i_last)
