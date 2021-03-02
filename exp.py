@@ -16,6 +16,27 @@ def get_subfolders(folder, subfolder_names=['out', 'temp']):
     return [small.mkdir(folder/name) for name in subfolder_names]
 
 
+def set_dd(d, key, value, sep='.', soft=False):
+    """Dynamic assignment to nested dictionary
+    http://stackoverflow.com/questions/21297475/set-a-value-deep-in-a-dict-dynamically"""
+    dd = d
+    keys = key.split(sep)
+    latest = keys.pop()
+    for k in keys:
+        dd = dd.setdefault(k, {})
+    if soft:
+        dd.setdefault(latest, value)
+    else:
+        dd[latest] = value
+
+
+def unflatten_nested_dict(flat_dict, sep='.'):
+    nested = {}
+    for k, v in flat_dict.items():
+        set_dd(nested, k, v, sep)
+    return nested
+
+
 def flatten_nested_dict(d, parent_key='', sep='.'):
     items = []
     for k, v in d.items():
@@ -221,10 +242,12 @@ class YConfig(object):
         self._check_types(self.cf, self.ydefaults)
         return self.cf
 
-    def without_prefix(self, prefix):
+    def without_prefix(self, prefix, flat=True):
         new_cf = {}
         for k, v in self.cf.items():
             if k.startswith(prefix):
                 new_k = k[len(prefix):]
                 new_cf[new_k] = v
+        if not flat:
+            new_cf = unflatten_nested_dict(new_cf)
         return new_cf
