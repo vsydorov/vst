@@ -56,7 +56,7 @@ def load_json(filepath):
 
 def save_pkl(filepath, obj):
     with Path(filepath).open('wb') as f:
-        pickle.dump(obj, f, pickle.HIGHEST_PROTOCOL)
+        pickle.dump(obj, f)
 
 
 def load_pkl(filepath):
