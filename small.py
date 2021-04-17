@@ -244,7 +244,7 @@ def df_to_table(df: pd.DataFrame, indexcols=None) -> str:
         col_formats.append(form)
 
     table = string_table(
-                    np.array(df.reset_index()),
+                    np.array(df.reset_index()),  # type: ignore
                     header=header,
                     col_formats=col_formats,
                     pad=2)
@@ -508,3 +508,8 @@ def get_experiment_id_string():
         string.ascii_uppercase, k=3))
     str_node = platform.node()
     return f'{str_time}_{str_rnd}_{str_node}'
+
+
+def leqn_split(arr, N):
+    """Divide 1d np array into batches of len <= N"""
+    return np.array_split(arr, (len(arr)-1)//N + 1)
