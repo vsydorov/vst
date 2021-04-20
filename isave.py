@@ -110,7 +110,7 @@ class Isaver_base(Isaver_base0):
         super().__init__(folder, total)
 
     def _get_filenames(self, i) -> Dict[str, Path]:
-        filenames = self._get_filenames(i)
+        filenames = super()._get_filenames(i)
         filenames['pkl'] = filenames['finished'].with_suffix('.pkl')
         return filenames
 
