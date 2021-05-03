@@ -216,15 +216,6 @@ class Isaver_threading(Isaver_base):
         all_ii = set(range(len(self.arg_list)))
         remaining_ii = all_ii - set(self.result.keys())
 
-        io_executor = concurrent.futures.ThreadPoolExecutor(
-                max_workers=self._max_workers)
-        io_futures = []
-        for i in remaining_ii:
-            args = self.arg_list[i]
-            submitted = io_executor.submit(self.func, *args)
-            submitted.i = i
-            io_futures.append(submitted)
-
         flush_dict = {}
 
         def flush_purge():
@@ -235,17 +226,39 @@ class Isaver_threading(Isaver_base):
             self._save(len(self.result))
             self._purge_intermediate_files()
 
-        pbar = concurrent.futures.as_completed(io_futures)
-        if self._progress:
-            pbar = tqdm(pbar, self._progress, total=len(io_futures))
-        for io_future in pbar:
-            result = io_future.result(timeout=self._timeout)
-            i = io_future.i
-            flush_dict[i] = result
-            # A bit dirty, but should still work
-            if countra.check() or len(flush_dict) >= self._save_iters:
-                flush_purge()
-                countra.tic()
+        if self._max_workers == 0:
+            # Run with zero threads, for debugging purposes
+            pbar = remaining_ii
+            if self._progress:
+                pbar = tqdm(pbar, self._progress)
+            for i in pbar:
+                result = self.func(*self.arg_list[i])
+                flush_dict[i] = result
+                if countra.check() or len(flush_dict) >= self._save_iters:
+                    flush_purge()
+                    countra.tic()
+        else:
+            # Proper threading run
+            io_executor = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=self._max_workers)
+            io_futures = []
+            for i in remaining_ii:
+                args = self.arg_list[i]
+                submitted = io_executor.submit(self.func, *args)
+                submitted.i = i
+                io_futures.append(submitted)
+            pbar = concurrent.futures.as_completed(io_futures)
+            if self._progress:
+                pbar = tqdm(pbar, self._progress, total=len(io_futures))
+            for io_future in pbar:
+                result = io_future.result(timeout=self._timeout)
+                i = io_future.i
+                flush_dict[i] = result
+                # A bit dirty, but should still work
+                if countra.check() or len(flush_dict) >= self._save_iters:
+                    flush_purge()
+                    countra.tic()
+
         flush_purge()
         assert len(self.result) == len(self.arg_list)
         result_list = [self.result[i] for i in all_ii]
