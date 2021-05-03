@@ -46,7 +46,7 @@ class Counter_repeated_action(object):
         return ACTION
 
 
-class Isaver_base(ABC):
+class Isaver_base0(ABC):
     def __init__(self, folder, total):
         self._re_finished = (
             r'item_(?P<i>\d+)_of_(?P<N>\d+).finished')
@@ -57,14 +57,14 @@ class Isaver_base(ABC):
         self._total = total
         if self._folder is None:
             log.debug('Isaver without folder, no saving will be performed')
+        else:
+            self._folder = vst.mkdir(self._folder)
 
     def _get_filenames(self, i) -> Dict[str, Path]:
         if self._folder is None:
             raise RuntimeError('Filenames are undefined without folder')
-        base_filenames = {
-            'finished': self._fmt_finished.format(i, self._total)}
-        base_filenames['pkl'] = Path(base_filenames['finished']).with_suffix('.pkl')
-        filenames = {k: self._folder/v for k, v in base_filenames.items()}
+        filenames = {'finished':
+                self._folder/self._fmt_finished.format(i, self._total)}
         return filenames
 
     def _get_intermediate_files(self) -> Dict[int, Dict[str, Path]]:
@@ -102,6 +102,18 @@ class Isaver_base(ABC):
         log.debug('Purged {} states, {} files'.format(
             len(inds_to_purge), files_purged))
 
+
+class Isaver_base(Isaver_base0):
+    result: Any
+
+    def __init__(self, folder, total):
+        super().__init__(folder, total)
+
+    def _get_filenames(self, i) -> Dict[str, Path]:
+        filenames = super()._get_filenames(i)
+        filenames['pkl'] = filenames['finished'].with_suffix('.pkl')
+        return filenames
+
     def _restore(self):
         intermediate_files: Dict[int, Dict[str, Path]] = \
                 self._get_intermediate_files()
@@ -110,7 +122,7 @@ class Isaver_base(ABC):
         if ifiles is not None:
             restore_from = ifiles['pkl']
             self.result = vst.load_pkl(restore_from)
-            log.info('Restore from {}'.format(restore_from))
+            log.debug('Restore from {}'.format(restore_from))
         return start_i
 
     def _save(self, i):
