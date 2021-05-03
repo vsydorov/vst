@@ -182,7 +182,8 @@ class Isaver_threading(Isaver_base):
             save_iters=np.inf,
             save_interval=120,
             max_workers=None,
-            progress: Optional[str] = None
+            progress: Optional[str] = None,
+            timeout: Optional[int] = None
             ):
         arg_list = list(arg_list)
         super().__init__(folder, len(arg_list))
@@ -192,6 +193,7 @@ class Isaver_threading(Isaver_base):
         self._save_interval = save_interval
         self._max_workers = max_workers
         self._progress = progress
+        self._timeout = timeout
         self.result = {}
 
     def run(self):
@@ -225,7 +227,7 @@ class Isaver_threading(Isaver_base):
         if self._progress:
             pbar = tqdm(pbar, self._progress, total=len(io_futures))
         for io_future in pbar:
-            result = io_future.result()
+            result = io_future.result(timeout=self._timeout)
             i = io_future.i
             flush_dict[i] = result
             # A bit dirty, but should still work
