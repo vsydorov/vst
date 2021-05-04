@@ -1,15 +1,37 @@
+#!/usr/bin/env python3
+"""
+Run dervo experiments without using the whole experimental system
+
+Usage:
+    run_experiment.py --configs <configs_csv> [options]
+
+Options:
+    --output_folder <str>     Where outputs will be stored.
+                                If not set - same folder as last config_csv
+    --experiment_name <str>   Name of experiment.
+                                If not set - will pick up "dervo.yml" from the
+                                folder of last config_csv
+    --experiment_prefix <str>
+"""
+import re
+import pprint
+import itertools
+import importlib
 import collections
 import yaml
 import logging
 import copy
 import numpy as np
+from pathlib import Path
 from typing import (  # NOQA
             Optional, Iterable, List, Dict,
             Any, Union, Callable, TypeVar)
 
-log = logging.getLogger(__name__)
+from docopt import docopt
 
 from vst import small
+
+log = logging.getLogger(__name__)
 
 
 def get_subfolders(folder, subfolder_names=['out', 'temp']):
@@ -29,6 +51,16 @@ def set_dd(d, key, value, sep='.', soft=False):
     else:
         dd[latest] = value
 
+
+def gir_merge_dicts(user, default):
+    """Girschik's dict merge from F-RCNN python implementation"""
+    if isinstance(user, dict) and isinstance(default, dict):
+        for k, v in default.items():
+            if k not in user:
+                user[k] = v
+            else:
+                user[k] = gir_merge_dicts(user[k], v)
+    return user
 
 def unflatten_nested_dict(flat_dict, sep='.'):
     nested = {}
@@ -251,3 +283,131 @@ class YConfig(object):
         if not flat:
             new_cf = unflatten_nested_dict(new_cf)
         return new_cf
+
+
+# Launching dervo scripts without dervo
+
+
+def expand_relative_path(config_path, value):
+    """
+    Two kinds of relative paths supported py@anygrab and py@str
+
+    Relative paths have these ugly formats from dervo
+        - anygrab:  "py@anygrab(epath/'RPATH', 'SUBPATH'"
+        - str: "py@str(epath/'RPATH')"
+
+    Examples:
+      - py@anygrab(epath/'../110_retrieve_moncler', 'out/imlogo_list.pkl')
+    """
+    epath = config_path.parent
+    if value.startswith('py@anygrab'):
+        # This anygrab overload has two inputs
+        match = re.match(r"py@anygrab\(epath/'(.*?)', *'(.*?)'", value)
+        if not match:
+            match = re.match(r'py@anygrab\(epath/"(.*?)", *"(.*?)"', value)
+        if match:
+            rpath, subpath = match.groups()
+            abspath = str((epath/rpath/subpath).resolve())
+            return abspath
+        # This anygrab overload has one input
+        match = re.match(r"py@anygrab\(epath/'(.*?)'", value)
+        if not match:
+            match = re.match(r'py@anygrab\(epath/"(.*?)"', value)
+        if match:
+            rpath = match.group(1)
+            abspath = str((epath/rpath).resolve())
+            return abspath
+        else:
+            raise RuntimeError('Wrong format for anygrab')
+
+    elif value.startswith('py@str'):
+        match = re.match(r"py@str\(epath/'(.*)'\)", value)
+        rpath = match.group(1)
+        abspath = str((epath/rpath).resolve())
+    else:
+        raise RuntimeError('Wrong format for relative path')
+    return abspath
+
+
+def dervo_run(args):
+    # / Read arguments
+    configs_csv = args['<configs_csv>']
+    # // Read configs csv, if folder - assumg cfg.yml is inside
+    config_paths = []
+    for config_path in configs_csv.split(','):
+        config_path = Path(config_path)
+        if config_path.is_dir():
+            config_path = config_path/'cfg.yml'
+        config_paths.append(config_path)
+    log.info('Following configs will be loaded: {}'.format(
+        pprint.pformat(config_paths)))
+    last_config_folder = Path(config_paths[-1]).parent
+
+    # // If output folder not set - assume folder of last config
+    output_folder = args.get('--output_folder')
+    if output_folder is None:
+        output_folder = last_config_folder
+    log.info(f'Following output folder: {output_folder}')
+
+    # // If experiment name not set - search for dervo.yml in parents
+    experiment_prefix = args['--experiment_prefix']
+    experiment_name = args.get('--experiment_name')
+    if experiment_name is None:
+        dervo_yml_path = None
+        for path in itertools.chain(
+                [last_config_folder], last_config_folder.parents):
+            files = [x.name for x in path.iterdir()]
+            if ('dervo.yml' in files):
+                dervo_yml_path = path/'dervo.yml'
+                break
+        if dervo_yml_path is None:
+            raise RuntimeError('Could not find dervo.yml')
+        else:
+            log.info(f'Found {dervo_yml_path}')
+        with dervo_yml_path.open('r') as f:
+            cfg = yaml.safe_load(f)
+        experiment_name = cfg['run']
+    log.info(f'Experiment_prefix: {experiment_prefix}')
+    log.info(f'Experiment_name: {experiment_name}')
+
+    global EXPERIMENT_PATH
+    EXPERIMENT_PATH = last_config_folder
+
+    # Setup additional logging
+    logfolder = small.mkdir(output_folder/'log')
+    id_string = small.get_experiment_id_string()
+    small.add_filehandler(
+            logfolder/f'{id_string}.DEBUG.log', logging.DEBUG, 'extended')
+    small.add_filehandler(
+            logfolder/f'{id_string}.INFO.log', logging.INFO, 'short')
+
+    # Load YML configs, merge into a single config
+    subconfigs = []
+    for config_path in config_paths:
+        with Path(config_path).open('r') as f:
+            subconfig = yaml.safe_load(f)
+        # If we encounter "relative" paths - expand them
+        flat_subconfig = flatten_nested_dict(subconfig)
+        for k, v in copy.copy(flat_subconfig).items():
+            if isinstance(v, str) and v.lower().startswith('py@'):
+                flat_subconfig[k] = expand_relative_path(config_path, v)
+        subconfig = unflatten_nested_dict(flat_subconfig)
+        subconfigs.append(subconfig)
+    config = {}
+    for subconfig in subconfigs:
+        config = gir_merge_dicts(subconfig, config)
+
+    # Retrieve the experiment routine, execute
+    experiment_str = f'{experiment_prefix}.{experiment_name}'
+    x = experiment_str.split('.')
+    module_str = '.'.join(x[:-1])
+    routine_str = x[-1]
+
+    module = importlib.import_module(module_str)
+    routine = getattr(module, routine_str)
+
+    routine(output_folder, config, [])
+
+if __name__ == '__main__':
+    log = small.reasonable_logging_setup(logging.INFO)
+    dervo_run(docopt(__doc__))
