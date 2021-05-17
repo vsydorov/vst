@@ -1,18 +1,4 @@
 #!/usr/bin/env python3
-"""
-Run dervo experiments without using the whole experimental system
-
-Usage:
-    run_experiment.py --configs <configs_csv> [options]
-
-Options:
-    --output_folder <str>     Where outputs will be stored.
-                                If not set - same folder as last config_csv
-    --experiment_name <str>   Name of experiment.
-                                If not set - will pick up "dervo.yml" from the
-                                folder of last config_csv
-    --experiment_prefix <str>
-"""
 import re
 import pprint
 import itertools
@@ -329,6 +315,22 @@ def expand_relative_path(config_path, value):
     return abspath
 
 
+DERVO_DOC = """
+Run dervo experiments without using the whole experimental system
+
+Usage:
+    run_experiment.py --configs <configs_csv> [options]
+
+Options:
+    --output_folder <str>     Where outputs will be stored.
+                                If not set - same folder as last config_csv
+    --experiment_name <str>   Name of experiment.
+                                If not set - will pick up "dervo.yml" from the
+                                folder of last config_csv
+    --experiment_prefix <str>
+"""
+
+
 def dervo_run(args):
     # / Read arguments
     configs_csv = args['<configs_csv>']
@@ -408,6 +410,7 @@ def dervo_run(args):
 
     routine(output_folder, config, [])
 
+
 if __name__ == '__main__':
     log = small.reasonable_logging_setup(logging.INFO)
-    dervo_run(docopt(__doc__))
+    dervo_run(docopt(DERVO_DOC))
