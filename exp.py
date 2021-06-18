@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-import re
-import pprint
-import itertools
+"""
+These functions supplement and extend Dervo basic functionality
+At the same time Dervo is not required to make use of them
+"""
+import sys
 import importlib
 import collections
 import yaml
@@ -15,13 +17,13 @@ from typing import (  # NOQA
 
 from docopt import docopt
 
-from vst import small
+import vst
 
 log = logging.getLogger(__name__)
 
 
 def get_subfolders(folder, subfolder_names=['out', 'temp']):
-    return [small.mkdir(folder/name) for name in subfolder_names]
+    return [vst.mkdir(folder/name) for name in subfolder_names]
 
 
 def set_dd(d, key, value, sep='.', soft=False):
@@ -187,7 +189,7 @@ def _config_assign_defaults(cf, cf_defaults,
                 .format(none_keys))
 
     if len(DEFAULTS_ASSIGNED):
-        DEFAULTS_TABLE = small.string_table(DEFAULTS_ASSIGNED,
+        DEFAULTS_TABLE = vst.string_table(DEFAULTS_ASSIGNED,
                 header=['KEY', 'OLD', 'NEW'])
         DEFAULTS_ASSIGNED_STR = 'We assigned some defaults:\n{}'.format(
                 DEFAULTS_TABLE)
@@ -271,146 +273,123 @@ class YConfig(object):
         return new_cf
 
 
-# Launching dervo scripts without dervo
+class UniqueKeyLoader(yaml.SafeLoader):
+    # https://gist.github.com/pypt/94d747fe5180851196eb#gistcomment-3401011
+    def construct_mapping(self, node, deep=False):
+        mapping = []
+        for key_node, value_node in node.value:
+            key = self.construct_object(key_node, deep=deep)
+            assert key not in mapping, f'Duplicate key ("{key}") in YAML'
+            mapping.append(key)
+        return super().construct_mapping(node, deep)
 
 
-def expand_relative_path(config_path, value):
-    """
-    Two kinds of relative paths supported py@anygrab and py@str
+def yml_load(f):
+    # We disallow duplicate keys
+    cfg = yaml.load(f, UniqueKeyLoader)
+    cfg = {} if cfg is None else cfg
+    return cfg
 
-    Relative paths have these ugly formats from dervo
-        - anygrab:  "py@anygrab(epath/'RPATH', 'SUBPATH'"
-        - str: "py@str(epath/'RPATH')"
 
-    Examples:
-      - py@anygrab(epath/'../110_retrieve_moncler', 'out/imlogo_list.pkl')
-    """
-    epath = config_path.parent
-    if value.startswith('py@anygrab'):
-        # This anygrab overload has two inputs
-        match = re.match(r"py@anygrab\(epath/'(.*?)', *'(.*?)'", value)
-        if not match:
-            match = re.match(r'py@anygrab\(epath/"(.*?)", *"(.*?)"', value)
-        if match:
-            rpath, subpath = match.groups()
-            abspath = str((epath/rpath/subpath).resolve())
-            return abspath
-        # This anygrab overload has one input
-        match = re.match(r"py@anygrab\(epath/'(.*?)'", value)
-        if not match:
-            match = re.match(r'py@anygrab\(epath/"(.*?)"', value)
-        if match:
-            rpath = match.group(1)
-            abspath = str((epath/rpath).resolve())
-            return abspath
-        else:
-            raise RuntimeError('Wrong format for anygrab')
+def yml_from_file(filepath: Path):
+    try:
+        with filepath.open('r') as f:
+            return yml_load(f)
+    except Exception as e:
+        log.info(f'Could not load yml at {filepath}')
+        raise e
 
-    elif value.startswith('py@str'):
-        match = re.match(r"py@str\(epath/'(.*)'\)", value)
-        rpath = match.group(1)
-        abspath = str((epath/rpath).resolve())
-    else:
-        raise RuntimeError('Wrong format for relative path')
-    return abspath
+
+# Launching dervo scripts
+
+
+def resolve_clean_exp_path(path_: str) -> Path:
+    path = Path(path_)
+    assert path.exists(), f'Path must exists: {path}'
+    if path.is_file():
+        log.warning('File instead of dir was provided, using its parent instead')
+        path = path.parent
+    path = path.resolve()
+    return path
+
+
+def add_logging_filehandlers(workfolder):
+    # Create two output files in /_log subfolder, start loggign
+    assert isinstance(logging.getLogger().handlers[0],
+            logging.StreamHandler), 'First handler should be StreamHandler'
+    logfolder = vst.mkdir(workfolder/'_log')
+    id_string = vst.get_experiment_id_string()
+    logfilename_debug = vst.add_filehandler(
+            logfolder/f'{id_string}.DEBUG.log', logging.DEBUG, 'extended')
+    logfilename_info = vst.add_filehandler(
+            logfolder/f'{id_string}.INFO.log', logging.INFO, 'short')
+    return logfilename_debug, logfilename_info
+
+
+def extend_path_reload_modules(actual_code_root):
+    # Extend pythonpath to allow importing certain modules
+    sys.path.insert(0, str(actual_code_root))
+    # Unload caches, to allow local version (if present) to take over
+    importlib.invalidate_caches()
+    # Reload vst and then submoduless (avoid issues with __init__ imports)
+    # https://stackoverflow.com/questions/35640590/how-do-i-reload-a-python-submodule/51074507#51074507
+    importlib.reload(vst)
+    for k, v in list(sys.modules.items()):
+        if k.startswith('vst'):
+            log.debug(f'Reload {k} {v}')
+            importlib.reload(v)
+
+
+def import_routine(run_string):
+    module_str, experiment_str = run_string.split(':')
+    module = importlib.import_module(module_str)
+    experiment_routine = getattr(module, experiment_str)
+    return experiment_routine
+
+
+def remove_loghandler_to_handle_error(err):
+    # Remove first handler(StreamHandler to stderr) to avoid double clutter
+    our_logger = logging.getLogger()
+    assert len(our_logger.handlers), \
+            'Logger handlers are empty for some reason'
+    if isinstance(our_logger.handlers[0], logging.StreamHandler):
+        our_logger.removeHandler(our_logger.handlers[0])
+    log.exception("Fatal error in experiment routine")
+    raise err
 
 
 DERVO_DOC = """
 Run dervo experiments without using the whole experimental system
 
 Usage:
-    run_experiment.py --configs <configs_csv> [options]
-
-Options:
-    --output_folder <str>     Where outputs will be stored.
-                                If not set - same folder as last config_csv
-    --experiment_name <str>   Name of experiment.
-                                If not set - will pick up "dervo.yml" from the
-                                folder of last config_csv
-    --experiment_prefix <str>
+    exp.py folder <path> [--] [<add_args> ...]
 """
 
 
 def dervo_run(args):
-    # / Read arguments
-    configs_csv = args['<configs_csv>']
-    # // Read configs csv, if folder - assumg cfg.yml is inside
-    config_paths = []
-    for config_path in configs_csv.split(','):
-        config_path = Path(config_path)
-        if config_path.is_dir():
-            config_path = config_path/'cfg.yml'
-        config_paths.append(config_path)
-    log.info('Following configs will be loaded: {}'.format(
-        pprint.pformat(config_paths)))
-    last_config_folder = Path(config_paths[-1]).parent
+    if args['folder']:
+        # Automatically pick up experiment from dervo output folder
+        workfolder = resolve_clean_exp_path(args['<path>'])
+        # Read _final_cfg.yml that defines the experimental configuration
+        ycfg = yml_from_file(workfolder/'_final_cfg.yml')
+        # Cannibalize some values from _experiment meta
+        actual_code_root = ycfg['_experiment']['code_root']
+        run_string = ycfg['_experiment']['run']
 
-    # // If output folder not set - assume folder of last config
-    output_folder = args.get('--output_folder')
-    if output_folder is None:
-        output_folder = last_config_folder
-    log.info(f'Following output folder: {output_folder}')
+    # Create logfilehandlers
+    add_logging_filehandlers(workfolder)
 
-    # // If experiment name not set - search for dervo.yml in parents
-    experiment_prefix = args['--experiment_prefix']
-    experiment_name = args.get('--experiment_name')
-    if experiment_name is None:
-        dervo_yml_path = None
-        for path in itertools.chain(
-                [last_config_folder], last_config_folder.parents):
-            files = [x.name for x in path.iterdir()]
-            if ('dervo.yml' in files):
-                dervo_yml_path = path/'dervo.yml'
-                break
-        if dervo_yml_path is None:
-            raise RuntimeError('Could not find dervo.yml')
-        else:
-            log.info(f'Found {dervo_yml_path}')
-        with dervo_yml_path.open('r') as f:
-            cfg = yaml.safe_load(f)
-        experiment_name = cfg['run']
-    log.info(f'Experiment_prefix: {experiment_prefix}')
-    log.info(f'Experiment_name: {experiment_name}')
-
-    global EXPERIMENT_PATH
-    EXPERIMENT_PATH = last_config_folder
-
-    # Setup additional logging
-    logfolder = small.mkdir(output_folder/'log')
-    id_string = small.get_experiment_id_string()
-    small.add_filehandler(
-            logfolder/f'{id_string}.DEBUG.log', logging.DEBUG, 'extended')
-    small.add_filehandler(
-            logfolder/f'{id_string}.INFO.log', logging.INFO, 'short')
-
-    # Load YML configs, merge into a single config
-    subconfigs = []
-    for config_path in config_paths:
-        with Path(config_path).open('r') as f:
-            subconfig = yaml.safe_load(f)
-        # If we encounter "relative" paths - expand them
-        flat_subconfig = flatten_nested_dict(subconfig)
-        for k, v in copy.copy(flat_subconfig).items():
-            if isinstance(v, str) and v.lower().startswith('py@'):
-                flat_subconfig[k] = expand_relative_path(config_path, v)
-        subconfig = unflatten_nested_dict(flat_subconfig)
-        subconfigs.append(subconfig)
-    config = {}
-    for subconfig in subconfigs:
-        config = gir_merge_dicts(subconfig, config)
-
-    # Retrieve the experiment routine, execute
-    experiment_str = f'{experiment_prefix}.{experiment_name}'
-    x = experiment_str.split('.')
-    module_str = '.'.join(x[:-1])
-    routine_str = x[-1]
-
-    module = importlib.import_module(module_str)
-    routine = getattr(module, routine_str)
-
-    routine(output_folder, config, [])
+    # Deal with imports
+    extend_path_reload_modules(actual_code_root)
+    experiment_routine = import_routine(run_string)
+    del ycfg['_experiment']  # Strip '_experiment meta' from ycfg
+    try:
+        experiment_routine(workfolder, ycfg, args['<add_args>'])
+    except Exception as err:
+        remove_loghandler_to_handle_error(err)
+    log.info('- } Execute experiment routine')
 
 
 if __name__ == '__main__':
-    log = small.reasonable_logging_setup(logging.INFO)
+    log = vst.reasonable_logging_setup(logging.INFO)
     dervo_run(docopt(DERVO_DOC))

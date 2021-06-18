@@ -1,6 +1,7 @@
 """
 Module with small snippets
 """
+import subprocess
 import json
 import re
 import io
@@ -8,19 +9,19 @@ import sys
 import itertools
 import logging
 import pickle
-import numpy as np
 import string
 import random
 import platform
-import pandas as pd
 from contextlib import contextmanager
 from datetime import datetime
-
 from pathlib import Path
 from timeit import default_timer as timer
 from typing import (  # NOQA
             Optional, Iterable, List, Dict,
             Any, Union, Callable, TypeVar)
+
+import numpy as np
+import pandas as pd
 
 log = logging.getLogger(__name__)
 
@@ -417,6 +418,37 @@ def additional_logging(rundir):
     out_filehandler.setFormatter(LOG_FORMATTER)
     out_filehandler.setLevel(logging.INFO)
     logging.getLogger().addHandler(out_filehandler)
+
+
+def loglevel_str_to_int(loglevel: str) -> int:
+    assert isinstance(loglevel, str)
+    return logging._checkLevel(loglevel)  # type: ignore
+
+
+def loglevel_int_to_str(loglevel: int) -> str:
+    assert isinstance(loglevel, int)
+    return logging.getLevelName(loglevel)
+
+
+def docopt_loglevel(loglevel) -> int:
+    """Tries to get int value softly.
+    For parsing docopt argument
+    """
+    try:
+        loglevel_int = int(loglevel)
+    except ValueError:
+        loglevel_int = loglevel_str_to_int(loglevel)
+    return loglevel_int
+
+
+def platform_info():
+    platform_string = f'Node: {platform.node()}'
+    oar_jid = subprocess.run('echo $OAR_JOB_ID', shell=True,
+            stdout=subprocess.PIPE).stdout.decode().strip()
+    platform_string += ' OAR_JOB_ID: {}'.format(
+            oar_jid if len(oar_jid) else 'None')
+    platform_string += f' System: {platform.system()} {platform.version()}'
+    return platform_string
 
 
 """
