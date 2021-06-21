@@ -544,3 +544,9 @@ def get_experiment_id_string():
 def leqn_split(arr, N):
     """Divide 1d np array into batches of len <= N"""
     return np.array_split(arr, (len(arr)-1)//N + 1)
+
+def npath(path) -> Optional[Path]:
+    # Path constructor that allows None values
+    if path is not None:
+        path = Path(path)
+    return path

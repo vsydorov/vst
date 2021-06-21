@@ -292,6 +292,7 @@ def yml_load(f):
 
 
 def yml_from_file(filepath: Path):
+    filepath = Path(filepath)
     try:
         with filepath.open('r') as f:
             return yml_load(f)
@@ -327,8 +328,9 @@ def add_logging_filehandlers(workfolder):
 
 
 def extend_path_reload_modules(actual_code_root):
-    # Extend pythonpath to allow importing certain modules
-    sys.path.insert(0, str(actual_code_root))
+    if actual_code_root is not None:
+        # Extend pythonpath to allow importing certain modules
+        sys.path.insert(0, str(actual_code_root))
     # Unload caches, to allow local version (if present) to take over
     importlib.invalidate_caches()
     # Reload vst and then submoduless (avoid issues with __init__ imports)
@@ -347,7 +349,7 @@ def import_routine(run_string):
     return experiment_routine
 
 
-def remove_loghandler_to_handle_error(err):
+def remove_first_loghandler_before_handling_error(err):
     # Remove first handler(StreamHandler to stderr) to avoid double clutter
     our_logger = logging.getLogger()
     assert len(our_logger.handlers), \
@@ -362,31 +364,60 @@ DERVO_DOC = """
 Run dervo experiments without using the whole experimental system
 
 Usage:
-    exp.py folder <path> [--] [<add_args> ...]
+    exp.py folder <folder_path> [--nolog] [--] [<add_args> ...]
+    exp.py manual --run <str> --cfg <path> [--workfolder <path>] [--code_root <path>] [--nolog] [--] [<add_args> ...]
+
+Options:
+    --nolog     Do not log to "workfolder/_log"
+
+    Manual mode:
+        --run <str>             Format: module.submodule:function
+        --cfg <path>            .yml file containing experimental config
+        --workfolder <path>     Workfolder for the experiment.
+            Defaults to config folder if not set.
+        --code_root <path>      Optional code root to append to the PYTHONPATH
+
 """
 
 
 def dervo_run(args):
+    # / Figure experimental configuration
     if args['folder']:
-        # Automatically pick up experiment from dervo output folder
-        workfolder = resolve_clean_exp_path(args['<path>'])
+        # // Automatically pick up experiment from dervo output folder
+        workfolder = resolve_clean_exp_path(args['<folder_path>'])
         # Read _final_cfg.yml that defines the experimental configuration
         ycfg = yml_from_file(workfolder/'_final_cfg.yml')
         # Cannibalize some values from _experiment meta
         actual_code_root = ycfg['_experiment']['code_root']
         run_string = ycfg['_experiment']['run']
+    elif args['manual']:
+        run_string = args['--run']
+        cfg_path = Path(args['--cfg'])
+        ycfg = yml_from_file(cfg_path)
+        workfolder = vst.npath(args['--workfolder'])
+        if workfolder is None:
+            workfolder = cfg_path.parent
+        actual_code_root = vst.npath(args['--code_root'])
+    else:
+        raise NotImplementedError()
 
-    # Create logfilehandlers
-    add_logging_filehandlers(workfolder)
+    # Strip '_experiment meta' from ycfg if present
+    if '_experiment' in ycfg:
+        del ycfg['_experiment']
+
+    if not args['--nolog']:
+        # Create logfilehandlers
+        add_logging_filehandlers(workfolder)
 
     # Deal with imports
     extend_path_reload_modules(actual_code_root)
     experiment_routine = import_routine(run_string)
-    del ycfg['_experiment']  # Strip '_experiment meta' from ycfg
     try:
         experiment_routine(workfolder, ycfg, args['<add_args>'])
     except Exception as err:
-        remove_loghandler_to_handle_error(err)
+        if not args['--nolog']:
+            remove_first_loghandler_before_handling_error(err)
+        log.exception("Fatal error in experiment routine")
     log.info('- } Execute experiment routine')
 
 
