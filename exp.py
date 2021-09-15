@@ -50,10 +50,10 @@ def gir_merge_dicts(user, default):
                 user[k] = gir_merge_dicts(user[k], v)
     return user
 
-def unflatten_nested_dict(flat_dict, sep='.'):
+def unflatten_nested_dict(flat_dict, sep='.', soft=False):
     nested = {}
     for k, v in flat_dict.items():
-        set_dd(nested, k, v, sep)
+        set_dd(nested, k, v, sep, soft)
     return nested
 
 
@@ -269,7 +269,7 @@ class YConfig(object):
                 new_k = k[len(prefix):]
                 new_cf[new_k] = v
         if not flat:
-            new_cf = unflatten_nested_dict(new_cf)
+            new_cf = unflatten_nested_dict(new_cf, soft=True)
         return new_cf
 
 
