@@ -3,6 +3,7 @@ Module with small snippets
 """
 import subprocess
 import json
+import yaml
 import re
 import io
 import sys
@@ -63,6 +64,17 @@ def save_pkl(filepath, obj):
 def load_pkl(filepath):
     with Path(filepath).resolve().open('rb') as f:
         obj = pickle.load(f)
+    return obj
+
+
+def save_yaml(filepath, obj):
+    with Path(filepath).open('w') as f:
+        yaml.dump(obj, f)
+
+
+def load_yaml(filepath):
+    with Path(filepath).open('r') as f:
+        obj = yaml.safe_load(f)
     return obj
 
 
