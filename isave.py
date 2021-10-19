@@ -143,16 +143,23 @@ class Isaver_simple(Isaver_base):
     - save_perid: SSLICE spec
     - log_interval, save_inverval: in seconds
     """
-    def __init__(self, folder, arg_list, func,
+    def __init__(
+            self, folder,
+            arg_list: Iterable[Iterable[Any]],
+            func: Callable, *,
             save_period='::',
             save_interval=120,  # every 2 minutes by default
-            log_interval=None,):
+            progress: Optional[str] = None,
+            log_interval=None,  # Works only if progress is defined
+            ):
+        arg_list = list(arg_list)
         super().__init__(folder, len(arg_list))
         self.arg_list = arg_list
         self.result = []
         self.func = func
         self._save_period = save_period
         self._save_interval = save_interval
+        self._progress = progress
         self._log_interval = log_interval
 
     def run(self):
@@ -160,7 +167,9 @@ class Isaver_simple(Isaver_base):
         run_range = np.arange(start_i+1, self._total)
         self._time_last_save = time.perf_counter()
         self._time_last_log = time.perf_counter()
-        pbar = tqdm(run_range)
+        pbar = run_range
+        if self._progress:
+            pbar = tqdm(pbar, self._progress)
         for i in pbar:
             args = self.arg_list[i]
             self.result.append(self.func(*args))
@@ -175,7 +184,7 @@ class Isaver_simple(Isaver_base):
                 self._purge_intermediate_files()
                 self._time_last_save = time.perf_counter()
             # Log check
-            if self._log_interval:
+            if self._progres and self._log_interval:
                 since_last_log = time.perf_counter() - self._time_last_log
                 if since_last_log > self._log_interval:
                     log.info(vst.tqdm_str(pbar))
@@ -189,7 +198,7 @@ class Isaver_threading(Isaver_base):
     """
     def __init__(
             self, folder,
-            arg_list: List[List[Any]],
+            arg_list: Iterable[Iterable[Any]],
             func: Callable, *,
             save_iters=np.inf,
             save_interval=120,
@@ -227,7 +236,7 @@ class Isaver_threading(Isaver_base):
             self._purge_intermediate_files()
 
         if self._max_workers == 0:
-            # Run with zero threads, for debugging purposes
+            # Run with zero threads, easy to debug
             pbar = remaining_ii
             if self._progress:
                 pbar = tqdm(pbar, self._progress)
