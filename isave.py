@@ -184,7 +184,7 @@ class Isaver_simple(Isaver_base):
                 self._purge_intermediate_files()
                 self._time_last_save = time.perf_counter()
             # Log check
-            if self._progres and self._log_interval:
+            if self._progress and self._log_interval:
                 since_last_log = time.perf_counter() - self._time_last_log
                 if since_last_log > self._log_interval:
                     log.info(vst.tqdm_str(pbar))
