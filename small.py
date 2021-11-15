@@ -19,7 +19,7 @@ from pathlib import Path
 from timeit import default_timer as timer
 from typing import (  # NOQA
             Optional, Iterable, List, Dict,
-            Any, Union, Callable, TypeVar)
+            Any, Union, Callable, TypeVar, TypedDict, Tuple)
 
 import numpy as np
 import pandas as pd
@@ -464,6 +464,73 @@ def platform_info():
 
 
 """
+SSLICES (numpy-like strided slices) spec.
+
+Spec:
+- SSLICES:  + separated SSLICEs
+- SSLICE: '(inds)?:(ilimit)?:(period)?'
+  - inds: 'csv list' Enumeration of indices
+  - ilimit: '(MIN)?,(MAX)?'. Inclusive limit on period, "don't fire beyond"
+  - period: 'int' (fire at period intervals)
+
+Examples:
+    '' or '::' - empty.
+    '::5' - every 5 iters. (5, 10, 15...)
+    '0::5' - 0 and every 5 iters. (0, 5, 10, 15...)
+    '0:,20:5' - same, but stop at 20 inclusive. (0, 5, 10, 15, 20)
+    '0,1:10,:5' - 0, 1 and every 5 starting from 10 (0, 1, 10, 15, 20...)
+    ':,5:1+::25' - Union of ':,5:1' and '::25'. (0, 1, 2, 3, 4, 5, 25, 50, 75...)
+"""
+
+
+class SSLICE(TypedDict):
+    inds: List[int]
+    ilimit: Optional[Tuple[Optional[int], Optional[int]]]
+    period: Optional[int]
+
+
+def _parse_sslice_spec(sslice_str: str) -> SSLICE:
+    """ Parse SSLICE spec """
+    inds, ilimit, period = [], None, None  # type: ignore
+    if not len(sslice_str):
+        return SSLICE(inds=inds, ilimit=ilimit, period=period)
+    spec_re = r'^([\d,]*):((?:\d*,\d*)?):([\d]*)$'
+    match = re.fullmatch(spec_re, sslice_str)
+    if match is None:
+        raise ValueError(f'Invalid spec {sslice_str}')
+    _inds, _ilimit, _period = match.groups()
+    if _inds:
+        inds = list(map(int, _inds.split(',')))
+    if _ilimit:
+        ilimit = map(lambda x: int(x) if x else None, _ilimit.split(','))
+    if _period:
+        period = int(_period)
+    return SSLICE(inds=inds, ilimit=ilimit, period=period)  # type: ignore
+
+
+def _check_step_sslice(step: int, sslice_str: str) -> bool:
+    """ Check whether step matches SSLICE spec """
+    sslice = _parse_sslice_spec(sslice_str)
+    if step in sslice['inds']:
+        return True
+    if sslice['ilimit'] is not None:
+        ilmin, ilmax = sslice['ilimit']
+        if ilmin is not None and step < ilmin:
+            return False
+        if ilmax is not None and step > ilmax:
+            return False
+    if sslice['period'] is not None:
+        if step % sslice['period'] == 0:
+            return True
+    return False
+
+
+def check_step(step: int, sslices_str: str) -> bool:
+    """ Check whether step matches SSLICES spec """
+    return any((_check_step_sslice(step, s) for s in sslices_str.split('+')))
+
+
+"""
 Various simple snippets
 """
 
@@ -501,36 +568,6 @@ def add_pypath(path):
     path = str(path)  # To cover pathlib strings
     if path not in sys.path:
         sys.path.insert(0, path)
-
-
-def check_step(
-        step: int,
-        period_sslice: str) -> bool:
-    """
-    Check whether step matches SSLICE spec
-
-    SSLICE spec: '(more_runs):(run_limit):(period)'
-      - more_runs: (csv list of runs when we should fire)
-      - run_limit: [MIN],[MAX] (inclusive, don't fire beyond)
-      - period: (fire at period intervals)
-    """
-    spec_re = r'^([\d,]*):((?:\d*,\d*)?):([\d]*)$'
-    match = re.fullmatch(spec_re, period_sslice)
-    if match is None:
-        raise ValueError(f'Invalid spec {period_sslice}')
-    _more_runs, run_limit, _period = match.groups()
-
-    if len(run_limit):
-        lmin, lmax = run_limit.split(',')
-        if lmin and step < int(lmin):
-            return False
-        if lmax and step > int(lmax):
-            return False
-    if _more_runs and step in map(int, _more_runs.split(',')):
-        return True
-    if _period and step and (step % int(_period) == 0):
-        return True
-    return False
 
 
 def tqdm_str(pbar, ninc=0):
