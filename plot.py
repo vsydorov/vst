@@ -37,7 +37,9 @@ def cv_put_box_with_text(
 
         retval, baseline = cv2.getTextSize(
                 text, fontFace, text_size, text_thickness)
-        if text_position == 'left_down':
+        if text_position == 'left_below':
+            text_pos = (l, d+retval[1])
+        elif text_position == 'left_down':
             text_pos = (l, d-5)
         elif text_position == 'left_up':
             text_pos = (l, t-5)
