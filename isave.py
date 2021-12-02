@@ -138,16 +138,15 @@ class Isaver_base(Isaver_base0):
 
 class Isaver_simple(Isaver_base):
     """
-    Will process a list with a func
+    Execute *func* (in parallel) over *arg_list* arguments, with checkpoints
 
-    - save_perid: SSLICE spec
-    - log_interval, save_inverval: in seconds
+    - Legacy. Use Isaver_fast instead
     """
     def __init__(
             self, folder,
             arg_list: Iterable[Iterable[Any]],
             func: Callable, *,
-            save_period='::',
+            save_period='::',  # SSLICES
             save_interval=120,  # every 2 minutes by default
             progress: Optional[str] = None,
             log_interval=None,  # Works only if progress is defined
@@ -192,17 +191,18 @@ class Isaver_simple(Isaver_base):
         return self.result
 
 
-class Isaver_threading(Isaver_base):
+class Isaver_fast(Isaver_base):
     """
-    Will process a list with a func, in async manner
+    Execute *func* (in parallel) over *arg_list* arguments, with checkpoints
     """
     def __init__(
-            self, folder,
+            self, folder: Optional[Path],
             arg_list: Iterable[Iterable[Any]],
             func: Callable, *,
+            async_kind='thread',
+            num_workers=None,
             save_iters=np.inf,
             save_interval=120,
-            max_workers=None,
             progress: Optional[str] = None,
             timeout: Optional[int] = None
             ):
@@ -210,9 +210,10 @@ class Isaver_threading(Isaver_base):
         super().__init__(folder, len(arg_list))
         self.arg_list = arg_list
         self.func = func
+        self._async_kind = async_kind
         self._save_iters = save_iters
         self._save_interval = save_interval
-        self._max_workers = max_workers
+        self._num_workers = num_workers
         self._progress = progress
         self._timeout = timeout
         self.result = {}
@@ -235,7 +236,7 @@ class Isaver_threading(Isaver_base):
             self._save(len(self.result))
             self._purge_intermediate_files()
 
-        if self._max_workers == 0:
+        if self._num_workers == 0:
             # Run with zero threads, easy to debug
             pbar = remaining_ii
             if self._progress:
@@ -247,23 +248,28 @@ class Isaver_threading(Isaver_base):
                     flush_purge()
                     countra.tic()
         else:
-            # Proper threading run
-            io_executor = concurrent.futures.ThreadPoolExecutor(
-                    max_workers=self._max_workers)
+            # Run asynchronously
+            if self._async_kind == 'thread':
+                io_executor = concurrent.futures.ThreadPoolExecutor(
+                        max_workers=self._num_workers)
+            elif self._async_kind == 'process':
+                io_executor = concurrent.futures.ProcessPoolExecutor(
+                        max_workers=self._num_workers)
+            else:
+                raise RuntimeError(f'Unknown {self._async_kind=}')
             io_futures = []
             for i in remaining_ii:
                 args = self.arg_list[i]
                 submitted = io_executor.submit(self.func, *args)
-                submitted.i = i
+                submitted._i = i
                 io_futures.append(submitted)
             pbar = concurrent.futures.as_completed(io_futures)
             if self._progress:
                 pbar = tqdm(pbar, self._progress, total=len(io_futures))
             for io_future in pbar:
                 result = io_future.result(timeout=self._timeout)
-                i = io_future.i
+                i = io_future._i
                 flush_dict[i] = result
-                # A bit dirty, but should still work
                 if countra.check() or len(flush_dict) >= self._save_iters:
                     flush_purge()
                     countra.tic()
@@ -272,6 +278,21 @@ class Isaver_threading(Isaver_base):
         assert len(self.result) == len(self.arg_list)
         result_list = [self.result[i] for i in all_ii]
         return result_list
+
+
+class Isaver_threading(Isaver_fast):
+    """ Present for backwards compatability, soon to be deprecated"""
+    def __init__(
+            self, folder, arg_list, func, *,
+            max_workers=None, save_iters=np.inf,
+            save_interval=120, progress=None, timeout=None):
+        super().__init__(folder, arg_list, func,
+                async_kind='thread',
+                num_workers=max_workers,
+                save_iters=save_iters,
+                save_interval=save_interval,
+                progress=progress,
+                timeout=timeout)
 
 
 class Isaver_dataloader(Isaver_base):
