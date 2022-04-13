@@ -26,6 +26,17 @@ def get_subfolders(folder, subfolder_names=['out', 'temp']):
     return [vst.mkdir(folder/name) for name in subfolder_names]
 
 
+def gir_merge_dicts(user, default):
+    """Girschik's dict merge from F-RCNN python implementation"""
+    if isinstance(user, dict) and isinstance(default, dict):
+        for k, v in default.items():
+            if k not in user:
+                user[k] = v
+            else:
+                user[k] = gir_merge_dicts(user[k], v)
+    return user
+
+
 def set_dd(d, key, value, sep='.', soft=False):
     """Dynamic assignment to nested dictionary
     http://stackoverflow.com/questions/21297475/set-a-value-deep-in-a-dict-dynamically"""
@@ -40,15 +51,15 @@ def set_dd(d, key, value, sep='.', soft=False):
         dd[latest] = value
 
 
-def gir_merge_dicts(user, default):
-    """Girschik's dict merge from F-RCNN python implementation"""
-    if isinstance(user, dict) and isinstance(default, dict):
-        for k, v in default.items():
-            if k not in user:
-                user[k] = v
-            else:
-                user[k] = gir_merge_dicts(user[k], v)
-    return user
+def get_dd(d, key, sep='.'):
+    # Dynamic query from a nested dictonary
+    dd = d
+    keys = key.split(sep)
+    latest = keys.pop()
+    for k in keys:
+        dd = dd[k]
+    return dd[latest]
+
 
 def unflatten_nested_dict(flat_dict, sep='.', soft=False):
     nested = {}
@@ -63,6 +74,21 @@ def flatten_nested_dict(d, parent_key='', sep='.'):
         new_key = parent_key + sep + k if parent_key else k
         if isinstance(v, collections.abc.MutableMapping):
             items.extend(flatten_nested_dict(v, new_key, sep=sep).items())
+        else:
+            items.append((new_key, v))
+    return dict(items)
+
+
+def flatten_nested_dict_v2(d, parent_key='', sep='.', keys_to_ignore=[]):
+    items = []
+    for k, v in d.items():
+        new_key = parent_key + sep + k if parent_key else k
+        if new_key in keys_to_ignore:
+            items.append((new_key, v))
+        elif isinstance(v, collections.abc.MutableMapping):
+            items.extend(flatten_nested_dict_v2(
+                v, new_key, sep=sep,
+                keys_to_ignore=keys_to_ignore).items())
         else:
             items.append((new_key, v))
     return dict(items)
@@ -101,13 +127,20 @@ class Ydefault(yaml.YAMLObject):
             for k, v in x.items():
                 if k in cls.argnames:
                     args[k] = v
+            if not len(args):
+                args['default'] = {}
         elif isinstance(node, yaml.SequenceNode):
             x = loader.construct_sequence(node, deep=True)
             for k, v in zip(cls.argnames, x):
                 if v is not None:
                     args[k] = v
+            if not len(args):
+                args['default'] = []
         elif isinstance(node, yaml.ScalarNode):
-            args['default'] = loader.construct_scalar(node)
+            value = loader.construct_scalar(node)
+            if value == '~':
+                value = None
+            args['default'] = value
         else:
             raise RuntimeError()
         ydef = Ydefault(**args)
@@ -121,9 +154,6 @@ class Ydefault(yaml.YAMLObject):
                 items.append(f'{arg}: {attr}')
         s = 'Ydef[{}]'.format(', '.join(items))
         return s
-
-
-# ConfigLoader.add_constructor('!def', Ydefault)
 
 
 def _flat_config_merge(merge_into, merge_from, prefix, allow_overwrite):
@@ -213,7 +243,7 @@ class YConfig(object):
          - allowed_wo_defaults - Key substrings that are allowed to exist
            without defaults
         """
-        self.cf = flatten_nested_dict(cfg_dict)
+        self.cfg_dict = cfg_dict
         self.ydefaults = {}
         self.allowed_wo_defaults = allowed_wo_defaults
         self.raise_without_defaults = raise_without_defaults
@@ -254,9 +284,14 @@ class YConfig(object):
                     f'Value {VALUE} for key {k} does not eval: {v.evalcheck}'
 
     def parse(self):
-        # remove ignored fields
-        self.cf = {k: v for k, v in self.cf.items() if v!= '!ignore'}
         cf_defaults = {k: v.default for k, v in self.ydefaults.items()}
+        # NOTE: Hack. Make sure Cfgs with default dict values are not flattened
+        keys_to_ignore = [k for k, v in cf_defaults.items()
+                if isinstance(v, dict)]
+        self.cf = flatten_nested_dict_v2(
+                self.cfg_dict, keys_to_ignore=keys_to_ignore)
+        # NOTE: Hack. Remove !ignore fields
+        self.cf = {k: v for k, v in self.cf.items() if v!= '!ignore'}
         self.cf = _config_assign_defaults(self.cf, cf_defaults,
                 self.allowed_wo_defaults, self.raise_without_defaults)
         self._check_types(self.cf, self.ydefaults)
