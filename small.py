@@ -276,6 +276,9 @@ reasonable_formatters = {
     'short': logging.Formatter(
         "%(asctime)s %(name)s %(levelname)s: %(message)s",
         "%Y-%m-%d %H:%M:%S"),
+    'shorter': logging.Formatter(
+        "%(asctime)s %(levelname)s: %(message)s",
+        "%Y-%m-%d %H:%M:%S"),
     'shortest': logging.Formatter(
         "%(asctime)s: %(message)s",
         "%Y-%m-%d %H:%M:%S")}
