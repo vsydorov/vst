@@ -156,6 +156,17 @@ class Ydefault(yaml.YAMLObject):
         return s
 
 
+class YDict(yaml.YAMLObject):
+    yaml_tag = '!dict'
+    yaml_loader = [ConfigLoader]
+
+    @classmethod
+    def from_yaml(cls, loader, node):
+        assert isinstance(node, yaml.MappingNode)
+        x = loader.construct_mapping(node, deep=True)
+        return Ydefault(default=x)
+
+
 def _flat_config_merge(merge_into, merge_from, prefix, allow_overwrite):
     assert isinstance(prefix, str)
     for k, v in merge_from.items():
