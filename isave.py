@@ -79,7 +79,11 @@ class Isaver_base0(ABC):
                 # Check if filenames exist
                 filenames = self._get_filenames(i)
                 all_exist = all([v.exists() for v in filenames.values()])
-                assert ffilename == filenames['finished']
+                assert ffilename == filenames['finished'], (
+                        'Incompatible isaver tempfiles found.'
+                        'Probably remnants of previous run, kill them. '
+                        'Found {} should be {}'.format(
+                            ffilename, filenames['finished'].name))
                 if all_exist:
                     intermediate_files[i] = filenames
         return intermediate_files
