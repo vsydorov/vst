@@ -18,7 +18,9 @@ def cv_put_box_with_text(
         text_size=0.6,
         text_color=None,
         text_thickness=2,
-        text_position='left_down'
+        text_position='left_down',
+        text_font_face=cv2.FONT_HERSHEY_SIMPLEX,
+        text_line_type=cv2.LINE_8,
             ) -> np.ndarray:
     """
     Overwrites in place
@@ -53,10 +55,11 @@ def cv_put_box_with_text(
                 image,
                 text,
                 text_pos,
-                fontFace=fontFace,
+                fontFace=text_font_face,
                 fontScale=text_size,
                 color=text_color,
-                thickness=text_thickness)
+                thickness=text_thickness,
+                lineType=text_line_type)
     return image
 
 
