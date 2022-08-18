@@ -340,6 +340,8 @@ class Isaver_dataloader(Isaver_base):
 
     def run(self):
         i_last = self._restore()
+        if i_last+1 >= self._total:  # Avoid running with empty dataloader
+            return self.result
         countra = Counter_repeated_action(
                 sslice=self._save_period,
                 seconds=self._save_interval)
