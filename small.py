@@ -22,7 +22,6 @@ from typing import (  # NOQA
             Any, Union, Callable, TypeVar, TypedDict, Tuple)
 
 import numpy as np
-import pandas as pd
 
 log = logging.getLogger(__name__)
 
@@ -236,7 +235,8 @@ def string_table(
     return '\n'.join(table)
 
 
-def df_to_table(df: pd.DataFrame, indexcols=None) -> str:
+def df_to_table(df, indexcols=None) -> str:
+    import pandas as pd
     # Header
     if indexcols is None:
         if isinstance(df.index, pd.MultiIndex):
