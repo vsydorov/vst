@@ -403,7 +403,8 @@ def reasonable_logging_setup(
     logger.addHandler(handler)
     # Prevent some spammy packages from exceeding INFO verbosity
     spammy_packages = [
-            'PIL', 'git', 'tensorflow', 'matplotlib', 'selenium', 'urllib3']
+            'PIL', 'git', 'tensorflow', 'matplotlib', 'selenium',
+            'urllib3', 'fiona', 'rasterio']
     for packagename in spammy_packages:
         logging.getLogger(packagename).setLevel(
                 max(logging.INFO, stream_loglevel))
