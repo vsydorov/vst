@@ -107,7 +107,7 @@ class Ydefault(yaml.YAMLObject):
             default=None,
             values: Optional[List] = None,
             typecheck=None,
-            evalcheck: str = None,):
+            evalcheck: Optional[str] = None,):
         self.default = default
         self.values = values
         self.typecheck = typecheck

@@ -88,7 +88,7 @@ class Isaver_base0(ABC):
                     intermediate_files[i] = filenames
         return intermediate_files
 
-    def _purge_intermediate_files(self):
+    def _purge_intermediate_files(self) -> None:
         if self._folder is None:
             log.debug('Isaver folder is None, no purging')
             return
@@ -96,7 +96,7 @@ class Isaver_base0(ABC):
         intermediate_files: Dict[int, Dict[str, Path]] = \
                 self._get_intermediate_files()
         inds_to_purge = np.sort(np.fromiter(
-            intermediate_files.keys(), np.int))[:-self._history_size]
+            intermediate_files.keys(), np.int64))[:-self._history_size]
         files_purged = 0
         for ind in inds_to_purge:
             filenames = intermediate_files[ind]
@@ -118,7 +118,7 @@ class Isaver_base(Isaver_base0):
         filenames['pkl'] = filenames['finished'].with_suffix('.pkl')
         return filenames
 
-    def _restore(self):
+    def _restore(self) -> int:
         intermediate_files: Dict[int, Dict[str, Path]] = \
                 self._get_intermediate_files()
         start_i, ifiles = max(intermediate_files.items(),

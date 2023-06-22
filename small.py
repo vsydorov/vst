@@ -214,7 +214,7 @@ Table creation
 
 def string_table(
         table_rows: List[Iterable],
-        header: List[str] = None,
+        header: Optional[List[str]] = None,
         col_formats: Iterable[str] = itertools.repeat('{}'),
         col_alignments: Iterable[str] = itertools.repeat('<'),
         pad=0,
