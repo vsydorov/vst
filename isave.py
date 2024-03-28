@@ -1,19 +1,16 @@
 # Incremental savers
 import concurrent.futures
-import time
-import re
 import logging
+import re
+import time
 from abc import ABC
 from pathlib import Path
-from typing import (  # NOQA
-            Optional, Iterable, List, Dict,
-            Any, Union, Callable, TypeVar)
+from typing import Any, Callable, Dict, Iterable, List, Optional, TypeVar, Union  # NOQA
 
 import numpy as np
 from tqdm import tqdm
 
 import vst
-
 
 log = logging.getLogger(__name__)
 
@@ -22,7 +19,8 @@ class Counter_repeated_action(object):
     """
     Will check whether repeated action should be performed
     """
-    def __init__(self, sslice='::', seconds=None, iters=None):
+
+    def __init__(self, sslice="::", seconds=None, iters=None):
         self.sslice = sslice
         self.seconds = seconds
         self.iters = iters
@@ -48,23 +46,24 @@ class Counter_repeated_action(object):
 
 class Isaver_base0(ABC):
     def __init__(self, folder, total):
-        self._re_finished = (
-            r'item_(?P<i>\d+)_of_(?P<N>\d+).finished')
-        self._fmt_finished = 'item_{:04d}_of_{:04d}.finished'
+        self._re_finished = r"item_(?P<i>\d+)_of_(?P<N>\d+).finished"
+        self._fmt_finished = "item_{:04d}_of_{:04d}.finished"
         self._history_size = 3
 
         self._folder = folder
         self._total = total
         if self._folder is None:
-            log.debug('Isaver without folder, no saving will be performed')
+            log.debug("Isaver without folder, no saving will be performed")
         else:
             self._folder = vst.mkdir(self._folder)
 
     def _get_filenames(self, i) -> Dict[str, Path]:
         if self._folder is None:
-            raise RuntimeError('Filenames are undefined without folder')
-        filenames = {'finished':
-                self._folder/self._fmt_finished.format(i, self._total)}
+            raise RuntimeError("Filenames are undefined without folder")
+        filenames = {
+            "finished": self._folder
+            / self._fmt_finished.format(i, self._total)
+        }
         return filenames
 
     def _get_intermediate_files(self) -> Dict[int, Dict[str, Path]]:
@@ -75,36 +74,43 @@ class Isaver_base0(ABC):
         for ffilename in self._folder.iterdir():
             matched = re.match(self._re_finished, ffilename.name)
             if matched:
-                i = int(matched.groupdict()['i'])
+                i = int(matched.groupdict()["i"])
                 # Check if filenames exist
                 filenames = self._get_filenames(i)
                 all_exist = all([v.exists() for v in filenames.values()])
-                assert ffilename == filenames['finished'], (
-                        'Incompatible isaver tempfiles found.'
-                        'Probably remnants of previous run, kill them. '
-                        'Found {} should be {}'.format(
-                            ffilename, filenames['finished'].name))
+                assert ffilename == filenames["finished"], (
+                    "Incompatible isaver tempfiles found."
+                    "Probably remnants of previous run, kill them. "
+                    "Found {} should be {}".format(
+                        ffilename, filenames["finished"].name
+                    )
+                )
                 if all_exist:
                     intermediate_files[i] = filenames
         return intermediate_files
 
     def _purge_intermediate_files(self) -> None:
         if self._folder is None:
-            log.debug('Isaver folder is None, no purging')
+            log.debug("Isaver folder is None, no purging")
             return
         """Remove old saved states"""
-        intermediate_files: Dict[int, Dict[str, Path]] = \
-                self._get_intermediate_files()
-        inds_to_purge = np.sort(np.fromiter(
-            intermediate_files.keys(), np.int64))[:-self._history_size]
+        intermediate_files: Dict[int, Dict[str, Path]] = (
+            self._get_intermediate_files()
+        )
+        inds_to_purge = np.sort(
+            np.fromiter(intermediate_files.keys(), np.int64)
+        )[: -self._history_size]
         files_purged = 0
         for ind in inds_to_purge:
             filenames = intermediate_files[ind]
             for filename in filenames.values():
                 filename.unlink()
                 files_purged += 1
-        log.debug('Purged {} states, {} files'.format(
-            len(inds_to_purge), files_purged))
+        log.debug(
+            "Purged {} states, {} files".format(
+                len(inds_to_purge), files_purged
+            )
+        )
 
 
 class Isaver_base(Isaver_base0):
@@ -115,29 +121,29 @@ class Isaver_base(Isaver_base0):
 
     def _get_filenames(self, i) -> Dict[str, Path]:
         filenames = super()._get_filenames(i)
-        filenames['pkl'] = filenames['finished'].with_suffix('.pkl')
+        filenames["pkl"] = filenames["finished"].with_suffix(".pkl")
         return filenames
 
     def _restore(self) -> int:
-        intermediate_files: Dict[int, Dict[str, Path]] = \
-                self._get_intermediate_files()
-        start_i, ifiles = max(intermediate_files.items(),
-                default=(-1, None))
+        intermediate_files: Dict[int, Dict[str, Path]] = (
+            self._get_intermediate_files()
+        )
+        start_i, ifiles = max(intermediate_files.items(), default=(-1, None))
         if ifiles is not None:
-            restore_from = ifiles['pkl']
+            restore_from = ifiles["pkl"]
             self.result = vst.load_pkl(restore_from)
-            log.debug('Restore from {}'.format(restore_from))
+            log.debug("Restore from {}".format(restore_from))
         return start_i
 
     def _save(self, i):
         if self._folder is None:
-            log.debug('Isaver folder is None, no saving')
+            log.debug("Isaver folder is None, no saving")
             return
         ifiles = self._get_filenames(i)
-        savepath = ifiles['pkl']
+        savepath = ifiles["pkl"]
         vst.mkdir(savepath.parent)
         vst.save_pkl(savepath, self.result)
-        ifiles['finished'].touch()
+        ifiles["finished"].touch()
 
 
 class Isaver_simple(Isaver_base):
@@ -146,15 +152,18 @@ class Isaver_simple(Isaver_base):
 
     - Legacy. Use Isaver_fast instead
     """
+
     def __init__(
-            self, folder,
-            arg_list: Iterable[Iterable[Any]],
-            func: Callable, *,
-            save_period='::',  # SSLICES
-            save_interval=120,  # every 2 minutes by default
-            progress: Optional[str] = None,
-            log_interval=None,  # Works only if progress is defined
-            ):
+        self,
+        folder,
+        arg_list: Iterable[Iterable[Any]],
+        func: Callable,
+        *,
+        save_period="::",  # SSLICES
+        save_interval=120,  # every 2 minutes by default
+        progress: Optional[str] = None,
+        log_interval=None,  # Works only if progress is defined
+    ):
         arg_list = list(arg_list)
         super().__init__(folder, len(arg_list))
         self.arg_list = arg_list
@@ -167,7 +176,7 @@ class Isaver_simple(Isaver_base):
 
     def run(self):
         start_i = self._restore()
-        run_range = np.arange(start_i+1, self._total)
+        run_range = np.arange(start_i + 1, self._total)
         self._time_last_save = time.perf_counter()
         self._time_last_log = time.perf_counter()
         pbar = run_range
@@ -181,7 +190,7 @@ class Isaver_simple(Isaver_base):
             if self._save_interval:
                 since_last_save = time.perf_counter() - self._time_last_save
                 SAVE |= since_last_save > self._save_interval
-            SAVE |= (i+1 == self._total)
+            SAVE |= i + 1 == self._total
             if SAVE:
                 self._save(i)
                 self._purge_intermediate_files()
@@ -199,17 +208,20 @@ class Isaver_fast(Isaver_base):
     """
     Execute *func* (in parallel) over *arg_list* arguments, with checkpoints
     """
+
     def __init__(
-            self, folder: Optional[Path],
-            arg_list: Iterable[Iterable[Any]],
-            func: Callable, *,
-            async_kind='thread',
-            num_workers=None,
-            save_iters=np.inf,
-            save_interval=120,
-            progress: Optional[str] = None,
-            timeout: Optional[int] = None
-            ):
+        self,
+        folder: Optional[Path],
+        arg_list: Iterable[Iterable[Any]],
+        func: Callable,
+        *,
+        async_kind="thread",
+        num_workers=None,
+        save_iters=np.inf,
+        save_interval=120,
+        progress: Optional[str] = None,
+        timeout: Optional[int] = None,
+    ):
         arg_list = list(arg_list)
         super().__init__(folder, len(arg_list))
         self.arg_list = arg_list
@@ -224,8 +236,7 @@ class Isaver_fast(Isaver_base):
 
     def run(self):
         self._restore()
-        countra = Counter_repeated_action(
-                seconds=self._save_interval)
+        countra = Counter_repeated_action(seconds=self._save_interval)
 
         all_ii = set(range(len(self.arg_list)))
         remaining_ii = all_ii - set(self.result.keys())
@@ -253,14 +264,16 @@ class Isaver_fast(Isaver_base):
                     countra.tic()
         else:
             # Run asynchronously
-            if self._async_kind == 'thread':
+            if self._async_kind == "thread":
                 io_executor = concurrent.futures.ThreadPoolExecutor(
-                        max_workers=self._num_workers)
-            elif self._async_kind == 'process':
+                    max_workers=self._num_workers
+                )
+            elif self._async_kind == "process":
                 io_executor = concurrent.futures.ProcessPoolExecutor(
-                        max_workers=self._num_workers)
+                    max_workers=self._num_workers
+                )
             else:
-                raise RuntimeError(f'Unknown {self._async_kind=}')
+                raise RuntimeError(f"Unknown {self._async_kind=}")
             io_futures = []
             for i in remaining_ii:
                 args = self.arg_list[i]
@@ -285,18 +298,31 @@ class Isaver_fast(Isaver_base):
 
 
 class Isaver_threading(Isaver_fast):
-    """ Present for backwards compatability, soon to be deprecated"""
+    """Present for backwards compatability, soon to be deprecated"""
+
     def __init__(
-            self, folder, arg_list, func, *,
-            max_workers=None, save_iters=np.inf,
-            save_interval=120, progress=None, timeout=None):
-        super().__init__(folder, arg_list, func,
-                async_kind='thread',
-                num_workers=max_workers,
-                save_iters=save_iters,
-                save_interval=save_interval,
-                progress=progress,
-                timeout=timeout)
+        self,
+        folder,
+        arg_list,
+        func,
+        *,
+        max_workers=None,
+        save_iters=np.inf,
+        save_interval=120,
+        progress=None,
+        timeout=None,
+    ):
+        super().__init__(
+            folder,
+            arg_list,
+            func,
+            async_kind="thread",
+            num_workers=max_workers,
+            save_iters=save_iters,
+            save_interval=save_interval,
+            progress=progress,
+            timeout=timeout,
+        )
 
 
 class Isaver_dataloader(Isaver_base):
@@ -321,14 +347,19 @@ class Isaver_dataloader(Isaver_base):
             i_last = negatives_inds.index(inds[-1])
             return result_dict, i_last
     """
+
     def __init__(
-            self, folder,
-            total, func, prepare_func, *,
-            save_period='::',
-            save_interval=120,
-            log_interval=None,
-            progress: Optional[str] = None
-            ):
+        self,
+        folder,
+        total,
+        func,
+        prepare_func,
+        *,
+        save_period="::",
+        save_interval=120,
+        log_interval=None,
+        progress: Optional[str] = None,
+    ):
         super().__init__(folder, total)
         self.func = func
         self.prepare_func = prepare_func
@@ -340,11 +371,11 @@ class Isaver_dataloader(Isaver_base):
 
     def run(self):
         i_last = self._restore()
-        if i_last+1 >= self._total:  # Avoid running with empty dataloader
+        if i_last + 1 >= self._total:  # Avoid running with empty dataloader
             return self.result
         countra = Counter_repeated_action(
-                sslice=self._save_period,
-                seconds=self._save_interval)
+            sslice=self._save_period, seconds=self._save_interval
+        )
 
         result_cache = []
 
