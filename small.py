@@ -43,6 +43,12 @@ def mkdir(directory) -> Path:
     return directory
 
 
+def mkpar(path) -> Path:
+    directory = Path(path).parent
+    mkdir(directory)
+    return path
+
+
 def save_json(filepath, obj):
     with Path(filepath).open("w") as f:
         json.dump(obj, f, indent=4, sort_keys=True)
