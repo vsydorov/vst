@@ -2,6 +2,11 @@
 Module with small snippets
 """
 
+import subprocess
+import json
+import yaml
+import re
+
 import io
 import itertools
 import json
@@ -17,7 +22,18 @@ from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from timeit import default_timer as timer
-from typing import Callable, Iterable, List, Optional, Tuple, TypedDict, TypeVar, Union
+from typing import (  # NOQA
+    Optional,
+    Iterable,
+    List,
+    Dict,
+    Any,
+    Union,
+    Callable,
+    TypeVar,
+    TypedDict,
+    Tuple,
+)
 
 import numpy as np
 import yaml
@@ -328,20 +344,32 @@ class CaptureLogRecordsHandler(logging.Handler):
 
 
 class LogCaptorToRecords(object):
-    def __init__(self, pause_others=False):
+    def __init__(self, pause_others=False, pause_file_only=True):
         self.pause_others = pause_others
+        self.pause_file_only = pause_file_only
         self._logger = logging.getLogger()
         self._captor_handler = CaptureLogRecordsHandler()
         self.captured = []
 
     def _pause_other_handlers(self):
         self._other_handlers = self._logger.handlers.copy()
-        for handle in self._logger.handlers:
+        if self.pause_file_only:
+            # Only pause file handlers, keep stream (stdout/stderr) handlers
+            to_remove = [
+                h
+                for h in self._logger.handlers
+                if not isinstance(h, logging.StreamHandler)
+                or isinstance(h, logging.FileHandler)
+            ]
+        else:
+            to_remove = self._logger.handlers.copy()
+        for handle in to_remove:
             self._logger.removeHandler(handle)
 
     def _unpause_other_handlers(self):
         for handle in self._other_handlers:
-            self._logger.addHandler(handle)
+            if handle not in self._logger.handlers:
+                self._logger.addHandler(handle)
 
     def __enter__(self):
         if self.pause_others:
@@ -609,12 +637,8 @@ def tqdm_str(pbar, ninc=0):
     if pbar is None:
         tqdm_str = ""
     else:
-        tqdm_str = (
-            "TQDM["
-            + pbar.format_meter(
-                pbar.n + ninc, pbar.total, pbar._time() - pbar.start_t
-            )
-            + "]"
+        tqdm_str = "TQDM[" + pbar.format_meter(
+            pbar.n + ninc, pbar.total, pbar._time() - pbar.start_t
         )
     return tqdm_str
 
