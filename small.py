@@ -344,45 +344,41 @@ class CaptureLogRecordsHandler(logging.Handler):
 
 
 class LogCaptorToRecords(object):
-    def __init__(self, pause_others=False, pause_file_only=True):
-        self.pause_others = pause_others
-        self.pause_file_only = pause_file_only
+    """Capture log records while optionally pausing handlers.
+
+    pause='none' — capture alongside all active handlers; handle_captured() is a no-op
+    pause='all'  — pause all handlers; handle_captured() replays to all current handlers
+    pause='file' — pause only FileHandlers, keep stream (stdout) active;
+                   handle_captured() replays only to current FileHandlers
+    """
+
+    def __init__(self, pause='none'):
+        if pause not in ('none', 'all', 'file'):
+            raise ValueError(f"pause must be 'none', 'all', or 'file', got {pause!r}")
+        self.pause = pause
         self._logger = logging.getLogger()
         self._captor_handler = CaptureLogRecordsHandler()
+        self._paused_handlers = []
         self.captured = []
 
-    def _pause_other_handlers(self):
-        self._other_handlers = self._logger.handlers.copy()
-        if self.pause_file_only:
-            # Only pause file handlers, keep stream (stdout/stderr) handlers
-            to_remove = [
-                h
-                for h in self._logger.handlers
-                if not isinstance(h, logging.StreamHandler)
-                or isinstance(h, logging.FileHandler)
-            ]
-        else:
-            to_remove = self._logger.handlers.copy()
-        for handle in to_remove:
-            self._logger.removeHandler(handle)
-
-    def _unpause_other_handlers(self):
-        for handle in self._other_handlers:
-            if handle not in self._logger.handlers:
-                self._logger.addHandler(handle)
-
     def __enter__(self):
-        if self.pause_others:
-            self._pause_other_handlers()
+        if self.pause == 'all':
+            self._paused_handlers = self._logger.handlers.copy()
+        elif self.pause == 'file':
+            self._paused_handlers = [
+                h for h in self._logger.handlers if isinstance(h, logging.FileHandler)
+            ]
+        for h in self._paused_handlers:
+            self._logger.removeHandler(h)
         self._logger.addHandler(self._captor_handler)
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
-        if self.pause_others:
-            self._unpause_other_handlers()
         self._logger.removeHandler(self._captor_handler)
+        for h in self._paused_handlers:
+            if h not in self._logger.handlers:
+                self._logger.addHandler(h)
         self.captured = self._captor_handler.captured_records[:]
-        # If exception was raise - handle captured right now
         if exc_type is not None:
             log.error(
                 "<<(CAPTURED BEGIN)>> Capturer encountered an "
@@ -392,8 +388,15 @@ class LogCaptorToRecords(object):
             log.error("<<(CAPTURED END)>> End of captured records")
 
     def handle_captured(self):
+        if self.pause == 'none':
+            return  # All handlers were active during capture, no replay needed
+        elif self.pause == 'all':
+            targets = self._logger.handlers.copy()
+        else:  # 'file'
+            targets = [h for h in self._logger.handlers if isinstance(h, logging.FileHandler)]
         for record in self.captured:
-            self._logger.handle(record)
+            for h in targets:
+                h.handle(record)
 
 
 class LogCaptorToString(object):

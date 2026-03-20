@@ -3,13 +3,23 @@
 These functions supplement and extend Dervo basic functionality
 At the same time Dervo is not required to make use of them
 """
+
 import collections
 import copy
 import importlib
 import logging
 import sys
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, TypeVar, Union  # NOQA
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    TypeVar,
+    Union,
+)  # NOQA
 
 import numpy as np
 import yaml
@@ -367,6 +377,7 @@ def yml_from_file(filepath: Path):
 
 
 # Launching dervo scripts
+# TODO : Deprecate and remove
 
 
 def resolve_clean_exp_path(path_: str) -> Path:
